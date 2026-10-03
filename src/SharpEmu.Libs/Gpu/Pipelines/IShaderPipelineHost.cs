@@ -68,6 +68,9 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
+    // Whether the guest address is mapped. A host that cannot tell without a read probes with one.
+    bool IsGuestMapped(ulong address) => TryReadGuestWord(address, out _);
+
     bool TryReadCleanGuestWords(ulong address, Span<uint> words)
     {
         using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);

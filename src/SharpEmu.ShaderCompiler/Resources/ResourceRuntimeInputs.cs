@@ -19,6 +19,10 @@ public sealed record ResourceRuntimeInputs
     public GuestWordReader? ReadMemory { get; init; }
     public GuestWordReader? ReadCleanMemory { get; init; }
     public GuestWordsReader? ReadCleanWords { get; init; }
+
+    // Whether a guest address is mapped, without reading or synchronizing it. Null makes
+    // the callers probe with ReadMemory instead.
+    public Func<ulong, bool>? IsMapped { get; init; }
     public ComputeSelectorState? ComputeState { get; init; }
 
     // Told true before the flattened table's words are evaluated and false after, so a reader

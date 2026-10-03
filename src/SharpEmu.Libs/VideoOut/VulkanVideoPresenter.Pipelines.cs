@@ -140,6 +140,9 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // A mapping query only: nothing is read, so nothing the GPU wrote is synchronized.
+        public bool IsGuestMapped(ulong address) => _guestMemory.CanRead(address, sizeof(uint));
+
         // Refused while a GPU buffer or image write may still own the range.
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {

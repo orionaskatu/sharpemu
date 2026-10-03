@@ -58,7 +58,7 @@ public sealed class ResourceMaterializationCache
         out ResourceMaterializationFailure failure)
     {
         var key = KeyOf(plan, inputs);
-        if (TryFind(key, plan, inputs, out var cached))
+        if (TryFind(key, plan, inputs, out var cached) && MappingsHold(cached, inputs))
         {
             if (Validate(cached, residentReader))
             {
@@ -88,6 +88,7 @@ public sealed class ResourceMaterializationCache
             ReadMemory = recorder.Wrap(inputs.ReadMemory, clean: false),
             ReadCleanMemory = recorder.Wrap(inputs.ReadCleanMemory, clean: true),
             ReadCleanWords = recorder.Wrap(inputs.ReadCleanWords),
+            IsMapped = recorder.Wrap(inputs.IsMapped),
             TablePhase = recorder.SetTablePhase,
         };
         if (!ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure))
@@ -170,6 +171,7 @@ public sealed class ResourceMaterializationCache
             RangeOffsets = cached.RangeOffsets,
             RangeLengths = cached.RangeLengths,
             RangeClean = cached.RangeClean,
+            MappingProbes = cached.MappingProbes,
             WordTableOnly = cached.WordTableOnly,
             TableRefreshable = true,
             Bytes = current,
@@ -257,6 +259,19 @@ public sealed class ResourceMaterializationCache
         _young[key] = entry;
     }
 
+    // A mapping probe answers whether an address is mapped, not what it holds: the entry
+    // stays valid while every probed address keeps its answer.
+    private static bool MappingsHold(Entry entry, ResourceRuntimeInputs inputs)
+    {
+        foreach (var (address, mapped) in entry.MappingProbes)
+        {
+            if (inputs.IsMapped is not { } isMapped || isMapped(address) != mapped)
+                return false;
+        }
+
+        return true;
+    }
+
     private bool Validate(Entry entry, ResidentGuestBytesReader residentReader)
     {
         for (var index = 0; index < entry.RangeAddresses.Length; index++)
@@ -283,6 +298,7 @@ public sealed class ResourceMaterializationCache
         public required int[] RangeOffsets { get; init; }
         public required int[] RangeLengths { get; init; }
         public required bool[] RangeClean { get; init; }
+        public required (ulong Address, bool Mapped)[] MappingProbes { get; init; }
         // Per recorded dword: read only while the flattened table was evaluated.
         public required bool[] WordTableOnly { get; init; }
         // The table has the plan's plain layout, so no specialization read or extended it.
@@ -307,6 +323,7 @@ public sealed class ResourceMaterializationCache
     {
         private readonly List<(ulong Address, uint Word, bool Clean, bool Table)> _reads = new();
         private readonly Dictionary<ulong, int> _readIndex = new();
+        private readonly Dictionary<ulong, bool> _mappingProbes = new();
         private bool _inTable;
 
         public bool Failed { get; private set; }
@@ -329,6 +346,19 @@ public sealed class ResourceMaterializationCache
 
                 Record(address, word, clean);
                 return true;
+            };
+        }
+
+        public Func<ulong, bool>? Wrap(Func<ulong, bool>? inner)
+        {
+            if (inner is null) return null;
+            return address =>
+            {
+                var mapped = inner(address);
+                // One materialization that saw both answers cannot be validated by either.
+                if (_mappingProbes.TryGetValue(address, out var previous) && previous != mapped) Failed = true;
+                _mappingProbes[address] = mapped;
+                return mapped;
             };
         }
 
@@ -415,6 +445,7 @@ public sealed class ResourceMaterializationCache
                 RangeOffsets = [.. offsets],
                 RangeLengths = [.. lengths],
                 RangeClean = [.. clean],
+                MappingProbes = _mappingProbes.Select(probe => (probe.Key, probe.Value)).ToArray(),
                 WordTableOnly = [.. tableOnly],
                 TableRefreshable = snapshot.FlattenedResourceTable.Length ==
                     plan.TableReads.Count + plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount,

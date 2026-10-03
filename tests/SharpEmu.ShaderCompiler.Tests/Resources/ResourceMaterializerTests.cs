@@ -56,6 +56,51 @@ public sealed class ResourceMaterializerTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public void UnboundedSelectorScansAMaterialTableBeyondSixtyFourThousandDwordProbes(bool bulkReads)
+    {
+        // An unbounded selector times the 224-byte stride reaches every 32-byte step of the
+        // table: 10000 records need 70001 probes, as Ghost of Yotei's 290 KB, 116-byte table does.
+        const uint records = 10000;
+        const ulong heap = 0x280000;
+        var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false));
+        uint[] userData = [0x1000, 224 << 16, records, 0, (uint)heap, 16 << 16, 4, 0, 7];
+        var memory = new TestWordMemory { Words = new uint[(heap + 0x1000) / 4] };
+        var first = ResourceTrackerTests.ImageDescriptor();
+        var last = first.ToArray();
+        last[0] += 1;
+        ResourceTrackerTests.WriteImage(memory, heap, first);
+        ResourceTrackerTests.WriteImage(memory, heap + 32, last);
+        memory.At(0x1000 + (ulong)(records - 1) * 224 + 4) = 1;
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        var bulkCalls = 0;
+        var inputs = Inputs(userData, readCleanMemory: memory.Read) with
+        {
+            ReadCleanWords = bulkReads
+                ? (address, words) =>
+                {
+                    bulkCalls++;
+                    for (var index = 0; index < words.Length; index++)
+                        if (!memory.Read(address + (ulong)index * sizeof(uint), out words[index]))
+                            return false;
+                    return true;
+                }
+                : null,
+        };
+
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization, out var failure));
+        Assert.Equal(ResourceMaterializationFailure.None, failure);
+        Assert.Equal(2, snapshot.Images.Length);
+        Assert.Equal(last, snapshot.Images[1]);
+        // The table is read in chunks, not one call per probed dword.
+        if (bulkReads)
+            Assert.InRange(bulkCalls, 1, 64);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public void IncompatibleImageCapturePreservesFailureAndPublishedState(bool captureEnabled)
     {
         var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false));

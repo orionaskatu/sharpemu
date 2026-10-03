@@ -13,12 +13,18 @@ public static class ResourceMaterializer
 {
     private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
     private const ulong MaxIndirectImageProbes = 65536;
+    // An unbounded selector scaled by the record stride reaches every dword of the material
+    // table, so its scan reads one key per dword: this admits tables up to 4 MiB. The keys are
+    // few and distinct descriptors are still bounded by the image limit.
+    private const ulong MaxIndirectSelectorProbes = 1 << 20;
+    private const ulong MaterialBulkReadThreshold = 1024;
+    private const int MaterialBulkReadChunkWords = 16384;
 
     // Written to standard error like every specialization refusal; the host turns it
     // into its fatal.
     public static Action<string> SpecializationFailed { get; set; } = message => Console.Error.WriteLine($"shader resource specialization failed: {message}");
 
-    private sealed class IndirectImageTable
+    internal sealed class IndirectImageTable
     {
         public uint Resource;
         public List<uint> Keys = [];
@@ -127,7 +133,7 @@ public static class ResourceMaterializer
         snapshot = new MaterializedSnapshot();
         if (plan.RequiresSpecializationMemory && inputs.ReadCleanMemory is null)
         {
-            return false;
+            return Fail("the plan reads guest memory for specialization but no clean reader is available");
         }
 
         if (!RuntimeValueEvaluator.EvaluateSources(plan, plan.MaterializationSources, inputs, plan.CleanFlatSlots,
@@ -161,7 +167,7 @@ public static class ResourceMaterializer
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, directCandidates.Select(candidate => candidate.Source).ToArray(),
                         cleanInputs, [], evaluateTable: false, out var descriptors, out _))
                     {
-                        return false;
+                        return Fail($"image {imageIndex} direct candidates cannot be evaluated: candidates={directCandidates.Count}");
                     }
                     var directTable = new IndirectImageTable { Resource = (uint)imageIndex };
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
@@ -187,7 +193,7 @@ public static class ResourceMaterializer
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [], evaluateTable: false,
                         out var waveSources, out _))
-                        return false;
+                        return Fail($"image {imageIndex} wave-indexed heap source {indirect.HeapSource} cannot be evaluated");
                     if (!MaterializeWaveIndexedImage(indirect, waveIndexed, waveSources[0], image, image.R128, inputs, out var waveTable, out failure))
                         return false;
                     snapshot.Images[imageIndex] = waveTable.Descriptors[(int)waveTable.Candidates[0]].Dwords;
@@ -202,7 +208,7 @@ public static class ResourceMaterializer
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [], evaluateTable: false,
                         out var denseSources, out _))
-                        return false;
+                        return Fail($"image {imageIndex} dense heap source {indirect.HeapSource} cannot be evaluated");
                     if (!MaterializeDenseIndirectImage(indirect, denseSources[0], image, image.R128, inputs, out var denseTable, out failure))
                         return false;
                     snapshot.Images[imageIndex] = denseTable.Descriptors[(int)denseTable.Candidates[0]].Dwords;
@@ -215,7 +221,7 @@ public static class ResourceMaterializer
                 }
                 if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _))
                 {
-                    return false;
+                    return Fail($"image {imageIndex} material source {indirect.MaterialSource} or heap source {indirect.HeapSource} cannot be evaluated");
                 }
 
                 if (!MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image, inputs,
@@ -267,7 +273,7 @@ public static class ResourceMaterializer
                 !RuntimeValueEvaluator.EvaluateSources(plan, [candidatePlan.SourceSrtResource], inputs, [], evaluateTable: false,
                     out var srtSources, out _) || srtSources.Count == 0)
             {
-                return false;
+                return Fail($"buffer candidate table SRT source {candidatePlan.SourceSrtResource} cannot be evaluated");
             }
 
             if (!MaterializeBufferCandidateTable(plan, candidatePlan, srtSources[0], inputs, out var candidateTable))
@@ -296,7 +302,7 @@ public static class ResourceMaterializer
         result = new BufferCandidateTable { MemoryIndex = table.MemoryIndices.Count != 0 ? table.MemoryIndices[0] : -1 };
         if (srt.DwordCount != 4)
         {
-            return false;
+            return Fail($"buffer candidate table SRT has {srt.DwordCount} dwords");
         }
 
         int count;
@@ -308,20 +314,25 @@ public static class ResourceMaterializer
         {
             if (table.Limit is null)
             {
-                return false;
+                return Fail("buffer candidate table has neither a static bound nor a limit");
             }
 
             using var scratch = RuntimeEvaluationScratch.Rent();
             var evaluator = new RuntimeValueEvaluator(scratch, plan, inputs);
-            if (!evaluator.Evaluate(table.Limit, out var limit) || !table.TryResolveCount(limit, out count))
+            if (!evaluator.Evaluate(table.Limit, out var limit))
             {
-                return false;
+                return Fail("buffer candidate table limit cannot be evaluated");
+            }
+
+            if (!table.TryResolveCount(limit, out count))
+            {
+                return Fail($"buffer candidate table limit 0x{limit:X} does not resolve to a count");
             }
         }
 
         if (count <= 0 || count > table.Cap)
         {
-            return false;
+            return Fail($"buffer candidate table count {count} is outside 1..{table.Cap}");
         }
 
         var keyToCandidate = new Dictionary<uint, uint>();
@@ -333,7 +344,7 @@ public static class ResourceMaterializer
             {
                 if (!ReadScalarBufferWord(srt.Dwords, offset, dword * sizeof(uint), inputs, out words[dword]))
                 {
-                    return false;
+                    return Fail($"buffer candidate {index} at SRT offset 0x{offset:X} cannot be read");
                 }
             }
 
@@ -350,7 +361,7 @@ public static class ResourceMaterializer
                 // run time; reject precisely instead of guessing.
                 if (!result.Descriptors[(int)existing].SameAs(descriptor))
                 {
-                    return false;
+                    return Fail($"buffer candidates share the probe key 0x{words[0]:X8} with different descriptors");
                 }
 
                 continue;
@@ -590,6 +601,32 @@ public static class ResourceMaterializer
         return inputs.ReadCleanMemory is not null && inputs.ReadCleanMemory(baseAddress + aligned, out word);
     }
 
+    // Every in-range dword of a V#'s buffer in clean bulk reads, or null when any part is
+    // refused; the caller then reads word by word, which applies the per-word rules.
+    private static uint[]? TryReadScalarBuffer(ReadOnlySpan<uint> descriptor, ResourceRuntimeInputs inputs)
+    {
+        var size = ScalarBufferSize(descriptor);
+        if (inputs.ReadCleanWords is null || size / sizeof(uint) > int.MaxValue)
+            return null;
+
+        var words = new uint[size / sizeof(uint)];
+        for (var start = 0; start < words.Length; start += MaterialBulkReadChunkWords)
+        {
+            var chunk = words.AsSpan(start, Math.Min(MaterialBulkReadChunkWords, words.Length - start));
+            if (!ScalarBufferRangeRead.TryRead(descriptor, (uint)start * sizeof(uint), 0, inputs, chunk))
+                return null;
+        }
+
+        return words;
+    }
+
+    // ReadScalarBufferWord over a buffer read by TryReadScalarBuffer: out of range reads zero.
+    private static uint ScalarBufferWordAt(uint[] words, ulong size, ulong byteOffset)
+    {
+        var aligned = byteOffset & ~3ul;
+        return aligned > size || size - aligned < sizeof(uint) ? 0 : words[aligned / sizeof(uint)];
+    }
+
     // Enumerates every material key that can pass the table's bounds and reads the
     // heap descriptor each selects; stale or invalid descriptors become null.
     private static bool MaterializeIndirectImage(
@@ -607,13 +644,14 @@ public static class ResourceMaterializer
         result = new IndirectImageTable();
         if (material.DwordCount != 4 || heap.DwordCount != 4)
         {
-            return false;
+            return Fail($"indirect image material/heap descriptors have {material.DwordCount}/{heap.DwordCount} dwords");
         }
 
         var materialStride = (material.Dwords[1] >> 16) & 0x3FFF;
         if (materialStride != indirect.SelectorStride)
         {
-            return false;
+            return Fail($"indirect image material stride {materialStride} differs from the selector stride {indirect.SelectorStride}: " +
+                string.Join(",", material.Dwords.Select(word => $"{word:x8}")));
         }
 
         var period = 1ul << 32;
@@ -636,20 +674,29 @@ public static class ResourceMaterializer
                 diagnostic.ProvenOffsets = provenOffsets ?? [];
             }
         }
-        if (provenOffsets is null && probeCount > MaxIndirectImageProbes)
+        if (provenOffsets is null && probeCount > MaxIndirectSelectorProbes)
         {
-            return false;
+            return Fail($"indirect image selector is unbounded: probes={probeCount} limit={MaxIndirectSelectorProbes} size=0x{size:X} stride={indirect.SelectorStride}");
         }
 
         var keys = new List<uint> { 0 };
         var seen = new HashSet<uint> { 0 };
         var offsets = provenOffsets is not null ? provenOffsets.Select(offset => (ulong)offset) :
             Enumerable.Range(0, (int)probeCount).Select(index => residue + (ulong)index * step);
+        // A full-domain scan reads every dword of the table: one bulk read replaces them.
+        var materialWords = provenOffsets is null && probeCount > MaterialBulkReadThreshold
+            ? TryReadScalarBuffer(material.Dwords, inputs)
+            : null;
         foreach (var offset in offsets)
         {
-            if (!ReadScalarBufferWord(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs, out var key))
+            uint key;
+            if (materialWords is not null)
             {
-                return false;
+                key = ScalarBufferWordAt(materialWords, size, offset + indirect.MaterialImmediate);
+            }
+            else if (!ReadScalarBufferWord(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs, out key))
+            {
+                return Fail($"indirect image material key at offset 0x{offset:X}+0x{indirect.MaterialImmediate:X} cannot be read");
             }
 
             if (seen.Add(key))
@@ -670,7 +717,7 @@ public static class ResourceMaterializer
                 for (uint dword = 0; dword < 8; dword++)
                 {
                     if (!ReadScalarBufferWord(heap.Dwords, heapOffset, dword * sizeof(uint), inputs, out candidate[dword]))
-                        return false;
+                        return Fail($"indirect image heap entry for key 0x{key:X} cannot be read");
                 }
             }
 
@@ -715,7 +762,7 @@ public static class ResourceMaterializer
             return MaterializeBufferTableImage(indirect, heap, r128, inputs, out result, out failure);
 
         if (heap.DwordCount != 2 || indirect.KeyBound == 0 || indirect.KeyBound > MaxIndirectImageProbes || inputs.ReadCleanMemory is null)
-            return false;
+            return Fail($"dense indirect image cannot be probed: heap dwords={heap.DwordCount} key bound={indirect.KeyBound}");
 
         var baseAddress = (((ulong)heap.Dwords[1] << 32) | heap.Dwords[0]) & AddressMask;
         var probed = new List<uint[]>((int)indirect.KeyBound);
@@ -728,7 +775,7 @@ public static class ResourceMaterializer
                 var relative = entry + dword * sizeof(uint);
                 if (relative > AddressMask || baseAddress > AddressMask - relative ||
                     !inputs.ReadCleanMemory(baseAddress + relative, out candidate[dword]))
-                    return false;
+                    return Fail($"dense indirect image entry {key} at 0x{baseAddress:X}+0x{relative:X} cannot be read");
             }
 
             if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) ||
@@ -748,7 +795,7 @@ public static class ResourceMaterializer
     // Every record of a V# table: the key is the record's byte offset, which the shader
     // passes as its scalar buffer offset. The V# range bounds the records; a record whose
     // bytes cannot be read ends the table as the hardware would read out of range.
-    private static bool MaterializeBufferTableImage(
+    internal static bool MaterializeBufferTableImage(
         IndirectImageSelector indirect,
         DescriptorWords table,
         bool r128,
@@ -759,7 +806,7 @@ public static class ResourceMaterializer
         failure = ResourceMaterializationFailure.Other;
         result = new IndirectImageTable();
         if (table.DwordCount != 4 || inputs.ReadCleanMemory is null)
-            return false;
+            return Fail($"buffer-table image has a {table.DwordCount}-dword table descriptor");
 
         var baseAddress = (table.Dwords[0] | ((ulong)(table.Dwords[1] & 0xFFFF) << 32)) & AddressMask;
         var recordStride = (table.Dwords[1] >> 16) & 0x3FFF;
@@ -771,6 +818,7 @@ public static class ResourceMaterializer
         var count = rangeBytes < indirect.TableOffset + entryBytes ? 0 : Math.Min((rangeBytes - indirect.TableOffset - entryBytes) / indirect.BufferTableStride + 1, MaxIndirectImageProbes);
         var probed = new List<uint[]>();
         var keys = new List<uint>();
+        Span<uint> pointer = stackalloc uint[2];
         for (ulong record = 0; record < count; record++)
         {
             var candidate = new uint[8];
@@ -779,21 +827,24 @@ public static class ResourceMaterializer
             var dwords = r128 ? 4u : 8u;
             if (pointerTable)
             {
-                if (!TryReadCleanWord(baseAddress, entry, inputs, out var low) ||
-                    !TryReadCleanWord(baseAddress, entry + sizeof(uint), inputs, out var high))
+                if (!ScalarBufferRangeRead.TryReadAddress(baseAddress, entry, inputs, pointer) &&
+                    (!TryReadCleanWord(baseAddress, entry, inputs, out pointer[0]) ||
+                     !TryReadCleanWord(baseAddress, entry + sizeof(uint), inputs, out pointer[1])))
                     break;
 
                 // A null or unmapped pointer cannot be followed; that record selects null.
-                var target = (((ulong)high << 32) | low) & AddressMask;
-                for (uint dword = 0; dword < dwords && readable && target != 0; dword++)
-                    readable = TryReadCleanWord(target, indirect.PointerTargetOffset!.Value + dword * sizeof(uint), inputs, out candidate[dword]);
-                if (target == 0 || !readable)
+                var target = (((ulong)pointer[1] << 32) | pointer[0]) & AddressMask;
+                var targetOffset = indirect.PointerTargetOffset!.Value;
+                readable = target != 0 &&
+                    (ScalarBufferRangeRead.TryReadAddress(target, targetOffset, inputs, candidate.AsSpan(0, (int)dwords)) ||
+                     TryReadWords(target, targetOffset, dwords, inputs, candidate));
+                if (!readable)
                     Array.Clear(candidate);
             }
             else
             {
-                for (uint dword = 0; dword < dwords && readable; dword++)
-                    readable = TryReadCleanWord(baseAddress, entry + dword * sizeof(uint), inputs, out candidate[dword]);
+                readable = ScalarBufferRangeRead.TryReadAddress(baseAddress, entry, inputs, candidate.AsSpan(0, (int)dwords)) ||
+                    TryReadWords(baseAddress, entry, dwords, inputs, candidate);
                 if (!readable)
                     break;
             }
@@ -824,7 +875,7 @@ public static class ResourceMaterializer
     {
         sampler = new uint[4];
         if (table.DwordCount != 4 || inputs.ReadCleanMemory is null || selector.Stride == 0)
-            return false;
+            return Fail($"pointer-table sampler cannot be probed: table dwords={table.DwordCount} stride={selector.Stride}");
 
         var baseAddress = (table.Dwords[0] | ((ulong)(table.Dwords[1] & 0xFFFF) << 32)) & AddressMask;
         var recordStride = (table.Dwords[1] >> 16) & 0x3FFF;
@@ -861,11 +912,28 @@ public static class ResourceMaterializer
     }
 
     // A bindless table names every texture the game knows; one whose memory is not mapped is
-    // not resident, and sampling it cannot be valid, so it binds as null.
+    // not resident, and sampling it cannot be valid, so it binds as null. Only the mapping
+    // matters: reading the texel would synchronize memory the GPU may have written.
     private static bool ImageBaseMapped(ReadOnlySpan<uint> descriptor, ResourceRuntimeInputs inputs)
     {
         var baseAddress = (((ulong)descriptor[0] | ((ulong)(descriptor[1] & 0xFF) << 32)) << 8) & AddressMask;
-        return baseAddress == 0 || inputs.ReadMemory is null || inputs.ReadMemory(baseAddress, out _);
+        if (baseAddress == 0)
+            return true;
+        if (inputs.IsMapped is { } isMapped)
+            return isMapped(baseAddress);
+        return inputs.ReadMemory is null || inputs.ReadMemory(baseAddress, out _);
+    }
+
+    // Reads dwords one at a time; the fallback when a bulk read of the same words is refused.
+    private static bool TryReadWords(ulong baseAddress, ulong offset, uint count, ResourceRuntimeInputs inputs, Span<uint> words)
+    {
+        for (uint dword = 0; dword < count; dword++)
+        {
+            if (!TryReadCleanWord(baseAddress, offset + dword * sizeof(uint), inputs, out words[(int)dword]))
+                return false;
+        }
+
+        return true;
     }
 
     private static bool MaterializeWaveIndexedImage(
@@ -881,11 +949,11 @@ public static class ResourceMaterializer
         failure = ResourceMaterializationFailure.Other;
         result = new IndirectImageTable();
         if (heap.DwordCount != 2 || inputs.ReadCleanMemory is null || wave.IndexStride == 0)
-            return false;
+            return Fail($"wave-indexed image cannot be probed: heap dwords={heap.DwordCount} index stride={wave.IndexStride}");
 
         var baseAddress = (((ulong)heap.Dwords[1] << 32) | heap.Dwords[0]) & AddressMask;
         if (!TryReadCleanWord(baseAddress, wave.MaskOffset, inputs, out var activeMask))
-            return false;
+            return Fail($"wave-indexed image mask at 0x{baseAddress:X}+0x{wave.MaskOffset:X} cannot be read");
 
         var keys = new SortedSet<uint>();
         for (uint bit = 0; bit < 32; bit++)
@@ -894,7 +962,7 @@ public static class ResourceMaterializer
                 continue;
             var indexOffset = (ulong)wave.IndexTableOffset + (ulong)bit * wave.IndexStride;
             if (!TryReadCleanWord(baseAddress, indexOffset, inputs, out var key))
-                return false;
+                return Fail($"wave-indexed image index for lane {bit} at 0x{baseAddress:X}+0x{indexOffset:X} cannot be read");
             // VCmpxLeI32 0, key suppresses signed-negative indices before ReadFirstLane.
             if ((key & 0x8000_0000u) == 0)
                 keys.Add(key);
@@ -911,7 +979,7 @@ public static class ResourceMaterializer
                 for (uint dword = 0; dword < candidate.Length; dword++)
                 {
                     if (!TryReadCleanWord(baseAddress, descriptorOffset + dword * sizeof(uint), inputs, out candidate[dword]))
-                        return false;
+                        return Fail($"wave-indexed image descriptor for key 0x{key:X} at 0x{baseAddress:X}+0x{descriptorOffset:X} cannot be read");
                 }
             }
 
