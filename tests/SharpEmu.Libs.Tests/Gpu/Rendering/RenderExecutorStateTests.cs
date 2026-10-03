@@ -140,6 +140,19 @@ public sealed class RenderExecutorStateTests : IDisposable
     }
 
     [Fact]
+    public void DynamicState_CarriesTheDepthBoundsOfTheDraw()
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.DepthTarget = banks.Context.DepthTarget with { DepthControl = banks.Context.DepthTarget.DepthControl | 0x8 };
+        banks.Context.DepthBoundsMin = 0.25f;
+        banks.Context.DepthBoundsMax = 0.75f;
+        var state = DrawAndTakeState(banks);
+
+        Assert.True(state.DepthBoundsTestEnabled);
+        Assert.Equal((0.25f, 0.75f), (state.DepthBoundsMin, state.DepthBoundsMax));
+    }
+
+    [Fact]
     public void DynamicState_PassesTheStencilMasksWhenTheStencilTestIsOn()
     {
         var banks = Banks(withDepth: true);

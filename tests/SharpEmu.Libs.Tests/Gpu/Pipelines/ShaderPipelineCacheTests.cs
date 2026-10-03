@@ -142,6 +142,25 @@ public sealed class ShaderPipelineCacheTests : IDisposable
         Assert.Equal(StencilOperations.Default, description.StaticParameters.StencilFront);
     }
 
+    // Titles move the depth bounds every frame; only the test enable may select a pipeline.
+    [Fact]
+    public void DepthBounds_KeyThePipelineByTheTestEnableOnly()
+    {
+        GraphicsPipelineDescription WithBounds(float min, float max) => Describe(banks =>
+        {
+            banks.Context.DepthTarget = banks.Context.DepthTarget with { DepthControl = banks.Context.DepthTarget.DepthControl | 0x8 };
+            banks.Context.DepthBoundsMin = min;
+            banks.Context.DepthBoundsMax = max;
+        }, withDepth: true);
+
+        var first = WithBounds(0.25f, 0.75f);
+        var moved = WithBounds(0.4f, 0.6f);
+
+        Assert.True(first.StaticParameters.DepthBoundsTestEnable);
+        Assert.Equal(ShaderPipelineCache.KeyOf(first), ShaderPipelineCache.KeyOf(moved));
+        Assert.NotEqual(ShaderPipelineCache.KeyOf(first), ShaderPipelineCache.KeyOf(Describe(withDepth: true)));
+    }
+
     [Fact]
     public void VertexInputState_FoldsEveryBindingAndAttribute()
     {

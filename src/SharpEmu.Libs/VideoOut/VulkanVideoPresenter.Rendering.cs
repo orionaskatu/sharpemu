@@ -648,6 +648,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);
             }
 
+            if (_supportsDepthBounds && state.DepthBoundsTestEnabled)
+            {
+                _vk.CmdSetDepthBounds(command, state.DepthBoundsMin, state.DepthBoundsMax);
+            }
+
             if (state.StencilTestEnabled)
             {
                 _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.CompareMask);
