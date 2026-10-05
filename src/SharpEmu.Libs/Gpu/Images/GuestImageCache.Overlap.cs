@@ -495,7 +495,11 @@ public sealed partial class GuestImageCache
                 return new OverlapResolution(result != null && ViewFormatRules.AreCompatible(result.Description.PixelFormat, requested.PixelFormat) ? resultImageIdentifier : ResourceSlotIdentifier.Invalid);
             }
 
-            if (requested.Type == cachedInfo.Type && requested.Resources > cachedInfo.Resources)
+            // More subresources, or the same ones over a larger footprint (a padded pitch),
+            // replace the cached image with the requested layout.
+            if (requested.Type == cachedInfo.Type &&
+                (requested.Resources > cachedInfo.Resources ||
+                 (requested.Resources == cachedInfo.Resources && requested.Data.Size > cachedInfo.Data.Size)))
             {
                 return new OverlapResolution(GrowImage(requested, cachedImageIdentifier));
             }

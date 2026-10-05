@@ -51,6 +51,11 @@ public sealed class GuestGpuMemory : IDisposable
 
     public PageGuard Pages => _pages;
 
+    private long _mappingVersion;
+
+    // Changes whenever a span is mapped or unmapped.
+    public long MappingVersion => Volatile.Read(ref _mappingVersion);
+
     // Stores arrive once the host GPU is ready; null stores cannot perform cache recovery.
     public void AttachStores(IGuestBufferStore? buffers, IGuestImageStore? images)
     {
@@ -161,6 +166,28 @@ public sealed class GuestGpuMemory : IDisposable
         }
     }
 
+    // The mapped parts of [address, address + size).
+    public List<GuestSpan> GetMappedRanges(ulong address, ulong size)
+    {
+        var result = new List<GuestSpan>();
+        AddMappedRanges(address, size, result);
+        return result;
+    }
+
+    // Appends the mapped parts of [address, address + size) to a caller-owned list.
+    public void AddMappedRanges(ulong address, ulong size, List<GuestSpan> result)
+    {
+        _spansLock.EnterReadLock();
+        try
+        {
+            _spans.AddOverlappingRanges(address, size, result);
+        }
+        finally
+        {
+            _spansLock.ExitReadLock();
+        }
+    }
+
     public void ForEachSpan(Action<ulong, ulong> visit)
     {
         _spansLock.EnterReadLock();
@@ -184,6 +211,7 @@ public sealed class GuestGpuMemory : IDisposable
         try
         {
             _spans.Add(address, size);
+            Interlocked.Increment(ref _mappingVersion);
         }
         finally
         {
@@ -256,6 +284,7 @@ public sealed class GuestGpuMemory : IDisposable
                 try
                 {
                     _spans.Remove(address, size);
+                    Interlocked.Increment(ref _mappingVersion);
                 }
                 finally
                 {

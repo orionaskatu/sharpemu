@@ -15,6 +15,25 @@ using SharpEmu.ShaderCompiler.Vulkan;
 
 const ulong ProgramAddress = 0x100000;
 
+// Lists the decoded instructions of a raw code dump.
+// --disassemble <code.bin>
+if (args.Length == 2 && args[0] == "--disassemble")
+{
+    var bytes = File.ReadAllBytes(args[1]);
+    var codeWords = new uint[(bytes.Length + 3) / 4 + 64];
+    Buffer.BlockCopy(bytes, 0, codeWords, 0, bytes.Length);
+    var codeMemory = new FakeMemory();
+    codeMemory.AddRegion(ProgramAddress, codeWords);
+    if (!Gen5ShaderTranslator.TryDecodeProgram(new CpuContext(codeMemory, Generation.Gen5), ProgramAddress, out var decoded, out var error))
+        throw new InvalidOperationException(error);
+    foreach (var instruction in decoded!.Instructions)
+    {
+        Console.WriteLine($"0x{instruction.Pc:X4} {instruction.Opcode} {string.Join(',', instruction.Destinations)} <- {string.Join(',', instruction.Sources)} {instruction.Control}");
+    }
+
+    return;
+}
+
 // Plans a recorded program (input.ir.txt) and emits it with the default specialization:
 // checks resource planning and SPIR-V emission of a shader the game rejected, offline.
 // --plan-ir <input.ir.txt> <compute|pixel|vertex> <out.spv>

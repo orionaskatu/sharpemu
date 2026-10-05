@@ -63,6 +63,20 @@ public interface IShaderPipelineProvider
         bool pixelActive,
         bool depthBound);
 
+    // Tessellation: the merged local+hull program run as compute workgroups, and the draw
+    // programs whose vertex stage runs the domain program over a grid. Null when unsupported.
+    ComputeProgram? GetHullProgram(VertexStageRegisters vertex, SharpEmu.ShaderCompiler.Gen5HullDispatch hull, uint[] userData) => null;
+
+    GraphicsPrograms? GetDomainPrograms(
+        VertexStageRegisters vertex,
+        PixelStageRegisters pixel,
+        ShaderInterfaceRegisters shaderInterface,
+        ContextRegisters context,
+        ReadOnlySpan<ColorComponentMap> targetExportMapping,
+        bool pixelActive,
+        bool depthBound,
+        SharpEmu.ShaderCompiler.Gen5DomainGrid domain) => null;
+
     PipelineHandle CreateGraphicsPipeline(
         ReadOnlySpan<ColorTargetState> colors,
         in DepthAttachmentState depth,

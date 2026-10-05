@@ -220,8 +220,9 @@ public sealed partial class RenderExecutor
 
         var vertexBuffers = AcquireVertexBuffers(vertexInput);
         var indexBuffer = AcquireIndexBuffer(in indexSource);
+        var dbgArgsState = emission.IndirectArgumentsAddress != 0 && _host.DebugCapturing ? _host.DebugBufferState(emission.IndirectArgumentsAddress, emission.Indexed ? IndexedIndirectArgumentsSize : IndirectArgumentsSize) : ""; // TEMP
         var indirectArguments = emission.IndirectArgumentsAddress != 0
-            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)
+            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, emission.Indexed ? IndexedIndirectArgumentsSize : IndirectArgumentsSize, isWritten: false)
             : default;
         DropUnwrittenColorTargets(context, ref state, pixelProgram);
         state.Rendering = AcquireAttachments(ref state);
@@ -248,6 +249,8 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x200);
         }
 
+        if (emission.IndirectArgumentsAddress != 0 && _host.DebugCapturing) _host.DebugNote($"argsaddr=0x{emission.IndirectArgumentsAddress:X} submit={submitId} vs=0x{vertexInput.Stage.Program?.Hash ?? 0:X} {dbgArgsState} bound=0x{indirectArguments.Handle:X}+0x{indirectArguments.Offset:X}"); // TEMP
+        if (emission.IndirectArgumentsAddress != 0) _host.DebugCaptureIndirectArguments(indirectArguments); // TEMP
         _host.BindVertexBuffers(vertexBuffers, vertexInput);
 
         if (pixelBindings is not null && setAutoDebug)
@@ -279,7 +282,14 @@ public sealed partial class RenderExecutor
         {
             // Uploads and shader writes end with barriers to all commands, so the
             // indirect read sees them.
-            _host.DrawIndexedIndirect(indirectArguments);
+            if (emission.Indexed)
+            {
+                _host.DrawIndexedIndirect(indirectArguments);
+            }
+            else
+            {
+                _host.DrawIndirect(indirectArguments);
+            }
         }
         else
         {
@@ -314,6 +324,7 @@ public sealed partial class RenderExecutor
     }
 
     private const ulong IndexedIndirectArgumentsSize = 20;
+    private const ulong IndirectArgumentsSize = 16;
 
     private void EmitDraw(UserConfigRegisters userConfig, VertexInputInfo vertexInput, in DrawCall draw, in DrawEmission emission)
     {

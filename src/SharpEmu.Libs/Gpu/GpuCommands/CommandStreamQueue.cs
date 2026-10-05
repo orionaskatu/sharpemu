@@ -127,6 +127,7 @@ public sealed class CommandStreamQueue
             return;
         }
 
+        if (DbgCommandHash) _dbgPendingHash = DbgHashBuffer(address, dwordCount); // TEMP
         lock (_gate)
         {
             var submission = new CommandSubmission(CommandSubmissionKind.Graphics, 0, address, dwordCount, submissionId, geometrySnapshots)
@@ -135,6 +136,7 @@ public sealed class CommandStreamQueue
             };
             _graphicsDone = false;
             EnqueueLocked(submission);
+            _dbgLastEnqueued = submission; // TEMP
         }
     }
 
@@ -151,9 +153,12 @@ public sealed class CommandStreamQueue
             throw _host.Fatal($"A compute submission is empty: queue=0x{queue:X} address=0x{address:X16}.");
         }
 
+        if (DbgCommandHash) _dbgPendingHash = DbgHashBuffer(address, dwordCount); // TEMP
         lock (_gate)
         {
-            EnqueueLocked(new CommandSubmission(CommandSubmissionKind.Compute, (int)(queue - GpuCommandInterpreter.ComputeQueueBase) + 1, address, dwordCount, submissionId, geometrySnapshots));
+            var submission = new CommandSubmission(CommandSubmissionKind.Compute, (int)(queue - GpuCommandInterpreter.ComputeQueueBase) + 1, address, dwordCount, submissionId, geometrySnapshots);
+            EnqueueLocked(submission);
+            _dbgLastEnqueued = submission; // TEMP
         }
     }
 
@@ -177,6 +182,114 @@ public sealed class CommandStreamQueue
         }
     }
 
+    // TEMP: SHARPEMU_DBG_SYNC_SUBMIT=<ms> makes the submitting guest thread wait until the render
+    // thread has interpreted its submission (bounded, so CPU-written labels cannot deadlock it).
+    [ThreadStatic] private static CommandSubmission? _dbgLastEnqueued;
+    internal static readonly int DbgSyncSubmitMilliseconds =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_SYNC_SUBMIT"), out var dbgSync) ? dbgSync : 0;
+    internal static long DbgSyncTimeouts;
+
+    public void DbgWaitForLastEnqueued()
+    {
+        var submission = _dbgLastEnqueued;
+        if (submission is null || DbgSyncSubmitMilliseconds <= 0)
+            return;
+        var deadline = System.Diagnostics.Stopwatch.GetTimestamp() + DbgSyncSubmitMilliseconds * System.Diagnostics.Stopwatch.Frequency / 1000;
+        lock (_gate)
+        {
+            while (!submission.DbgCompleted)
+            {
+                var remaining = (deadline - System.Diagnostics.Stopwatch.GetTimestamp()) * 1000 / System.Diagnostics.Stopwatch.Frequency;
+                if (remaining <= 0)
+                {
+                    if (Interlocked.Increment(ref DbgSyncTimeouts) % 100 == 1)
+                        Console.Error.WriteLine($"[DBG][SYNC] submit wait timed out: count={DbgSyncTimeouts} queue={submission.QueueId} address=0x{submission.Address:X16}");
+                    return;
+                }
+
+                Monitor.Wait(_gate, (int)Math.Min(remaining, 50));
+            }
+        }
+    }
+
+    // TEMP: SHARPEMU_DBG_CB_HASH=1 compares each command buffer at submit and at first interpretation.
+    internal static readonly bool DbgCommandHash = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CB_HASH") == "1";
+    private static long _dbgHashChecks, _dbgHashChanges;
+    [ThreadStatic] private static ulong _dbgPendingHash;
+    private CommandSubmission? _dbgCompletionPending;
+    private static long _dbgCompletionChecks, _dbgCompletionChanges;
+
+    private void DbgCheckCompletionHash()
+    {
+        var submission = _dbgCompletionPending;
+        _dbgCompletionPending = null;
+        if (submission is null)
+            return;
+        var checks = ++_dbgCompletionChecks;
+        if (DbgHashBuffer(submission.Address, submission.DwordCount) != submission.DbgHash)
+        {
+            var changes = ++_dbgCompletionChanges;
+            if (changes <= 30 || changes % 100 == 0)
+            {
+                var lagMs = (System.Diagnostics.Stopwatch.GetTimestamp() - submission.DbgEnqueuedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine($"[DBG][CBHASH] changed-by-completion queue={submission.QueueId} address=0x{submission.Address:X16} dwords={submission.DwordCount} lag_ms={lagMs:F1} changes={changes}/{checks}");
+            }
+        }
+
+        if (checks % 5000 == 0)
+            Console.Error.WriteLine($"[DBG][CBHASH] completion summary changes={_dbgCompletionChanges}/{checks} first-read changes={_dbgHashChanges}/{_dbgHashChecks}");
+    }
+    private static readonly Dictionary<(int, uint), long> _dbgHashChangesByQueue = new();
+
+    private ulong DbgHashBuffer(ulong address, uint dwords)
+    {
+        var bytes = new byte[Math.Min(dwords, 65536u) * 4u];
+        try
+        {
+            if (_host.Memory is not { } memory || !memory.TryRead(address, bytes))
+                return 0;
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
+
+        var hash = 1469598103934665603ul;
+        foreach (var value in System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes))
+            hash = (hash ^ value) * 1099511628211ul;
+        return hash;
+    }
+
+    private void DbgCheckHash(CommandSubmission submission)
+    {
+        if (!DbgCommandHash || submission.DbgHashed || submission.Kind == CommandSubmissionKind.FlipPreparation)
+            return;
+        submission.DbgHashed = true;
+        var now = DbgHashBuffer(submission.Address, submission.DwordCount);
+        var checks = Interlocked.Increment(ref _dbgHashChecks);
+        if (now != submission.DbgHash)
+        {
+            var changes = Interlocked.Increment(ref _dbgHashChanges);
+            lock (_dbgHashChangesByQueue)
+            {
+                var key = (submission.QueueId, submission.DwordCount);
+                _dbgHashChangesByQueue[key] = _dbgHashChangesByQueue.GetValueOrDefault(key) + 1;
+            }
+
+            if (changes <= 20 || changes % 200 == 0)
+            {
+                var lagMs = (System.Diagnostics.Stopwatch.GetTimestamp() - submission.DbgEnqueuedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine($"[DBG][CBHASH] changed queue={submission.QueueId} address=0x{submission.Address:X16} dwords={submission.DwordCount} lag_ms={lagMs:F1} changes={changes}/{checks}");
+            }
+        }
+
+        if (checks % 5000 == 0)
+        {
+            lock (_dbgHashChangesByQueue)
+                Console.Error.WriteLine($"[DBG][CBHASH] summary changes={_dbgHashChanges}/{checks} " + string.Join(' ', _dbgHashChangesByQueue.OrderByDescending(e => e.Value).Take(8).Select(e => $"q{e.Key.Item1}/{e.Key.Item2}:{e.Value}")));
+        }
+    }
+
     private void EnqueueLocked(CommandSubmission submission)
     {
         if (!_accepting)
@@ -187,6 +300,12 @@ public sealed class CommandStreamQueue
             }
 
             throw _host.Fatal($"The command stream no longer accepts submissions: queue={submission.QueueId} address=0x{submission.Address:X16}.");
+        }
+
+        if (DbgCommandHash && submission.Kind != CommandSubmissionKind.FlipPreparation) // TEMP
+        {
+            submission.DbgHash = _dbgPendingHash;
+            submission.DbgEnqueuedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
         _queues[submission.QueueId].AddLast(submission);
@@ -350,6 +469,7 @@ public sealed class CommandStreamQueue
         }
 
         bool complete;
+        DbgCheckHash(submission); // TEMP
         try
         {
             complete = RunSlice(submission);
@@ -370,9 +490,10 @@ public sealed class CommandStreamQueue
             throw;
         }
 
+        SliceResult result;
         lock (_gate)
         {
-            SliceResult result;
+            submission.DbgCompleted = true; // TEMP: reached (completed or blocked on a wait)
             if (!complete)
             {
                 submission.Blocked = true;
@@ -392,13 +513,18 @@ public sealed class CommandStreamQueue
                     }
                 }
 
+                submission.DbgCompleted = true; // TEMP
+                if (DbgCommandHash && submission.Kind != CommandSubmissionKind.FlipPreparation && submission.DbgHashed)
+                    _dbgCompletionPending = submission; // TEMP: hashed outside the lock below
                 result = SliceResult.Completed;
             }
 
             _processing = false;
             Monitor.PulseAll(_gate);
-            return result;
         }
+
+        DbgCheckCompletionHash(); // TEMP
+        return result;
     }
 
     private bool RunSlice(CommandSubmission submission)

@@ -1640,7 +1640,22 @@ public static partial class VideoOutExports
             $"[LOADER][PERF] videoout submitted_fps={submitted / elapsedSeconds:F1} " +
             $"presented_fps={presentedCount / elapsedSeconds:F1} " +
             $"draws={draws} draw_ms={drawMs:F0} pipelines={pipelines} spirv={spirvCompiles} " +
-            $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1}");
+            $"pool_leases={poolLeases} pool_cached_mb={poolCachedBytes / 1024.0 / 1024.0:F1}" +
+            DbgGcStats()); // TEMP
+    }
+
+    // TEMP: GC activity since the previous report.
+    private static int _dbgGen0, _dbgGen1, _dbgGen2;
+    private static TimeSpan _dbgPause;
+    private static long _dbgAllocated;
+    private static string DbgGcStats()
+    {
+        int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+        var pause = GC.GetTotalPauseDuration();
+        var allocated = GC.GetTotalAllocatedBytes();
+        var text = $" gc0={g0 - _dbgGen0} gc1={g1 - _dbgGen1} gc2={g2 - _dbgGen2} gc_pause_ms={(pause - _dbgPause).TotalMilliseconds:F0} alloc_mb={(allocated - _dbgAllocated) / 1048576.0:F0}";
+        (_dbgGen0, _dbgGen1, _dbgGen2, _dbgPause, _dbgAllocated) = (g0, g1, g2, pause, allocated);
+        return text;
     }
 
     private static readonly bool _flipPacingDisabled = string.Equals(

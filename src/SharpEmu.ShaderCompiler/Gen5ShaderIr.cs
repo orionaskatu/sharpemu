@@ -132,6 +132,17 @@ public readonly record struct Gen5PixelOutputBinding(
         : this(guestSlot, hostLocation, kind, Gen5ColorComponentMapping.Identity)
     {
     }
+
+    private readonly uint? _exportTarget;
+
+    // The EXP MRT target that feeds this slot. It differs from the slot when the pixel
+    // program skips targets, because the hardware packs color exports into the slots
+    // that CB_SHADER_MASK enables.
+    public uint ExportTarget
+    {
+        get => _exportTarget ?? GuestSlot;
+        init => _exportTarget = value;
+    }
 }
 
 public readonly record struct Gen5ComputeSystemRegisters(
@@ -139,6 +150,30 @@ public readonly record struct Gen5ComputeSystemRegisters(
     uint? WorkGroupYRegister,
     uint? WorkGroupZRegister,
     uint? ThreadGroupSizeRegister);
+
+// A merged local+hull program run as a compute workgroup of one wave64. Each workgroup
+// holds PatchesPerGroup patches; the prologue derives the hull system registers from the
+// workgroup and lane, and reads the draw values from the user data at s2-s5:
+// s2 = first patch of the dispatch, s3 = patch count, s4 = patches per instance, s5 = first vertex.
+// It then sets s2 = off-chip offset, s3 = merged wave info, s4 = factor offset,
+// v1 = relative patch and control point ids, v2 = vertex id, v3 = local vertex slot, v5 = instance id.
+public readonly record struct Gen5HullDispatch(
+    uint PatchesPerGroup,
+    uint InputControlPoints,
+    uint OutputControlPoints,
+    uint OffchipBytesPerGroup,
+    uint FactorBytesPerPatch);
+
+// A domain program run as a vertex shader over a uniform grid of Segments x Segments cells per
+// patch: the instance index is the patch, the vertex index the grid corner of a triangle list.
+// The prologue sets v5/v6 = tessellation coordinates, v7 = relative patch id, v8 = patch id and
+// s4 = the off-chip offset of the patch's hull workgroup.
+public readonly record struct Gen5DomainGrid(
+    uint PatchesPerGroup,
+    uint OffchipBytesPerGroup,
+    uint Segments,
+    bool Triangles,
+    bool Clockwise);
 
 public readonly record struct Gen5Operand(Gen5OperandKind Kind, uint Value)
 {

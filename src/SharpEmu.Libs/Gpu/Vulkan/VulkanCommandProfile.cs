@@ -8,7 +8,7 @@ namespace SharpEmu.Libs.Gpu.Vulkan;
 
 internal sealed unsafe class VulkanCommandProfile : IDisposable
 {
-    internal const int QueryCapacity = 512;
+    internal const int QueryCapacity = 8192;
     private const int BufferCapacity = 64;
     private readonly Vk _vulkan;
     private readonly Device _device;

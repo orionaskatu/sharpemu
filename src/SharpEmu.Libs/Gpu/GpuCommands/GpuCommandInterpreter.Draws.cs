@@ -40,12 +40,54 @@ public sealed partial class GpuCommandInterpreter
         DrawIndexed(packetAddress, PacketOpcode.DrawIndexOffset2, indexCount, IndexBaseAddress + (indexOffset * IndexElementSize));
     }
 
+    private static int _dbgHullRawDumps; // TEMP
+
+    private void DbgDumpHullRaw() // TEMP
+    {
+            if ((TypedRegisters.Context.ShaderStages & 0x4) != 0 && Interlocked.Increment(ref _dbgHullRawDumps) <= 8) // TEMP
+            {
+                var text = new System.Text.StringBuilder();
+                for (var register = 0x100u; register < 0x150u; register++)
+                    if (Registers.Shader.TryGetValue(register, out var rawValue) && rawValue != 0) text.Append($" {register:X3}={rawValue:X8}");
+                for (var register = 0x80u; register < 0x100u; register++)
+                    if (Registers.Shader.TryGetValue(register, out var rawValue) && rawValue != 0) text.Append($" {register:X3}={rawValue:X8}");
+                Console.Error.WriteLine($"[DBG][HSRAW]{text}");
+                if (_dbgHullRawDumps == 1)
+                {
+                    var all = new System.Text.StringBuilder();
+                    foreach (var (register, value) in Registers.Shader.OrderBy(pair => pair.Key))
+                        if (value != 0) all.Append($" {register:X3}={value:X8}");
+                    Console.Error.WriteLine($"[DBG][HSALL]{all}");
+                }
+
+                if (_dbgHullRawDumps <= 2)
+                {
+                    var table = new byte[0x80];
+                    var ok = _host.TryReadGuest(0x2000010000UL, table);
+                    Console.Error.WriteLine($"[DBG][HSRING] ok={ok} table={Convert.ToHexString(table)}");
+                }
+
+                if (_dbgHullRawDumps == 1 && Registers.Shader.TryGetValue(0x100u, out var checksum))
+                {
+                    foreach (var candidate in new[] { (ulong)checksum << 8, 0x8000000000UL | ((ulong)checksum << 8), (ulong)checksum })
+                    {
+                        var bytes = new byte[0x4000];
+                        var ok = _host.TryReadGuest(candidate, bytes);
+                        Console.Error.WriteLine($"[DBG][HSRAW] candidate=0x{candidate:X} ok={ok} head={Convert.ToHexString(bytes, 0, 32)}");
+                        if (ok) File.WriteAllBytes(Path.Combine(Path.GetTempPath(), $"hs_candidate_{candidate:X}.bin"), bytes);
+                    }
+                }
+            }
+    }
+
     internal void DrawAuto(ulong packetAddress, uint opcode, uint vertexCount, uint instanceCount = 0, uint firstVertex = 0, uint firstInstance = 0, DrawOffsetSource offsetSource = DrawOffsetSource.Packet)
     {
         if (instanceCount == 0)
         {
             instanceCount = InstanceCount;
         }
+
+        DbgDumpHullRaw(); // TEMP
 
         _host.DrawAuto(SubmitId, new DrawAutoArguments(packetAddress, opcode, vertexCount, instanceCount, firstVertex, firstInstance, offsetSource));
     }
@@ -81,6 +123,7 @@ public sealed partial class GpuCommandInterpreter
         var drawCount = maxCountOrCount;
         if (countAddress != 0)
         {
+            DbgCount(3); // TEMP
             drawCount = Math.Min(ReadDword(countAddress), maxCountOrCount);
         }
 
@@ -105,6 +148,17 @@ public sealed partial class GpuCommandInterpreter
     {
         if (!indexed)
         {
+            if (_host.ResolvesIndirectDrawOnGpu)
+            {
+                // The host reads the four arguments on the GPU, or itself when the draw needs the counts.
+                _deferredInstanceCountAddress = argumentsAddress + 4;
+                DbgDumpHullRaw(); // TEMP
+                _host.DrawAuto(SubmitId, new DrawAutoArguments(
+                    packetAddress, opcode, 1, 1, 0, 0, DrawOffsetSource.IndirectArguments, argumentsAddress));
+                return;
+            }
+
+            DbgCount(0); // TEMP
             var vertexCount = ReadDword(argumentsAddress);
             var instanceCount = ReadDword(argumentsAddress + 4);
             var startVertex = ReadDword(argumentsAddress + 8);
@@ -120,12 +174,14 @@ public sealed partial class GpuCommandInterpreter
             // range; the arguments pick the indices. The host falls back to reading them
             // itself when the draw needs the counts.
             _deferredInstanceCountAddress = argumentsAddress + 4;
+            DbgCount(1); // TEMP
             _host.DrawIndexed(SubmitId, new DrawIndexedArguments(
                 packetAddress, opcode, gpuIndexCount, IndexBaseAddress, IndexTypeAndSize, 1, 0, 0,
                 DrawOffsetSource.IndirectArguments, argumentsAddress, UnboundedIndexBuffer: IndexBufferSize == 0));
             return;
         }
 
+        DbgCount(2); // TEMP
         var indexCountPerInstance = ReadDword(argumentsAddress);
         var indexedInstanceCount = ReadDword(argumentsAddress + 4);
         var startIndex = ReadDword(argumentsAddress + 8);
@@ -151,6 +207,14 @@ public sealed partial class GpuCommandInterpreter
     private const int MaxIndexExtents = 4096;
     private readonly Dictionary<ulong, ulong> _indexExtents = new();
     private uint _indexExtentDraws;
+
+    // TEMP: indirect draw path counters.
+    internal static readonly long[] DbgCounts = new long[6];
+    internal static void DbgCount(int index)
+    {
+        if (Interlocked.Increment(ref DbgCounts[index]) % 5000 == 0)
+            Console.Error.WriteLine($"[DBG][INDIRECT] nonindexed={DbgCounts[0]} gpu={DbgCounts[1]} cpuindexed={DbgCounts[2]} count={DbgCounts[3]} deferredread={DbgCounts[4]} resolves={DbgCounts[5]}");
+    }
 
     private bool TryGetGpuIndexRange(out uint indexCount)
     {

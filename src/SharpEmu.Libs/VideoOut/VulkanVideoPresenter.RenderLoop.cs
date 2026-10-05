@@ -121,6 +121,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _relay.RunPendingCommands();
             }
+            CaptureReadbackIfPending(); // TEMP
             if (_deviceLost)
             {
                 RenderDocCapture.DiscardFrame();

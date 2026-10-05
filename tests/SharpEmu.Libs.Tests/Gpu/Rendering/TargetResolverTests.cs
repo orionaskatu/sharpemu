@@ -94,6 +94,23 @@ public sealed class TargetResolverTests : IClassFixture<HeadlessVulkanFixture>
         // A test that reads the reference cannot also carry a different replacement value.
         var tested = StencilContext(pass: 4, writeMask: 0xFF, operationValue: 0x20, DepthControl(CompareOp.Less, CompareOp.Equal));
         Assert.Contains("replacement", Assert.Throws<InvalidOperationException>(() => DepthTargetResolver.ResolveState(tested, true, Fatal)).Message);
+
+        // Replacing the written bits with zeros is a ZERO, so the reference keeps the test value.
+        tested.StencilMask.TestValue = 0x40;
+        tested.StencilMask.WriteMask = 0x40;
+        tested.StencilMask.OperationValue = 0x00;
+        state = DepthTargetResolver.ResolveState(tested, true, Fatal);
+        Assert.Equal(StencilOp.Zero, state.FrontOperations.PassOperation);
+        Assert.Equal(new StencilMasks(0xFF, 0x40, 0x40), state.FrontMasks);
+
+        // Disjoint compared and written bits share one reference.
+        tested.StencilMask.TestValue = 0x05;
+        tested.StencilMask.Mask = 0x0F;
+        tested.StencilMask.WriteMask = 0xF0;
+        tested.StencilMask.OperationValue = 0x30;
+        state = DepthTargetResolver.ResolveState(tested, true, Fatal);
+        Assert.Equal(StencilOp.Replace, state.FrontOperations.PassOperation);
+        Assert.Equal(new StencilMasks(0x0F, 0xF0, 0x35), state.FrontMasks);
         context.StencilMask.OperationValue = 0x20;
 
         // Without a write mask the operations have no effect, so the mismatch does not matter.

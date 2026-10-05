@@ -27,5 +27,19 @@ public sealed class CpuDirtySummary
         }
     }
 
+    public void ForEachDirty(Action<ulong> visit)
+    {
+        for (var index = 0; index < _words.Length; index++)
+        {
+            var word = (ulong)Volatile.Read(ref _words[index]);
+            while (word != 0)
+            {
+                var bit = System.Numerics.BitOperations.TrailingZeroCount(word);
+                visit((ulong)index * WordBits + (ulong)bit);
+                word &= word - 1;
+            }
+        }
+    }
+
     public bool IsDirty(ulong block) => (Volatile.Read(ref _words[block / WordBits]) & (1L << (int)(block % WordBits))) != 0;
 }

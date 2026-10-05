@@ -219,6 +219,7 @@ internal static unsafe partial class VulkanVideoPresenter
             imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
             BindImage(imageIdentifier, storage);
             var descriptor = new TextureDescriptorWords(words);
+            CaptureNoteTexture(program, index, imageIdentifier, request, descriptor.BaseAddress, words); // TEMP
             if (ShouldTraceTextureBindings())
             {
                 var cached = _imageCache.GetImage(imageIdentifier);
@@ -413,6 +414,13 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Reject incompatible draw views before buffer writes or image transitions are recorded.
+        // TEMP: SHARPEMU_DBG_IMAGE_USE=addr,addr logs every shader that binds those images.
+        private static readonly HashSet<ulong>? DbgImageUseAddresses =
+            Environment.GetEnvironmentVariable("SHARPEMU_DBG_IMAGE_USE") is { Length: > 0 } dbgText
+                ? dbgText.Split(',').Select(text => Convert.ToUInt64(text.Trim(), 16)).ToHashSet()
+                : null;
+        private static readonly HashSet<(ulong, ulong, bool, Format)> DbgImageUseSeen = new();
+
         private void ValidateDrawImageTypes(PreparedStageBindings prepared)
         {
             if (prepared.Program.Stage == ShaderStageKind.Compute)
@@ -482,6 +490,9 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Uploads every mapped range into the cache before a device-address draw; the fault pass follows.
+        private readonly List<GuestSpan> _mappedSpans = new();
+        private long _mappedSpansVersion = -1;
+
         public void PrepareDeviceAddresses()
         {
             var preparation = RequirePreparation();
@@ -501,8 +512,20 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             using var profileScope = BufferUploadProfile.BeginSweep(vertexProgramHash, pixelProgramHash, computeProgramHash);
             var memory = GuestGpuMemoryHook.Current ?? throw SubmissionScheduler.Fatal("A device-address program needs the guest GPU memory registry.");
-            var spans = new List<GuestSpan>();
-            memory.ForEachSpan((address, size) => spans.Add(new GuestSpan(address, size)));
+            var mappingVersion = memory.MappingVersion;
+            List<GuestSpan> Spans()
+            {
+                // Tens of thousands of spans with texture streaming: rebuilt only when the mapping changes.
+                if (_mappedSpansVersion != mappingVersion)
+                {
+                    _mappedSpans.Clear();
+                    memory.ForEachSpan((address, size) => _mappedSpans.Add(new GuestSpan(address, size)));
+                    _mappedSpansVersion = mappingVersion;
+                }
+
+                return _mappedSpans;
+            }
+
             var traceAddress = GuestGpuMemoryHook.TraceAddress;
             if (traceAddress != 0)
             {
@@ -519,7 +542,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (traceAddress != 0 && !memory.Covers(traceAddress, 1))
                 GuestGpuMemoryHook.Trace(traceAddress, 1,
                     $"device-address-mapping-check readable={_guestMemory.CanRead(traceAddress, 1)} backed={_guestBacking.IsBackedView(traceAddress)}");
-            _bufferCache.PrepareBda(spans);
+            _bufferCache.PrepareBda(mappingVersion, Spans, memory.AddMappedRanges);
         }
 
         public void BindResources(IPreparedBindings prepared)
@@ -648,7 +671,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var snapshot = prepared.Stage.Resources;
             if (!layout.UsesBindlessImages)
             {
-                prepared.Descriptors.FlattenedTable = UploadDwords(snapshot.FlattenedResourceTable, "flattened resource table", program);
+                var patched = PatchTableOnCpu(snapshot, 0, snapshot.FlattenedResourceTable, out var deviceRuns);
+                prepared.Descriptors.FlattenedTable = UploadDwords(patched, "flattened resource table", program);
+                CopyTableRuns(prepared.Descriptors.FlattenedTable, deviceRuns);
                 return;
             }
 
@@ -687,7 +712,68 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             snapshot.FlattenedResourceTable.AsSpan().CopyTo(table.AsSpan(slotCount));
+            PatchTableOnCpu(snapshot, slotCount, table, out var runs);
             prepared.Descriptors.FlattenedTable = UploadDwords(table, "bindless image slot table", program);
+            CopyTableRuns(prepared.Descriptors.FlattenedTable, runs);
+        }
+
+        // Table words the materializer left to the device: runs whose bytes a GPU buffer still
+        // owns are copied in queue order after upload; any other word is read on the CPU now.
+        private uint[] PatchTableOnCpu(ResourceSnapshot snapshot, int baseDword, uint[] table,
+            out List<(ulong Address, uint Dword, uint Count)> deviceRuns)
+        {
+            deviceRuns = [];
+            var patches = snapshot.TablePatches;
+            if (patches.Length == 0)
+            {
+                return table;
+            }
+
+            if (ReferenceEquals(table, snapshot.FlattenedResourceTable))
+            {
+                table = (uint[])table.Clone();
+            }
+
+            foreach (var patch in patches)
+            {
+                var dword = (uint)baseDword + patch.FlatOffset;
+                if (_bufferCache.IsGpuOwnedWord(patch.Address) && !_imageCache.HasGpuModifiedImageBytes(patch.Address, sizeof(uint)))
+                {
+                    if (deviceRuns.Count != 0 && deviceRuns[^1] is var last &&
+                        last.Address + last.Count * sizeof(uint) == patch.Address && last.Dword + last.Count == dword)
+                    {
+                        deviceRuns[^1] = last with { Count = last.Count + 1 };
+                    }
+                    else
+                    {
+                        deviceRuns.Add((patch.Address, dword, 1));
+                    }
+
+                    continue;
+                }
+
+                if (!TryReadGuestWord(patch.Address, out table[dword]))
+                {
+                    table[dword] = 0;
+                }
+            }
+
+            return table;
+        }
+
+        private void CopyTableRuns(BufferView table, List<(ulong Address, uint Dword, uint Count)> runs)
+        {
+            foreach (var run in runs)
+            {
+                if (_bufferCache.TryCopyGpuOwned(run.Address, run.Count * sizeof(uint), table.Buffer.Handle,
+                    table.Offset + run.Dword * sizeof(uint)))
+                {
+                    continue;
+                }
+
+                // PatchTableOnCpu checked ownership on this thread just before the upload.
+                throw SubmissionScheduler.Fatal($"A GPU-owned table run could not be copied: address=0x{run.Address:X16} dwords={run.Count}.");
+            }
         }
 
         // Device-address reads need persistent page-table entries before the shader runs.
@@ -811,6 +897,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     _imageCache.ApplyPendingDccClear(binding.ImageIdentifier, descriptor.MetadataAddress << 8);
                 }
+
+                if (DbgImageUseAddresses is { } dbgAddresses && dbgAddresses.Contains(image.Description.Data.Address)) // TEMP
+                {
+                    var dbgKey = (program.Hash ^ image.Backing.Handle.Handle, image.Description.Data.Address, binding.IsStorage, view.Format);
+                    lock (DbgImageUseSeen)
+                    {
+                        if (DbgImageUseSeen.Add(dbgKey))
+                            Console.Error.WriteLine($"[DBG][IMGUSE] hash=0x{program.Hash:X16} slot={index} addr=0x{image.Description.Data.Address:X} storage={binding.IsStorage} written={resource.Written} view={view.Format} backing={image.Description.PixelFormat} mip={view.BaseLevel} image=0x{image.Backing.Handle.Handle:X}");
+                    }
+                }
+
+                if (binding.IsStorage && resource.Written)
+                    CaptureNoteStorage(image, binding.Request.View, image.Description.Data.Address, program.Hash, index); // TEMP
 
                 image.Uses.Storage |= binding.IsStorage;
                 image.Uses.Texture |= !binding.IsStorage;

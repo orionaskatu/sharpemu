@@ -51,6 +51,17 @@ public sealed partial class RenderExecutor
         }
 
         state.PixelActive = HasActivePixelShader(banks);
+        if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive &&
+            VertexStageWritesMemory(banks, ref state))
+        {
+            // No attachment and no pixel stage, but the vertex (or emulated geometry) stage
+            // still stores to memory: a GPU-culling or stream-out pass whose only output is
+            // the buffer a later indirect draw reads. Rasterization has nothing to write, so
+            // the draw runs for its stores alone.
+            TraceDrawDisposition(banks, in draw, "vertex-stores-only");
+            return true;
+        }
+
         if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive)
         {
             TraceDrawDisposition(banks, in draw, "no-framebuffer");
@@ -65,6 +76,21 @@ public sealed partial class RenderExecutor
         }
 
         return true;
+    }
+
+    // Whether the bound vertex (or emulated geometry) stage stores to a buffer or a
+    // storage image, which is the only observable effect a draw without attachments
+    // and without a pixel stage can have.
+    private bool VertexStageWritesMemory(RegisterBanks banks, ref DrawState state)
+    {
+        if (banks.Shader.Vertex.ExportAddress == 0)
+        {
+            return false;
+        }
+
+        ResolveShaderPrograms(banks, ref state);
+        var stage = state.Programs.VertexInput.Stage;
+        return stage.Program is { } program && (WritesStorageImage(program) || HasBufferWrites(stage));
     }
 
     // Color control mode 3 resolves slot 0 into slot 1 instead of drawing; true consumes the draw.

@@ -51,6 +51,37 @@ public sealed partial class ScalarValueGraph
     // The graph is complete once built, so a phi's invariant value never changes; the
     // resource evaluator asks for it on every draw.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ScalarValue, ScalarValue?> _invariantPhis = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ScalarValue, ScalarValue[]> _phiLeaves = new();
+
+    // The non-phi values a phi web reaches, in the order a depth-first walk meets them. The
+    // graph is immutable once built, so the leaves are computed once per phi.
+    public ScalarValue[] PhiLeaves(ScalarValue phi) => _phiLeaves.GetOrAdd(phi, static current => CollectPhiLeaves(current));
+
+    private static ScalarValue[] CollectPhiLeaves(ScalarValue phi)
+    {
+        var leaves = new List<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(phi);
+        while (pending.TryPop(out var current))
+        {
+            if (current.Kind != ScalarValueKind.Phi)
+            {
+                leaves.Add(current);
+                continue;
+            }
+
+            if (visited.Add(current))
+            {
+                foreach (var operand in current.Operands)
+                {
+                    pending.Push(operand);
+                }
+            }
+        }
+
+        return leaves.ToArray();
+    }
 
     public ScalarValue? ResolveInvariantPhi(ScalarValue value) =>
         value.Kind != ScalarValueKind.Phi

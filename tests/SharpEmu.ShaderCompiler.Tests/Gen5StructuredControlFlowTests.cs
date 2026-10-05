@@ -31,7 +31,7 @@ public sealed class Gen5StructuredControlFlowTests
                 names[words[index + 1]] = Encoding.UTF8.GetString(code.AsSpan((index + 2) * 4, (length - 2) * 4)).TrimEnd('\0');
             if (opcode == SpirvOp.Variable) variables[words[index + 2]] = words[index + 3];
         }
-        foreach (var name in new[] { "sgpr", "vgpr" })
+        foreach (var name in new[] { "s0", "v0" })
         {
             var id = Assert.Single(names, entry => entry.Value == name).Key;
             Assert.Equal((uint)SpirvStorageClass.Function, variables[id]);

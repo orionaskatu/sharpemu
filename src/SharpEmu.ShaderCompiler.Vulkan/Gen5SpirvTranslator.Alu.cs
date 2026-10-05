@@ -1693,10 +1693,80 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (FastHalf)
+            {
+                result = EmitNativePackedF16(instruction, control);
+                return true;
+            }
+
             var low = EmitPackedF16Lane(instruction, control, highLane: false);
             var high = EmitPackedF16Lane(instruction, control, highLane: true);
             result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
             return true;
+        }
+
+        private bool FastHalf => _request.SupportsExactFloat16Conversions && _request.FastFloat16Arithmetic;
+
+        // Both lanes of a packed f16 op as one f16vec2 operation.
+        private uint EmitNativePackedF16(Gen5ShaderInstruction instruction, Gen5Vop3pControl control)
+        {
+            uint Operand(int index) => NativePackedF16Operand(instruction, control, index);
+            var left = Operand(0);
+            var right = Operand(1);
+            var value = instruction.Opcode switch
+            {
+                "VPkAddF16" => _module.AddInstruction(SpirvOp.FAdd, _half2Type, left, right),
+                "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, _half2Type, left, right),
+                "VPkMinF16" => Ext(79, _half2Type, left, right),
+                "VPkMaxF16" => Ext(80, _half2Type, left, right),
+                "VPkFmaF16" => Ext(50, _half2Type, left, right, Operand(2)),
+                _ => left,
+            };
+            return Bitcast(_uintType, control.Clamp ? ClampHalf2(value) : value);
+        }
+
+        private uint ClampHalf2(uint value)
+        {
+            var zero = _module.ConstantNull(_half2Type);
+            var one = _module.AddInstruction(SpirvOp.CompositeConstruct, _half2Type,
+                _module.Constant(_halfType, 0x3C00), _module.Constant(_halfType, 0x3C00));
+            return Ext(43, _half2Type, value, zero, one);
+        }
+
+        // One packed source as f16vec2: op_sel / op_sel_hi pick each lane's half and neg_lo /
+        // neg_hi flip its sign bit. An inline constant feeds both lanes the same f16 value.
+        private uint NativePackedF16Operand(Gen5ShaderInstruction instruction, Gen5Vop3pControl control, int index)
+        {
+            var negateLow = ((control.NegLoMask >> index) & 1) != 0;
+            var negateHigh = ((control.NegHiMask >> index) & 1) != 0;
+            uint bits;
+            if (instruction.Sources[index].Kind is Gen5OperandKind.EncodedConstant)
+            {
+                var half = _module.AddInstruction(SpirvOp.FConvert, _halfType, GetFloatSource(instruction, index));
+                var pair = _module.AddInstruction(SpirvOp.CompositeConstruct, _half2Type, half, half);
+                bits = Bitcast(_uintType, pair);
+            }
+            else
+            {
+                var raw = GetRawSource(instruction, index);
+                var lowFromHigh = ((control.OpSelMask >> index) & 1) != 0;
+                var highFromHigh = ((control.OpSelHiMask >> index) & 1) != 0;
+                bits = (lowFromHigh, highFromHigh) switch
+                {
+                    (false, true) => raw,
+                    (false, false) => BitwiseOr(BitwiseAnd(raw, UInt(0xFFFF)), ShiftLeftLogical(raw, UInt(16))),
+                    (true, true) => BitwiseOr(ShiftRightLogical(raw, UInt(16)), BitwiseAnd(raw, UInt(0xFFFF_0000))),
+                    (true, false) => BitwiseOr(ShiftRightLogical(raw, UInt(16)), ShiftLeftLogical(raw, UInt(16))),
+                };
+            }
+
+            var flip = (negateLow ? 0x8000u : 0) | (negateHigh ? 0x8000_0000u : 0);
+            if (flip != 0)
+            {
+                bits = BitwiseXor(bits, UInt(flip));
+            }
+
+            return Bitcast(_half2Type, bits);
         }
 
         // V_PK_ADD/SUB_I16 operates on the selected 16-bit halves of src0 and
@@ -1888,6 +1958,14 @@ public static partial class Gen5SpirvTranslator
             uint destination)
         {
             var accumulator = LoadV(destination);
+            if (FastHalf)
+            {
+                return Bitcast(_uintType, Ext(50, _half2Type,
+                    Bitcast(_half2Type, GetRawSource(instruction, 0)),
+                    Bitcast(_half2Type, GetRawSource(instruction, 1)),
+                    Bitcast(_half2Type, accumulator)));
+            }
+
             var low = EmitPackedF16FmacLane(instruction, accumulator, highLane: false);
             var high = EmitPackedF16FmacLane(instruction, accumulator, highLane: true);
             return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
@@ -2182,6 +2260,11 @@ public static partial class Gen5SpirvTranslator
             var half = _module.AddInstruction(
                 SpirvOp.CompositeExtract, _halfType, Bitcast(_half2Type, halfBits), 0);
             var widened = Bitcast(_uintType, _module.AddInstruction(SpirvOp.FConvert, _floatType, half));
+            if (FastHalf)
+            {
+                return widened;
+            }
+
             var magnitude = BitwiseAnd(halfBits, UInt(0x7FFF));
             var nan = BitwiseOr(
                 ShiftLeftLogical(BitwiseAnd(halfBits, UInt(0x8000)), UInt(16)),
@@ -2197,6 +2280,11 @@ public static partial class Gen5SpirvTranslator
             var half = _module.AddInstruction(SpirvOp.FConvert, _halfType, Bitcast(_floatType, bits));
             var pair = _module.AddInstruction(SpirvOp.CompositeConstruct, _half2Type, half, half);
             var narrowed = BitwiseAnd(Bitcast(_uintType, pair), UInt(0xFFFF));
+            if (FastHalf)
+            {
+                return narrowed;
+            }
+
             var nan = BitwiseOr(BitwiseAnd(ShiftRightLogical(bits, UInt(16)), UInt(0x8000)), UInt(0x7E00));
             var isNan = UCmp(SpirvOp.UGreaterThan, BitwiseAnd(bits, UInt(0x7FFF_FFFF)), UInt(0x7F80_0000));
             return SelectU(isNan, nan, narrowed);

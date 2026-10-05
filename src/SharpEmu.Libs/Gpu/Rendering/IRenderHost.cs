@@ -151,7 +151,17 @@ public interface IRenderHost
     void DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance);
 
     // One indexed draw whose counts the GPU reads from the buffer (VkDrawIndexedIndirectCommand layout).
+    void DebugCaptureIndirectArguments(BufferBinding arguments) { } // TEMP
+    bool DebugCapturing => false; // TEMP
+    void DebugCopyBuffer(ulong address, ulong size, string label) { } // TEMP
+    void DebugNote(string line) { } // TEMP
+    string DebugBufferState(ulong address, ulong size) => ""; // TEMP
+
     void DrawIndexedIndirect(BufferBinding arguments) =>
+        throw new NotSupportedException("The render host does not draw from indirect arguments.");
+
+    // One draw whose counts the GPU reads from the buffer (VkDrawIndirectCommand layout).
+    void DrawIndirect(BufferBinding arguments) =>
         throw new NotSupportedException("The render host does not draw from indirect arguments.");
 
     void Dispatch(uint groupsX, uint groupsY, uint groupsZ);

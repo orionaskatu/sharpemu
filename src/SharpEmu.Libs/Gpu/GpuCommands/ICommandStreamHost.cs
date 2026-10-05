@@ -38,7 +38,10 @@ public readonly record struct DrawAutoArguments(
     uint InstanceCount,
     uint FirstVertex,
     uint FirstInstance,
-    DrawOffsetSource OffsetSource);
+    DrawOffsetSource OffsetSource,
+    // Nonzero when the counts are still in guest memory at this address, laid out as
+    // (vertexCount, instanceCount, firstVertex, firstInstance); the counts above are then placeholders.
+    ulong IndirectArgumentsAddress = 0);
 
 public enum EndOfPipeWriteKind
 {
@@ -83,6 +86,10 @@ public interface ICommandStreamHost
 
     // Reads guest memory the GPU may have written; the host synchronizes GPU-owned pages first.
     bool TryReadGuest(ulong address, Span<byte> destination);
+
+    // Writes a few bytes to guest memory and the GPU's copy of them without downloading the
+    // GPU's other writes on the page first; false when the host must take the ordinary write.
+    bool TryWriteThrough(ulong address, ReadOnlySpan<byte> source) => false;
 
     // Runs commands other threads posted to this worker. Called before every packet.
     void RunPendingCommands();

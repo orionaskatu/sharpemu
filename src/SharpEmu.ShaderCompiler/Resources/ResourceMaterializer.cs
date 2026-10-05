@@ -43,6 +43,7 @@ public static class ResourceMaterializer
         public uint[][] Images = [];
         public uint[][] Samplers = [];
         public uint[] FlattenedTable = [];
+        public List<TableWordPatch> TablePatches = [];
         public uint[] UserData = [];
         public List<IndirectImageTable> IndirectImages = [];
         public List<BufferCandidateTable> BufferCandidateTables = [];
@@ -109,6 +110,7 @@ public static class ResourceMaterializer
             Images = nextSnapshot.Images,
             Samplers = nextSnapshot.Samplers,
             FlattenedResourceTable = nextSnapshot.FlattenedTable,
+            TablePatches = [.. materialized.TablePatches],
             UserData = nextSnapshot.UserData,
             DeviceAddressRanges = ranges,
         };
@@ -120,8 +122,12 @@ public static class ResourceMaterializer
     // Evaluates only the flattened table, laid out as a full materialization lays it out
     // before specialization; the written device-address slots are left zero for the caller.
     public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table) =>
+        TryEvaluateTable(plan, inputs, out table, null);
+
+    public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table,
+        List<TableWordPatch>? patches) =>
         RuntimeValueEvaluator.EvaluateSources(plan, [], inputs, plan.CleanFlatSlots, evaluateTable: true, out _, out table, out _,
-            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount));
+            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount), patches);
 
     // ---- snapshot ----
 
@@ -138,7 +144,8 @@ public static class ResourceMaterializer
 
         if (!RuntimeValueEvaluator.EvaluateSources(plan, plan.MaterializationSources, inputs, plan.CleanFlatSlots,
             evaluateTable: true, out var values, out var table, out var activeSources,
-            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount)))
+            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount),
+            patches: snapshot.TablePatches))
         {
             SpecializationFailed(DiagnoseSnapshotEvaluationFailure(plan, inputs, activeSources));
             return false;
@@ -811,6 +818,70 @@ public static class ResourceMaterializer
         var baseAddress = (table.Dwords[0] | ((ulong)(table.Dwords[1] & 0xFFFF) << 32)) & AddressMask;
         var recordStride = (table.Dwords[1] >> 16) & 0x3FFF;
         var rangeBytes = recordStride == 0 ? (ulong)table.Dwords[2] : (ulong)table.Dwords[2] * recordStride;
+        var memoKey = new BufferTableKey(baseAddress, rangeBytes, indirect.TableOffset, indirect.BufferTableStride,
+            indirect.PointerTargetOffset ?? uint.MaxValue, r128);
+        if (inputs.AllowTransientTableReuse && TryReuseBufferTable(memoKey, out result))
+        {
+            failure = ResourceMaterializationFailure.None;
+            return true;
+        }
+
+        if (!ProbeBufferTableImage(indirect, baseAddress, rangeBytes, r128, inputs, out result, out failure))
+            return false;
+
+        if (inputs.AllowTransientTableReuse)
+            RememberBufferTable(memoKey, result);
+        return true;
+    }
+
+    // Bindless tables hold tens of thousands of records, and plans that never hit the
+    // materialization cache probe the same table for every draw. Within this window a probe
+    // is reused; a texture streamed into the table shows up one window late at most.
+    private static readonly long BufferTableReuseTicks = System.Diagnostics.Stopwatch.Frequency / 10;
+
+    private readonly record struct BufferTableKey(ulong Base, ulong Range, uint Offset, uint Stride, uint PointerTarget, bool R128);
+
+    private static readonly Dictionary<BufferTableKey, (long Probed, IndirectImageTable Table)> _bufferTables = new();
+
+    private static bool TryReuseBufferTable(BufferTableKey key, out IndirectImageTable result)
+    {
+        result = new IndirectImageTable();
+        lock (_bufferTables)
+        {
+            if (!_bufferTables.TryGetValue(key, out var entry) ||
+                System.Diagnostics.Stopwatch.GetTimestamp() - entry.Probed > BufferTableReuseTicks)
+                return false;
+
+            result.Keys.AddRange(entry.Table.Keys);
+            result.Candidates.AddRange(entry.Table.Candidates);
+            result.Descriptors.AddRange(entry.Table.Descriptors);
+            return true;
+        }
+    }
+
+    private static void RememberBufferTable(BufferTableKey key, IndirectImageTable probed)
+    {
+        var copy = new IndirectImageTable();
+        copy.Keys.AddRange(probed.Keys);
+        copy.Candidates.AddRange(probed.Candidates);
+        copy.Descriptors.AddRange(probed.Descriptors);
+        lock (_bufferTables)
+        {
+            if (_bufferTables.Count >= 256)
+                _bufferTables.Clear();
+            _bufferTables[key] = (System.Diagnostics.Stopwatch.GetTimestamp(), copy);
+        }
+    }
+
+    private static bool ProbeBufferTableImage(
+        IndirectImageSelector indirect,
+        ulong baseAddress,
+        ulong rangeBytes,
+        bool r128,
+        ResourceRuntimeInputs inputs,
+        out IndirectImageTable result,
+        out ResourceMaterializationFailure failure)
+    {
         // A pointer record holds a 64-bit address; a direct record holds the descriptor.
         var pointerTable = indirect.PointerTargetOffset is not null;
         var entryBytes = pointerTable ? (ulong)sizeof(ulong) : 8 * sizeof(uint);

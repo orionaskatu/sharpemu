@@ -17,6 +17,10 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 {
     private const uint VertexUserDataBase = 8;
+    private static readonly bool DbgCullAll = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CULL_ALL") is "1" or "log"; // TEMP
+    private static readonly bool DbgCullNeutralize = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CULL_ALL") == "1"; // TEMP
+    private static int _dbgCullLogs; // TEMP
+    private static readonly string? DbgCullFlag = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CULL_FLAG"); // TEMP
     private const uint MaxPixelInputs = 32;
     private const uint MaxViewportDimension = 16384;
 
@@ -79,7 +83,71 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ContextRegisters context,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
         bool pixelActive,
-        bool depthBound)
+        bool depthBound) =>
+        GetGraphicsProgramsCore(vertex, pixel, shaderInterface, context, targetExportMapping, pixelActive, depthBound, null);
+
+    public GraphicsPrograms? GetDomainPrograms(
+        VertexStageRegisters vertex,
+        PixelStageRegisters pixel,
+        ShaderInterfaceRegisters shaderInterface,
+        ContextRegisters context,
+        ReadOnlySpan<ColorComponentMap> targetExportMapping,
+        bool pixelActive,
+        bool depthBound,
+        Gen5DomainGrid domain) =>
+        GetGraphicsProgramsCore(vertex, pixel, shaderInterface, context, targetExportMapping, pixelActive, depthBound, domain);
+
+    // The merged local+hull program as wave64 compute workgroups. The user data starts at s0:
+    // the user data address, the draw values of the prologue, then the hull user scalars.
+    public ComputeProgram? GetHullProgram(VertexStageRegisters vertex, Gen5HullDispatch hull, uint[] userData)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        Agc.AgcExports.TryRegisterAdjacentHullContinuation(_context, vertex.LocalAddress);
+        var registered = _registry.Require(vertex.LocalAddress, "hull");
+        if (!registered.IsFused)
+        {
+            return null;
+        }
+
+        var hash = ShaderIdentity.Compute(_context.Memory, vertex.LocalAddress, registered.CodeRanges, "hull");
+        var source = new ShaderSource(registered, hash, userData, 0, ShaderStage.Compute);
+        var input = new ComputeInputInfo
+        {
+            ThreadsX = 64,
+            ThreadsY = 1,
+            ThreadsZ = 1,
+            WaveSize = 64,
+            LocalDataShareDwords = Math.Max((uint)vertex.HullResource2.LocalDataShareSize * HullLocalDataShareGranuleDwords, 2048u),
+            ScratchDwords = registered.ScratchDwords,
+            ThreadIdCount = 1,
+            NeedsLocalDataShareBarriers = !_host.ComputeWave64Supported,
+        };
+        ShaderProgram handle;
+        ShaderStageResources stage;
+        lock (_gate)
+        {
+            var pushDataCursor = 0u;
+            if (!TryPrepareProgram(source, new StageCompileOptions { ComputeInfo = input, HullDispatch = hull }, ref pushDataCursor, out handle, out stage))
+            {
+                return new ComputeProgram { Available = false };
+            }
+        }
+
+        input.Stage = stage;
+        return new ComputeProgram { Program = handle, Input = input };
+    }
+
+    private const uint HullLocalDataShareGranuleDwords = 128;
+
+    private GraphicsPrograms GetGraphicsProgramsCore(
+        VertexStageRegisters vertex,
+        PixelStageRegisters pixel,
+        ShaderInterfaceRegisters shaderInterface,
+        ContextRegisters context,
+        ReadOnlySpan<ColorComponentMap> targetExportMapping,
+        bool pixelActive,
+        bool depthBound,
+        Gen5DomainGrid? domain)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
         var vertexSource = PrepareSource(
@@ -143,7 +211,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
             if (!TryPrepareProgram(
                 vertexSource,
-                new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount },
+                new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount, DomainGrid = domain },
                 ref pushDataCursor,
                 out vertexProgram,
                 out vertexStage))
@@ -232,6 +300,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         outputModes = new byte[PixelInputInfo.TargetCount];
         outputMappings = new ColorComponentMap[PixelInputInfo.TargetCount];
         var outputs = new List<Gen5PixelOutputBinding>(ContextRegisters.ColorTargetCount);
+        var location = 0u;
         for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
         {
             if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
@@ -256,9 +325,16 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 throw SubmissionScheduler.Fatal($"The color target format has no pixel output kind: slot={slot} layout={(uint)words.Layout} numberType={(uint)words.NumberType} order={(uint)words.Order}.");
             }
 
-            outputModes[slot] = (byte)((uint)kind + 1);
+            // A bound slot that no export reaches keeps its contents: its color write mask is zero.
+            var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, slot);
+            // The high nibble keys the compiled program by the export that feeds the slot.
+            outputModes[slot] = (byte)(((uint)kind + 1) | (uint)((exportTarget + 1) << 4));
             outputMappings[slot] = new ColorComponentMap(mapping.Packed);
-            outputs.Add(new Gen5PixelOutputBinding(slot, (uint)outputs.Count, kind, mapping));
+            // No EXP target reaches 8 and above, so an unfed slot is declared but never written.
+            outputs.Add(new Gen5PixelOutputBinding(slot, location++, kind, mapping)
+            {
+                ExportTarget = exportTarget >= 0 ? (uint)exportTarget : ContextRegisters.ColorTargetCount + slot,
+            });
         }
 
         return outputs.ToArray();
@@ -288,6 +364,51 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         uint dimensionZ)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPreparation);
+        if (DbgCullAll && compute.Address == 0x80003E5900UL) // TEMP: neutralize the culler's four planes
+        {
+            var constants = compute.UserScalars.Values[0] | ((ulong)compute.UserScalars.Values[1] << 32);
+            Span<byte> planes = stackalloc byte[64];
+            if (_context.Memory.TryRead(constants + 12, planes))
+            {
+                var floats = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(planes);
+                if (_dbgCullLogs++ < 4)
+                    Console.Error.WriteLine($"[DBG][CULL] ud=0x{constants:X} planes=({floats[0]},{floats[1]},{floats[2]},{floats[3]})({floats[4]},{floats[5]},{floats[6]},{floats[7]})({floats[8]},{floats[9]},{floats[10]},{floats[11]})({floats[12]},{floats[13]},{floats[14]},{floats[15]})");
+                Span<byte> header = stackalloc byte[160];
+                if ((DbgCullFlag is null ? _dbgCullLogs++ <= 2000 : File.Exists(DbgCullFlag)) && _context.Memory.TryRead(constants, header))
+                {
+                    var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(header);
+                    var rangePointer = words[20] | ((ulong)words[21] << 32);
+                    var recordsBase = (words[22] | ((ulong)words[23] << 32)) & 0xFFFF_FFFF_FFFFUL;
+                    Span<byte> range = stackalloc byte[16];
+                    if (_context.Memory.TryRead(rangePointer, range))
+                    {
+                        var rangeWords = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(range);
+                        var lods = new System.Text.StringBuilder();
+                        var count = Math.Min(rangeWords[3], 16u);
+                        for (var index = 0u; index < count; index++)
+                        {
+                            Span<byte> record = stackalloc byte[92];
+                            if (_context.Memory.TryRead(recordsBase + (rangeWords[2] + index) * 92UL, record))
+                            {
+                                var recordFloats = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(record);
+                                lods.Append($" [{BitConverter.ToUInt16(record[46..])}:{recordFloats[0]:F0},{recordFloats[1]:F0},{recordFloats[2]:F0}]");
+                            }
+                        }
+
+                        var argsBase = (words[26] | ((ulong)words[27] << 32)) & 0xFFFF_FFFF_FFFFUL;
+                        var listBase = (words[30] | ((ulong)words[31] << 32)) & 0xFFFF_FFFF_FFFFUL;
+                        Console.Error.WriteLine($"[DBG][CULLR] flags={words[0]},{words[1]},{words[2]} records=0x{recordsBase:X} range@0x{rangePointer:X}=[{rangeWords[2]}+{rangeWords[3]}] args=0x{argsBase:X}+{words[28]} list=0x{listBase:X}{lods}");
+                    }
+                }
+
+                if (DbgCullNeutralize)
+                {
+                    for (var plane = 0; plane < 4; plane++) floats[plane * 4 + 3] = -3.0e38f;
+                    _ = _context.Memory.TryWrite(constants + 12, planes);
+                }
+            }
+        }
+
         var source = PrepareSource(compute.Address, ShaderStage.Compute, "compute", compute.UserScalars, compute.UserScalarCount, probeWrittenRegisters: false, userDataBase: 0);
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         var systemRegisters = DecodeComputeSystemRegisters(compute);
@@ -457,7 +578,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             // A target the pixel program never exports keeps its contents, as on hardware; the
             // host output would otherwise write an undefined value (e.g. depth-only passes that
             // leave a color target bound and export only to the null target).
-            var exported = pixelStage is not null && ((pixelStage.PixelColorExportMasks >> (int)(color.Slot * 4)) & 0xFu) != 0;
+            var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, color.Slot);
+            var exported = pixelStage is not null &&
+                exportTarget >= 0 && ((pixelStage.PixelColorExportMasks >> (exportTarget * 4)) & 0xFu) != 0;
             var colorMask = exported ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0;
             parameters.SetColorMask(index, colorMask);
             if (RenderTrace.Enabled && RenderTrace.Pipeline())

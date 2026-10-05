@@ -70,12 +70,35 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             PValues = &tick,
         };
         Result result;
+        var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
             result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
         }
+        DbgWait(System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds); // TEMP
         failure = result.ToString();
         return result == Result.Success;
+    }
+
+    // TEMP: aggregates GPU waits by caller stack.
+    private static readonly bool _dbgWaits = Environment.GetEnvironmentVariable("SHARPEMU_DBG_WAITS") == "1";
+    private static readonly Dictionary<string, (int Count, double Ms)> _dbgWaitStacks = new();
+    private static long _dbgWaitLast = Environment.TickCount64;
+    private static void DbgWait(double ms)
+    {
+        if (!_dbgWaits) return;
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var key = string.Join(" < ", frames.Take(9).Select(f => f.GetMethod() is { } m ? $"{m.DeclaringType?.Name}.{m.Name}" : "?"));
+        lock (_dbgWaitStacks)
+        {
+            _dbgWaitStacks.TryGetValue(key, out var e);
+            _dbgWaitStacks[key] = (e.Count + 1, e.Ms + ms);
+            if (Environment.TickCount64 - _dbgWaitLast < 10000) return;
+            _dbgWaitLast = Environment.TickCount64;
+            foreach (var (k, v) in _dbgWaitStacks.OrderByDescending(x => x.Value.Ms).Take(12))
+                Console.Error.WriteLine($"[DBG][WAIT] n={v.Count} ms={v.Ms:F0} {k}");
+            _dbgWaitStacks.Clear();
+        }
     }
 
     public nint[] AllocateBuffers(int count)

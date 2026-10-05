@@ -172,6 +172,11 @@ public sealed class ShaderCompileRequest
     // may use native instructions; devices missing any guarantee use the software path.
     public bool SupportsExactFloat16Conversions { get; init; }
 
+    // With SupportsExactFloat16Conversions: f16 arithmetic runs as native f16 operations and
+    // conversions skip NaN payload reconstruction. Results can differ from the hardware in
+    // NaN payloads and in the last bit of a fused f16 multiply-add, never visibly.
+    public bool FastFloat16Arithmetic { get; init; }
+
     // Descriptor indexing with a per-invocation index (shader*ArrayNonUniformIndexing): an
     // indirect image table is then read by index instead of one case per candidate.
     public bool SupportsNonUniformImageIndexing { get; init; }
@@ -184,6 +189,8 @@ public sealed class ShaderCompileRequest
     // go through the run-time format decoder. For tests that compare the two.
     public bool ForceGenericBufferFormats { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
+    public Gen5HullDispatch? HullDispatch { get; init; }
+    public Gen5DomainGrid? DomainGrid { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
     public uint PixelInputEnable { get; init; }

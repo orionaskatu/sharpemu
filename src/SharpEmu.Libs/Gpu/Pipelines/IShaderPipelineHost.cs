@@ -68,6 +68,10 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
+    // Whether recorded GPU work still owns the dword, so the host can copy it on the device
+    // when it binds the flattened table instead of downloading it now.
+    bool IsGpuPendingGuestWord(ulong address) => false;
+
     // Whether the guest address is mapped. A host that cannot tell without a read probes with one.
     bool IsGuestMapped(ulong address) => TryReadGuestWord(address, out _);
 

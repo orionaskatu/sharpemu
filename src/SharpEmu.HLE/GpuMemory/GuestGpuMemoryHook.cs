@@ -98,6 +98,25 @@ public static class GuestGpuMemoryHook
         _current.Register(address, size, protection);
     }
 
+    // Mappings at most this large that the GPU may access are announced as they are created.
+    public static readonly ulong EagerGpuMappingLimit = Environment.GetEnvironmentVariable("SHARPEMU_DBG_EAGER_ALL_DIRECT") == "1" ? 1UL << 30 : 64UL << 20; // TEMP env
+
+    // Receives the GPU-accessible mappings of at most EagerGpuMappingLimit bytes. A streaming
+    // pool maps its pages one small mapping at a time; the GPU reaches them through device
+    // addresses, and a page missing from the page table at that first access reads zeros and
+    // drops writes. Announcing the mapping lets the buffer cache map it before the GPU runs.
+    public static Action<ulong, ulong>? GpuMappingCreated;
+
+    public static void NoteGpuMapping(ulong address, ulong size)
+    {
+        if (size == 0 || size > EagerGpuMappingLimit || !IsWithinGpuAddressSpace(address, size))
+        {
+            return;
+        }
+
+        GpuMappingCreated?.Invoke(address, size);
+    }
+
     // True when the manager applied the protection itself; the caller then does not protect.
     public static bool NoteProtected(ulong address, ulong size, GuestPageProtection protection) =>
         _current != null && IsWithinGpuAddressSpace(address, size) && _current.NoteProtected(address, size, protection);
@@ -113,8 +132,11 @@ public static class GuestGpuMemoryHook
         _current.Unregister(address, size);
     }
 
+    private static long _dbgWatchHits; // TEMP
     public static bool TryResolveFault(FaultKind kind, ulong address)
     {
+        if (DbgWatch.End != 0 && address >= DbgWatch.Begin && address < DbgWatch.End && Interlocked.Increment(ref _dbgWatchHits) <= 400) // TEMP
+            Console.Error.WriteLine($"[DBG][WATCH] cpu-fault kind={kind} addr=0x{address:X} tid={Environment.CurrentManagedThreadId}");
         if (_current == null && Traces(address, 8))
             Trace(address, 8, $"fault={kind} result=no-manager");
         if (_current != null && _current.TryResolveFault(kind, address))

@@ -180,6 +180,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _commandStream.EnqueueCompute(queue, address, dwordCount, submissionId, geometrySnapshots);
             }
+
+            _commandStream.DbgWaitForLastEnqueued(); // TEMP
         }
 
         // Runs slices until the budget ends or nothing is runnable; blocked heads retry every 100 ms.
@@ -253,12 +255,27 @@ internal static unsafe partial class VulkanVideoPresenter
 
         ICpuMemory ICommandStreamHost.Memory => _guestMemory;
 
+        public bool TryWriteThrough(ulong address, ReadOnlySpan<byte> source)
+        {
+            // Image pages take the ordinary write, which also invalidates the images.
+            if (_imageCache.QueryRegion(address, (ulong)source.Length).ImagePages)
+            {
+                return false;
+            }
+
+            SharpEmu.HLE.GuestImageWriteTracker.NotifyManagedWrite(address, (ulong)source.Length);
+            return _bufferCache.TryWriteThrough(address, source);
+        }
+
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemorySync))
             {
-                if (!_bufferCache.TrySynchronizeCpuRead(address, (ulong)destination.Length,
-                    SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.CommandMemoryRead))
+                // Only bytes a buffer write covered can be newer on the GPU; other GPU writes on
+                // the same page do not make these bytes stale.
+                if (_bufferCache.HasGpuDirtyBytes(address, (ulong)destination.Length) &&
+                    !_bufferCache.TrySynchronizeCpuRead(address, (ulong)destination.Length,
+                        SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.CommandMemoryRead))
                 {
                     return false;
                 }

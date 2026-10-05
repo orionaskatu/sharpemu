@@ -179,9 +179,14 @@ public sealed partial class GpuCommandInterpreter
             return packet.Length - 1;
         }
 
+        if (Interlocked.Increment(ref _dbgWaitLogs) is var dw && (dw < 60 || dw % 3000 == 0)) // TEMP
+            Console.Error.WriteLine($"[DBG][WAITMEM] n={_dbgWaitLogs} addr=0x{address:X} ref=0x{reference:X} mask=0x{mask:X} ctl=0x{control:X} value=0x{(is64Bit ? ReadQword(address) : ReadDword(address)):X} cond={_dbgInCond}");
         WaitOnMemory(control & 0x7u, address, reference, mask, WaitOperation.Decode(control, is64Bit), is64Bit);
         return packet.Length - 1;
     }
+
+    private static int _dbgWaitLogs; // TEMP
+    internal bool _dbgInCond; // TEMP
 
     internal uint WrappedWriteDataPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {

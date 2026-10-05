@@ -585,7 +585,9 @@ public sealed class RenderExecutorDrawTests : IDisposable
         _executor.DrawIndexed(1, banks, Indexed(3));
 
         Assert.Contains("reset_bindings", _host.Calls);
-        Assert.Empty(_pipelines.Calls);
+        // The vertex stage is resolved to see whether it stores to memory, but nothing is drawn.
+        Assert.Empty(_pipelines.PipelineRequests);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("begin_rendering", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -26,6 +26,26 @@ public sealed partial class RenderExecutor
     private const uint ImageClearStride = 16;
     private const uint ImageClearUserDataCount = 8;
 
+    // TEMP: SHARPEMU_DBG_SKIP_CS=hash,... drops those dispatches to bound their cost.
+    private static readonly HashSet<ulong> DbgSkipHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_CS") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(h => Convert.ToUInt64(h.Replace("0x", ""), 16)).ToHashSet();
+
+    private static readonly Dictionary<ulong, (int Count, long Groups, int Indirect)> _dbgDispatches = new(); // TEMP
+    private static long _dbgDispatchLast = Environment.TickCount64;
+    private static readonly bool _dbgDispatchStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPATCHES") == "1";
+    private static void DbgCountDispatch(ulong hash, long groups, bool indirect)
+    {
+        if (!_dbgDispatchStats) return;
+        _dbgDispatches.TryGetValue(hash, out var e);
+        _dbgDispatches[hash] = (e.Count + 1, e.Groups + groups, e.Indirect + (indirect ? 1 : 0));
+        if (Environment.TickCount64 - _dbgDispatchLast < 10000) return;
+        _dbgDispatchLast = Environment.TickCount64;
+        Console.Error.WriteLine($"[DBG][DISPATCHES] total={_dbgDispatches.Values.Sum(v => v.Count)} distinct={_dbgDispatches.Count}");
+        foreach (var (h, v) in _dbgDispatches.OrderByDescending(x => x.Value.Count).Take(25))
+            Console.Error.WriteLine($"[DBG][DISPATCHES] n={v.Count} avg_groups={v.Groups / (double)v.Count:F1} indirect={v.Indirect} hash=0x{h:X16}");
+        _dbgDispatches.Clear();
+    }
+
     public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
     {
         if (!_host.IsRecording)
@@ -101,6 +121,8 @@ public sealed partial class RenderExecutor
 
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
+        if (DbgSkipHashes.Contains(program.Hash)) return; // TEMP
+        DbgCountDispatch(program.Hash, groupsX * groupsY * groupsZ, indirectArgumentsAddress != 0); // TEMP
         if (RenderTrace.Enabled)
         {
             RenderTrace.Write(

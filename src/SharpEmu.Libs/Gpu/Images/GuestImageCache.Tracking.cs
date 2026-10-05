@@ -30,6 +30,13 @@ public sealed partial class GuestImageCache
             _pageOwners.GetOrCreate(page).Add(imageIdentifier);
         }
 
+        if (!_imagesByStart.TryGetValue(image.Description.Data.Address, out var starting))
+        {
+            starting = [];
+            _imagesByStart.Add(image.Description.Data.Address, starting);
+        }
+
+        starting.Add(imageIdentifier);
         image.Registered = true;
         image.RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, _collectionTick);
         _totalUsedMemory += image.AccountedSize;
@@ -58,6 +65,16 @@ public sealed partial class GuestImageCache
             }
         }
 
+        if (!_imagesByStart.TryGetValue(image.Description.Data.Address, out var starting) || !starting.Remove(imageIdentifier))
+        {
+            throw SubmissionScheduler.Fatal($"The image is missing from the start index: address=0x{image.Description.Data.Address:X16}.");
+        }
+
+        if (starting.Count == 0)
+        {
+            _imagesByStart.Remove(image.Description.Data.Address);
+        }
+
         _recencyQueue.Free(image.RecencyEntryIndex);
         var accounted = image.AccountedSize;
         if (accounted > _totalUsedMemory)
@@ -70,8 +87,23 @@ public sealed partial class GuestImageCache
     }
 
     // Removes the image and its stencil associations; the slot is freed after the current tick.
+    // TEMP: counts image deletions by caller.
+    private static readonly Dictionary<string, int> _dbgDeletes = new();
+    private static long _dbgDeleteTotal;
+    private void DbgDelete()
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var key = string.Join(" < ", frames.Take(3).Select(frame => frame.GetMethod()?.Name ?? "?"));
+        _dbgDeletes.TryGetValue(key, out var count);
+        _dbgDeletes[key] = count + 1;
+        if (++_dbgDeleteTotal % 2000 == 0)
+            Console.Error.WriteLine($"[DBG][IMGDEL] used_mb={TotalUsedMemory >> 20} images={_slots.Count} " +
+                string.Join(" | ", _dbgDeletes.OrderByDescending(entry => entry.Value).Take(5).Select(entry => $"{entry.Value}:{entry.Key}")));
+    }
+
     private int DeleteImage(ResourceSlotIdentifier imageIdentifier)
     {
+        DbgDelete(); // TEMP
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDelete);
         var image = _slots.TryGet(imageIdentifier);
         if (image == null || !image.Registered)

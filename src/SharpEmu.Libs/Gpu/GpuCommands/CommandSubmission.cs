@@ -88,6 +88,11 @@ public sealed class CommandSubmission
         GeometrySnapshots = geometrySnapshots;
     }
 
+    public volatile bool DbgCompleted; // TEMP
+    public ulong DbgHash; // TEMP
+    public bool DbgHashed; // TEMP
+    public long DbgEnqueuedTicks; // TEMP
+
     public CommandSubmissionKind Kind { get; }
 
     public int QueueId { get; }

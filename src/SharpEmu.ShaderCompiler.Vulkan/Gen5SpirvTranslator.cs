@@ -978,7 +978,7 @@ public static partial class Gen5SpirvTranslator
                         SpirvDecoration.Location,
                         binding.HostLocation);
                     _pixelOutputs.Add(
-                        binding.GuestSlot,
+                        binding.ExportTarget,
                         new SpirvPixelOutput(
                             variable,
                             outputType,
@@ -1134,8 +1134,15 @@ public static partial class Gen5SpirvTranslator
 
             if (_stage == Gen5SpirvStage.Vertex)
             {
-                StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
-                StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+                if (_request.DomainGrid is { } domain)
+                {
+                    EmitDomainGridState(domain);
+                }
+                else
+                {
+                    StoreV(5, Load(_uintType, _vertexIndexInput), guardWithExec: false);
+                    StoreV(8, Load(_uintType, _instanceIndexInput), guardWithExec: false);
+                }
 
                 // Give every declared param output a defined starting value.
                 // Outputs the program actually exports overwrite this; the
@@ -1244,7 +1251,76 @@ public static partial class Gen5SpirvTranslator
                             UInt(checked(_localSizeX * _localSizeY * _localSizeZ)));
                     }
                 }
+
+                if (_request.HullDispatch is { } hull)
+                {
+                    EmitHullDispatchState(
+                        hull,
+                        _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, workGroupId, (uint)_physicalAxisOfLogical[0]));
+                }
             }
+        }
+
+        private uint ISub(uint left, uint right) => _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+
+        private uint IMul(uint left, uint right) => _module.AddInstruction(SpirvOp.IMul, _uintType, left, right);
+
+        private uint UDiv(uint left, uint right) => _module.AddInstruction(SpirvOp.UDiv, _uintType, left, right);
+
+        private uint UMod(uint left, uint right) => _module.AddInstruction(SpirvOp.UMod, _uintType, left, right);
+
+        private uint UMin(uint left, uint right) => _module.AddInstruction(
+            SpirvOp.Select, _uintType, _module.AddInstruction(SpirvOp.ULessThan, _boolType, left, right), left, right);
+
+        // The hull system registers of one lane of a workgroup that holds PatchesPerGroup patches.
+        // The draw values arrive in s2-s5 and are read before those registers are replaced.
+        private void EmitHullDispatchState(Gen5HullDispatch hull, uint group)
+        {
+            var lane = LoadV(0);
+            var firstPatch = LoadS(2);
+            var patchCount = LoadS(3);
+            var patchesPerInstance = LoadS(4);
+            var firstVertex = LoadS(5);
+            var groupPatch = IMul(group, UInt(hull.PatchesPerGroup));
+            var patchesHere = UMin(ISub(patchCount, groupPatch), UInt(hull.PatchesPerGroup));
+            StoreS(2, IMul(group, UInt(hull.OffchipBytesPerGroup)));
+            StoreS(3, BitwiseOr(
+                IMul(patchesHere, UInt(hull.InputControlPoints)),
+                ShiftLeftLogical(IMul(patchesHere, UInt(hull.OutputControlPoints)), UInt(8))));
+            StoreS(4, IMul(groupPatch, UInt(hull.FactorBytesPerPatch)));
+
+            var hullPatch = UDiv(lane, UInt(hull.OutputControlPoints));
+            StoreV(0, UMod(IAdd(IAdd(firstPatch, groupPatch), hullPatch), patchesPerInstance), guardWithExec: false);
+            StoreV(1, BitwiseOr(hullPatch, ShiftLeftLogical(UMod(lane, UInt(hull.OutputControlPoints)), UInt(8))), guardWithExec: false);
+            var localPatch = IAdd(IAdd(firstPatch, groupPatch), UDiv(lane, UInt(hull.InputControlPoints)));
+            var vertex = IAdd(
+                firstVertex,
+                IAdd(IMul(UMod(localPatch, patchesPerInstance), UInt(hull.InputControlPoints)), UMod(lane, UInt(hull.InputControlPoints))));
+            StoreV(2, vertex, guardWithExec: false);
+            StoreV(3, lane, guardWithExec: false);
+            StoreV(4, UInt(0), guardWithExec: false);
+            StoreV(5, UDiv(localPatch, patchesPerInstance), guardWithExec: false);
+        }
+
+        // Two triangles per grid cell; the corner masks pick each corner's x and y step.
+        private void EmitDomainGridState(Gen5DomainGrid domain)
+        {
+            var vertex = Load(_uintType, _vertexIndexInput);
+            var patch = Load(_uintType, _instanceIndexInput);
+            var segments = UInt(domain.Segments);
+            var cell = UDiv(vertex, UInt(6));
+            var corner = UMod(vertex, UInt(6));
+            var (maskX, maskY) = domain.Clockwise ? (0x1Au, 0x34u) : (0x2Cu, 0x32u);
+            var x = IAdd(UMod(cell, segments), BitwiseAnd(ShiftRightLogical(UInt(maskX), corner), UInt(1)));
+            var y = IAdd(UDiv(cell, segments), BitwiseAnd(ShiftRightLogical(UInt(maskY), corner), UInt(1)));
+            var scale = Float(1f / domain.Segments);
+            var u = _module.AddInstruction(SpirvOp.FMul, _floatType, _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, x), scale);
+            var v = _module.AddInstruction(SpirvOp.FMul, _floatType, _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, y), scale);
+            StoreV(5, Bitcast(_uintType, u), guardWithExec: false);
+            StoreV(6, Bitcast(_uintType, v), guardWithExec: false);
+            StoreV(7, UMod(patch, UInt(domain.PatchesPerGroup)), guardWithExec: false);
+            StoreV(8, patch, guardWithExec: false);
+            StoreS(4, IMul(UDiv(patch, UInt(domain.PatchesPerGroup)), UInt(domain.OffchipBytesPerGroup)));
         }
 
         private void EmitPixelInputState(uint fragCoord)
@@ -3430,6 +3506,8 @@ public static partial class Gen5SpirvTranslator
                         var bothMapped = LogicalAnd(firstMapped, secondMapped);
                         EmitConditional(bothMapped, () =>
                         {
+                            NoteDeviceWrite(firstAddress);
+                            NoteDeviceWrite(secondAddress);
                             var originalLow = EmitAtomic(
                                 atomicOp, _uintType, DeviceWordPointer(firstPointer), 1, 0x48,
                                 () => LoadV(control.VectorData), () => UInt(0));
@@ -3458,6 +3536,7 @@ public static partial class Gen5SpirvTranslator
                         var (pointer, mapped) = ResolveDeviceAddress(address);
                         EmitConditional(mapped, () =>
                         {
+                            NoteDeviceWrite(address);
                             var original = EmitBufferFloatAtomic(
                                 DeviceWordPointer(pointer),
                                 LoadV(control.VectorData),
@@ -3487,6 +3566,7 @@ public static partial class Gen5SpirvTranslator
                     var (pointer, mapped) = ResolveDeviceAddress(address);
                     EmitConditional(mapped, () =>
                     {
+                        NoteDeviceWrite(address);
                         var original = EmitAtomic(
                             atomicOperation,
                             _uintType,
@@ -7585,8 +7665,33 @@ public static partial class Gen5SpirvTranslator
                 return variable;
             }
 
-            _scalarRegisters = Variable(_scalarArrayType, _module.ConstantNull(_scalarArrayType));
-            _vectorRegisters = Variable(_vectorArrayType, _module.ConstantNull(_vectorArrayType));
+            // One variable per register unless a relative move indexes the vector file at run
+            // time: the driver then never has to split a 512-entry array into registers, which
+            // dominated pipeline compile time for large shaders.
+            _splitRegisterFiles = !DbgFlags.Disabled("split") && !_request.Program.Instructions.Any(static instruction =>
+                instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal));
+            if (_splitRegisterFiles)
+            {
+                _scalarRegisterVariables = new uint[ScalarRegisterCount];
+                for (var register = 0; register < _scalarRegisterVariables.Length; register++)
+                {
+                    _scalarRegisterVariables[register] = Variable(_uintType, UInt(0));
+                    _module.AddName(_scalarRegisterVariables[register], $"s{register}");
+                }
+
+                _vectorRegisterVariables = new uint[VectorRegisterCount];
+                for (var register = 0; register < _vectorRegisterVariables.Length; register++)
+                {
+                    _vectorRegisterVariables[register] = Variable(_uintType, UInt(0));
+                    _module.AddName(_vectorRegisterVariables[register], $"v{register}");
+                }
+            }
+            else
+            {
+                _scalarRegisters = Variable(_scalarArrayType, _module.ConstantNull(_scalarArrayType));
+                _vectorRegisters = Variable(_vectorArrayType, _module.ConstantNull(_vectorArrayType));
+            }
+
             if (_functionScopeState)
             {
                 // A Private one is declared on first use instead; see PackedHalfRegisters.
@@ -7612,8 +7717,11 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_iterationGuard, "pcGuard");
             }
 
-            _module.AddName(_scalarRegisters, "sgpr");
-            _module.AddName(_vectorRegisters, "vgpr");
+            if (!_splitRegisterFiles)
+            {
+                _module.AddName(_scalarRegisters, "sgpr");
+                _module.AddName(_vectorRegisters, "vgpr");
+            }
 
             foreach (var slot in FindLaneSpillSlots())
             {
@@ -7699,12 +7807,18 @@ public static partial class Gen5SpirvTranslator
             return value;
         }
 
+        private bool _splitRegisterFiles;
+        private uint[] _scalarRegisterVariables = [];
+        private uint[] _vectorRegisterVariables = [];
+
         private uint ScalarPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _functionUintPointer,
-                _scalarRegisters,
-                UInt(register));
+            _splitRegisterFiles
+                ? _scalarRegisterVariables[register]
+                : _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _functionUintPointer,
+                    _scalarRegisters,
+                    UInt(register));
 
         private uint RuntimeBufferBiasPointer(int binding) =>
             _module.AddInstruction(
@@ -7714,11 +7828,13 @@ public static partial class Gen5SpirvTranslator
                 UInt(checked((uint)binding)));
 
         private uint VectorPointer(uint register) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _functionUintPointer,
-                _vectorRegisters,
-                UInt(register));
+            _splitRegisterFiles
+                ? _vectorRegisterVariables[register]
+                : _module.AddInstruction(
+                    SpirvOp.AccessChain,
+                    _functionUintPointer,
+                    _vectorRegisters,
+                    UInt(register));
 
         // The V_MOVREL* opcodes address the VGPR file with a register number that
         // is only known at run time (encoded number + M0), so the access chain

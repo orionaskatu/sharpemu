@@ -135,7 +135,7 @@ public static class PadExports
         {
             Console.Error.WriteLine(input.DescribeConnectedGamepad() is { } gamepadName
                 ? $"[LOADER][INFO] Controls: {gamepadName} connected (keyboard fallback also active)."
-                : "[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options. A DualSense or Xbox controller will be used automatically when plugged in.");
+                : "[LOADER][INFO] Keyboard controls: Arrow keys = D-pad, WASD = left stick, IJKL = right stick, Z/Enter = Cross, X/Esc = Circle, C = Square, V = Triangle, Q = L1, E = R1, R = L2, F = R2, Tab/Backspace = Options, T = touchpad click, left mouse button = touchpad finger. A DualSense or Xbox controller will be used automatically when plugged in.");
         }
 
         Volatile.Write(ref _padOpened, 1);
@@ -760,6 +760,12 @@ public static class PadExports
             }
         }
 
+        if (!touch.First.Active && !touch.Second.Active && acceptsKeyboardInput &&
+            HostWindowInput.MouseTouch is { Active: true } mouseTouch)
+        {
+            touch = new HostTouchState(mouseTouch, default);
+        }
+
         if (IsAutoCrossActive())
         {
             buttons |= 0x4000;
@@ -899,6 +905,8 @@ public static class PadExports
         if (input.IsKeyDown(0x46)) buttons |= OrbisPadButton.R2;                                // F (digital)
         // Options (Start)
         if (input.IsKeyDown(0x09) || input.IsKeyDown(0x08)) buttons |= OrbisPadButton.Options;  // Tab / Backspace
+        // Touchpad click
+        if (input.IsKeyDown(0x54)) buttons |= OrbisPadButton.TouchPad;                          // T
         return buttons;
     }
 

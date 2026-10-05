@@ -15,6 +15,7 @@ public static class HostWindowInput
     private static string? _gamepadName;
     private static HostGamepadState _gamepadState;
     private static IHostGamepadOutput? _gamepadOutput;
+    private static HostTouchPoint _mouseTouch;
     private static readonly WindowInputSource Source = new();
 
     public static void Connect(IHostGamepadOutput? gamepadOutput = null)
@@ -38,6 +39,7 @@ public static class HostWindowInput
             _gamepadName = null;
             _gamepadState = default;
             _gamepadOutput = null;
+            _mouseTouch = default;
             PressedKeys.Clear();
         }
 
@@ -52,6 +54,28 @@ public static class HostWindowInput
             if (!focused)
             {
                 PressedKeys.Clear();
+                _mouseTouch = default;
+            }
+        }
+    }
+
+    // The left mouse button held over the window stands in for one touchpad finger, so
+    // keyboard players can draw on the touchpad (Ghost of Yōtei writes names with it).
+    public static void SetMouseTouch(HostTouchPoint point)
+    {
+        lock (Gate)
+        {
+            _mouseTouch = point;
+        }
+    }
+
+    public static HostTouchPoint MouseTouch
+    {
+        get
+        {
+            lock (Gate)
+            {
+                return _focused ? _mouseTouch : default;
             }
         }
     }

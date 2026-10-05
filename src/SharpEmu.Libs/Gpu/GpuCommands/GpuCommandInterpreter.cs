@@ -73,6 +73,7 @@ public sealed partial class GpuCommandInterpreter
         {
             if (_deferredInstanceCountAddress != 0)
             {
+                DbgCount(4); // TEMP
                 _instanceCount = ReadDword(_deferredInstanceCountAddress);
                 _deferredInstanceCountAddress = 0;
             }
@@ -356,6 +357,22 @@ public sealed partial class GpuCommandInterpreter
                 : "????????";
             Console.Error.WriteLine($"\t{index:X5}{(index == offset ? ":" : " ")} {text}");
         }
+
+        // TEMP: who owns this buffer, and does the guest still change it.
+        if (_execution is { } stack)
+        {
+            for (var depth = 0; depth < stack.Depth; depth++)
+            {
+                ref var entry = ref stack.At(depth);
+                Console.Error.WriteLine($"[GPU][DBG] queue={QueueId} depth={depth} address=0x{entry.Address:X16} dwords={entry.DwordCount} offset=0x{entry.Offset:X} ring=0x{entry.RingChunkBase:X16} followed={entry.FollowedChunkAdvance}");
+            }
+        }
+
+        Thread.Sleep(50);
+        var again = _host.TryReadGuest(cursor.Address + ((ulong)offset * sizeof(uint)), word)
+            ? BinaryPrimitives.ReadUInt32LittleEndian(word).ToString("X8")
+            : "????????";
+        Console.Error.WriteLine($"[GPU][DBG] header re-read after 50ms: {again}");
     }
 
     internal uint ReadDword(ulong address, RenderPhaseProfile.CommandReadKind readKind = RenderPhaseProfile.CommandReadKind.Operand32)
@@ -407,6 +424,11 @@ public sealed partial class GpuCommandInterpreter
 
     internal void WriteBytes(ulong address, ReadOnlySpan<byte> source)
     {
+        if (_host.TryWriteThrough(address, source))
+        {
+            return;
+        }
+
         if (!_host.Memory.TryWrite(address, source))
         {
             throw _host.Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={source.Length}.");

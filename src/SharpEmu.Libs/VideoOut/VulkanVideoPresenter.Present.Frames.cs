@@ -237,6 +237,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var presentationTarget = PresentationTargetImage(imageIndex);
             var presentedCount = Interlocked.Increment(ref _presentedSwapchainCount);
+            CaptureOnPresent(); // TEMP
             var periodicDumpInterval = SwapchainDumpInterval();
             var traceDestination =
                 ShouldTracePresentedGuestImageContentsForDiagnostics() &&

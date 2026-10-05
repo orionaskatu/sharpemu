@@ -103,6 +103,23 @@ public sealed class TrackedRegion
         ChangeState(WriteOrigin.Cpu, enable: true, address, size);
     }
 
+    // Marks GPU-written the pages of the range the CPU has not written since; returns them.
+    public void MarkGpuWhereCpuClean(ulong address, ulong size, Action<ulong, ulong> marked)
+    {
+        var (start, end) = GetPageRange(address, size);
+        for (var page = start; page < end; page++)
+        {
+            if (_cpuDirty.Get(page))
+            {
+                continue;
+            }
+
+            var pageAddress = BaseAddress + (ulong)page * PageBytes;
+            ChangeState(WriteOrigin.Gpu, enable: true, pageAddress, PageBytes);
+            marked(pageAddress, PageBytes);
+        }
+    }
+
     public void ChangeState(WriteOrigin side, bool enable, ulong address, ulong size)
     {
         var (start, end) = GetPageRange(address, size);

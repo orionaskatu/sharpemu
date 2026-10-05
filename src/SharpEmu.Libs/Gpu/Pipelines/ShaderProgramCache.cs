@@ -38,6 +38,8 @@ public sealed class StageCompileOptions
     public uint PixelInputAddress { get; init; }
     public ComputeInputInfo? ComputeInfo { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
+    public Gen5HullDispatch? HullDispatch { get; init; }
+    public Gen5DomainGrid? DomainGrid { get; init; }
 }
 
 // The key of a program entry: what the emitter reads besides the resource specialization.
@@ -113,6 +115,10 @@ internal sealed class ShaderProgramCache
 
     // Read once: the draw path asked the environment on every draw and dispatch
     // (~4 % of the Demon's Souls render thread) for a debug dump that is almost never on.
+    // SHARPEMU_EXACT_F16=1 keeps the bit-exact software f16 arithmetic.
+    private static readonly bool ExactFloat16Arithmetic =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_EXACT_F16"), "1", StringComparison.Ordinal);
+
     private readonly bool _spirvDumpEnabled = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV"), "1", StringComparison.Ordinal);
 
     public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host)
@@ -206,6 +212,7 @@ internal sealed class ShaderProgramCache
             ReadCleanMemory = _host.TryReadCleanGuestWord,
             ReadCleanWords = _host.TryReadCleanGuestWords,
             IsMapped = _host.IsGuestMapped,
+            IsGpuPendingWord = _host.IsGpuPendingGuestWord,
             ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
                 ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
                     Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
@@ -304,6 +311,25 @@ internal sealed class ShaderProgramCache
             default:
                 StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), _staticState);
                 break;
+        }
+
+        if (options.HullDispatch is { } hull)
+        {
+            _staticState.Add(0x48554C4Cu);
+            _staticState.Add(hull.PatchesPerGroup);
+            _staticState.Add(hull.InputControlPoints);
+            _staticState.Add(hull.OutputControlPoints);
+            _staticState.Add(hull.OffchipBytesPerGroup);
+            _staticState.Add(hull.FactorBytesPerPatch);
+        }
+
+        if (options.DomainGrid is { } domain)
+        {
+            _staticState.Add(0x444F4D4Eu);
+            _staticState.Add(domain.PatchesPerGroup);
+            _staticState.Add(domain.OffchipBytesPerGroup);
+            _staticState.Add(domain.Segments);
+            _staticState.Add((domain.Triangles ? 1u : 0u) | (domain.Clockwise ? 2u : 0u));
         }
     }
 
@@ -567,8 +593,10 @@ internal sealed class ShaderProgramCache
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
+                    FastFloat16Arithmetic = exactFloat16Conversions && !ExactFloat16Arithmetic,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
+                    DomainGrid = options.DomainGrid,
                     VertexInputs = entry.VertexInputs,
                     PositionExportControl = info.PositionExportControl,
                     ClipSpace = new ShaderClipSpaceTransform(
@@ -587,6 +615,8 @@ internal sealed class ShaderProgramCache
                 var info = options.PixelInfo!;
                 var interpolators = new uint[info.InputCount];
                 Array.Copy(info.InterpolatorSettings, interpolators, interpolators.Length);
+                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_CNTL") == "1") // TEMP
+                    Console.Error.WriteLine($"[DBG][PSCNTL] hash=0x{source.Hash:X16} ena=0x{options.PixelInputEnable:X} addr=0x{options.PixelInputAddress:X} custom=0x{info.CustomInterpolationMask:X} cntl={string.Join(',', interpolators.Select(v => $"0x{v:X}"))}");
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
                     WaveSize = 32,
@@ -595,6 +625,7 @@ internal sealed class ShaderProgramCache
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
+                    FastFloat16Arithmetic = exactFloat16Conversions && !ExactFloat16Arithmetic,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
@@ -616,8 +647,10 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
+                    FastFloat16Arithmetic = exactFloat16Conversions && !ExactFloat16Arithmetic,
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
+                    HullDispatch = options.HullDispatch,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
                     LocalSizeY = Math.Max(info.ThreadsY, 1),
                     LocalSizeZ = Math.Max(info.ThreadsZ, 1),

@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Packets;
 
 namespace SharpEmu.Libs.Gpu.GpuCommands;
@@ -154,7 +155,47 @@ public sealed partial class GpuCommandInterpreter
                 $"address=0x{address:X16} count={executeCount} remaining={packet.Remaining}.");
         }
 
-        return ReadDword(address) == 0 ? payloadDwords + executeCount : payloadDwords;
+        // The host queue runs every packet in order, so a block of markers and memory waits only
+        // orders work against CPU-written labels. Its GPU-written predicate is not worth draining
+        // the queue for; the value the CPU last saw decides.
+        var predicate = !DbgCondSync && OnlyOrdersWork(packet.PacketAddress + 4u * (1 + payloadDwords), executeCount)
+            ? ReadUnsynchronizedDword(address)
+            : ReadDword(address);
+        return predicate == 0 ? payloadDwords + executeCount : payloadDwords;
+    }
+
+    private static readonly bool DbgCondSync = Environment.GetEnvironmentVariable("SHARPEMU_DBG_COND_SYNC") == "1"; // TEMP
+
+    private uint ReadUnsynchronizedDword(ulong address)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        return _host.Memory.TryRead(address, bytes)
+            ? BinaryPrimitives.ReadUInt32LittleEndian(bytes)
+            : ReadDword(address);
+    }
+
+    private bool OnlyOrdersWork(ulong blockAddress, uint dwords)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        for (var offset = 0u; offset < dwords;)
+        {
+            if (!_host.Memory.TryRead(blockAddress + 4u * offset, bytes))
+            {
+                return false;
+            }
+
+            var header = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (PacketHeader.PacketType(header) != 3 || PacketHeader.Opcode(header) != PacketOpcode.Nop ||
+                PacketHeader.CustomCode(header) is not (PacketCustomCode.PushMarker or PacketCustomCode.PopMarker or
+                    PacketCustomCode.WaitMemory32 or PacketCustomCode.WaitMemory64))
+            {
+                return false;
+            }
+
+            offset += PacketHeader.Length(header);
+        }
+
+        return true;
     }
 
     internal uint SetPredicationPacket(in PacketContext packet, ReadOnlySpan<uint> payload)

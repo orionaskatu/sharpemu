@@ -95,6 +95,24 @@ public static partial class Gen5SpirvTranslator
         private uint _pendingFaultWord;
         private uint _pendingFaultBits;
 
+        // The pages an invocation wrote through device addresses, kept in the second half of the
+        // fault buffer. The host marks them GPU-written after the submission so the guest CPU
+        // reads the results; unlike a fault, a write is never dropped, so a page in another
+        // bitmap word publishes the pending one first.
+        private uint _pendingWriteWord;
+        private uint _pendingWriteBits;
+
+        // The fault bitmap covers every cached page; the written-page bitmap follows it.
+        public const uint WrittenPageBitmapWordOffset = (uint)((1UL << (40 - DeviceAddressPageBits)) / 32);
+
+        // The last page this invocation resolved and its table entry. The page table does not
+        // change during a dispatch, so a repeated page skips the dependent table load.
+        private uint _translatedPage;
+        private uint _translatedEntry;
+
+        private static readonly bool DeviceAddressCache = !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_ADDRESS_CACHE"), "0", StringComparison.Ordinal);
+
         // The element a typed device-address store writes, chosen by the runtime format:
         // a value and a mask for each of its (at most four) dwords, and its byte count.
         private readonly uint[] _deviceStoreValueScratch = new uint[4];
@@ -249,6 +267,22 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_pendingFaultBits, "pendingFaultBits");
                 _interfaces.Add(_pendingFaultWord);
                 _interfaces.Add(_pendingFaultBits);
+                _pendingWriteWord = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _pendingWriteBits = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _module.AddName(_pendingWriteWord, "pendingWriteWord");
+                _module.AddName(_pendingWriteBits, "pendingWriteBits");
+                _interfaces.Add(_pendingWriteWord);
+                _interfaces.Add(_pendingWriteBits);
+                if (DeviceAddressCache)
+                {
+                    var privateUlongPointer = _module.TypePointer(SpirvStorageClass.Private, _ulongType);
+                    _translatedPage = _module.AddGlobalVariable(privateUlongPointer, SpirvStorageClass.Private, ULong(ulong.MaxValue));
+                    _translatedEntry = _module.AddGlobalVariable(privateUlongPointer, SpirvStorageClass.Private, ULong(0));
+                    _module.AddName(_translatedPage, "translatedPage");
+                    _module.AddName(_translatedEntry, "translatedEntry");
+                    _interfaces.Add(_translatedPage);
+                    _interfaces.Add(_translatedEntry);
+                }
                 for (var index = 0; index < _deviceStoreValueScratch.Length; index++)
                 {
                     _deviceStoreValueScratch[index] = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
@@ -746,6 +780,25 @@ public static partial class Gen5SpirvTranslator
         {
             var masked = And64(address64, ULong(DeviceAddressMask));
             var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPageBits));
+            if (_translatedPage == 0)
+            {
+                var resolved = WalkPageTable(address64, pageIndex64);
+                return (IAdd64(resolved, And64(masked, ULong(DeviceAddressPageSize - 1))), _module.AddInstruction(SpirvOp.INotEqual, _boolType, resolved, ULong(0)));
+            }
+
+            var miss = _module.AddInstruction(SpirvOp.INotEqual, _boolType, pageIndex64, Load(_ulongType, _translatedPage));
+            EmitConditional(miss, () =>
+            {
+                Store(_translatedEntry, WalkPageTable(address64, pageIndex64));
+                Store(_translatedPage, pageIndex64);
+            });
+            var entry = Load(_ulongType, _translatedEntry);
+            return (IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1))), _module.AddInstruction(SpirvOp.INotEqual, _boolType, entry, ULong(0)));
+        }
+
+        // The page's table entry, zero when unmapped; a missing page is recorded as a fault.
+        private uint WalkPageTable(uint address64, uint pageIndex64)
+        {
             var tableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0);
             var inTable = ULessThan64(pageIndex64, Widen(tableLength));
             var pageIndex = Narrow(pageIndex64);
@@ -788,13 +841,47 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, pendingWord, word)));
             Store(_pendingFaultWord, _module.AddInstruction(SpirvOp.Select, _uintType, merge, word, pendingWord));
             Store(_pendingFaultBits, _module.AddInstruction(SpirvOp.Select, _uintType, merge, BitwiseOr(pendingBits, bit), pendingBits));
-            var pointer = IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1)));
-            return (pointer, mapped);
+            return entry;
+        }
+
+        // Records a page written through a device address; called where the write happens.
+        private void NoteDeviceWrite(uint address64)
+        {
+            if (_pendingWriteBits == 0 || _faultBuffer == 0)
+            {
+                return;
+            }
+
+            var pageIndex = Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType,
+                And64(address64, ULong(DeviceAddressMask)), ULong(DeviceAddressPageBits)));
+            var word = IAdd(ShiftRightLogical(pageIndex, UInt(5)), UInt(WrittenPageBitmapWordOffset));
+            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
+            var pendingWord = Load(_uintType, _pendingWriteWord);
+            var pendingBits = Load(_uintType, _pendingWriteBits);
+            var otherWord = LogicalAnd(
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, pendingBits, UInt(0)),
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, pendingWord, word));
+            EmitConditional(otherWord, () =>
+            {
+                EmitConditional(IsBlockWordInRange(_faultBuffer, pendingWord), () =>
+                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, pendingWord), UInt(1), UInt(0), pendingBits));
+                Store(_pendingWriteBits, UInt(0));
+            });
+            Store(_pendingWriteWord, word);
+            Store(_pendingWriteBits, BitwiseOr(Load(_uintType, _pendingWriteBits), bit));
         }
 
         // Publishes the missing pages the invocation met, once, as it ends.
         private void FlushPendingDeviceFaults()
         {
+            if (_pendingWriteBits != 0 && _faultBuffer != 0)
+            {
+                var writeBits = Load(_uintType, _pendingWriteBits);
+                var writeWord = Load(_uintType, _pendingWriteWord);
+                EmitConditional(LogicalAnd(_module.AddInstruction(SpirvOp.INotEqual, _boolType, writeBits, UInt(0)), IsBlockWordInRange(_faultBuffer, writeWord)), () =>
+                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, writeWord), UInt(1), UInt(0), writeBits));
+            }
+
             if (_pendingFaultBits == 0)
             {
                 return;
@@ -823,7 +910,10 @@ public static partial class Gen5SpirvTranslator
         {
             var (pointer, valid) = ResolveDeviceAddress(address64);
             EmitConditional(LogicalAnd(allowed, valid), () =>
-                _module.AddStatement(SpirvOp.Store, DeviceWordPointer(pointer), value, 2u, 4u));
+            {
+                _module.AddStatement(SpirvOp.Store, DeviceWordPointer(pointer), value, 2u, 4u);
+                NoteDeviceWrite(address64);
+            });
         }
 
         private void StoreDeviceMaskedWord(uint address64, uint value, uint mask, uint allowed)
@@ -834,6 +924,7 @@ public static partial class Gen5SpirvTranslator
                 var (pointer, valid) = ResolveDeviceAddress(address64);
                 EmitConditional(valid, () =>
                 {
+                    NoteDeviceWrite(address64);
                     var wordPointer = DeviceWordPointer(pointer);
                     var full = _module.AddInstruction(SpirvOp.IEqual, _boolType, mask, UInt(uint.MaxValue));
                     EmitConditional(
@@ -1173,6 +1264,7 @@ public static partial class Gen5SpirvTranslator
                         var (pointer, valid) = ResolveDeviceAddress(address);
                         EmitConditional(valid, () =>
                         {
+                            NoteDeviceWrite(address);
                             var original = EmitAtomic(
                                 atomicOp,
                                 _uintType,

@@ -490,12 +490,26 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
                     break;
                 case SDL_EventType.SDL_EVENT_MOUSE_MOTION:
                     ShowCursorTemporarily();
+                    if (_mouseTouchDown)
+                    {
+                        UpdateMouseTouch(windowEvent.motion.x, windowEvent.motion.y, down: true);
+                    }
                     break;
                 case SDL_EventType.SDL_EVENT_MOUSE_BUTTON_DOWN:
                     ShowCursorTemporarily();
                     if (windowEvent.button.button == 1 && windowEvent.button.clicks == 2)
                     {
                         ToggleFullscreen();
+                    }
+                    else if (windowEvent.button.button == 1)
+                    {
+                        UpdateMouseTouch(windowEvent.button.x, windowEvent.button.y, down: true);
+                    }
+                    break;
+                case SDL_EventType.SDL_EVENT_MOUSE_BUTTON_UP:
+                    if (windowEvent.button.button == 1 && _mouseTouchDown)
+                    {
+                        UpdateMouseTouch(windowEvent.button.x, windowEvent.button.y, down: false);
                     }
                     break;
                 case SDL_EventType.SDL_EVENT_GAMEPAD_ADDED:
@@ -758,8 +772,17 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
             HostWindowInput.SetGamepad(
                 DescribeGamepad(),
                 state);
+            var summary = $"buttons=0x{(uint)state.Buttons:X} lx={state.LeftX} ly={state.LeftY} rx={state.RightX} ry={state.RightY} l2={state.LeftTrigger} r2={state.RightTrigger} touch={state.Touch.First.Active}"; // TEMP
+            if (summary != _dbgLastGamepad && _dbgGamepadLogs++ < 300) // TEMP
+            {
+                _dbgLastGamepad = summary;
+                Console.Error.WriteLine($"[DBG][GAMEPAD] {DescribeGamepad()} {summary}");
+            }
         }
     }
+
+    private string? _dbgLastGamepad; // TEMP
+    private int _dbgGamepadLogs; // TEMP
 
     private void EnableSensor(SDL_SensorType sensor)
     {
@@ -796,6 +819,28 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
             angularVelocity[0],
             angularVelocity[1],
             angularVelocity[2]);
+    }
+
+    private bool _mouseTouchDown;
+    private readonly Pad.TouchContactIds _mouseTouchIds = new();
+
+    // Window coordinates map onto the whole touchpad surface.
+    private void UpdateMouseTouch(float x, float y, bool down)
+    {
+        int width = 0;
+        int height = 0;
+        if (!SDL_GetWindowSize(_window, &width, &height) || width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        _mouseTouchDown = down;
+        var id = _mouseTouchIds.Track(0, down);
+        HostWindowInput.SetMouseTouch(new HostTouchPoint(
+            down,
+            id,
+            Math.Clamp(x / width, 0f, 1f),
+            Math.Clamp(y / height, 0f, 1f)));
     }
 
     private HostTouchState ReadTouch()

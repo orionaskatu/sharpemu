@@ -29,6 +29,15 @@ public sealed record ResourceRuntimeInputs
     // wrapper can tell the words only the table reads from those the descriptors depend on.
     public Action<bool>? TablePhase { get; init; }
 
+    // Whether the GPU still owns a guest dword: earlier recorded work writes it and the CPU
+    // copy is stale. A flattened table word read straight from such a dword is left for the
+    // host to copy on the device, in order, instead of draining the queue to read it here.
+    public Func<ulong, bool>? IsGpuPendingWord { get; init; }
+
+    // Set only when the result is not cached: a large descriptor table probed within the last
+    // few milliseconds may then be reused instead of read again.
+    public bool AllowTransientTableReuse { get; init; }
+
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => this with
     {
         ReadMemory = reader,

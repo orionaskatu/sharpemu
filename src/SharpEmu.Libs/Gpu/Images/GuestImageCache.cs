@@ -33,6 +33,10 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly ImageBackingPool? _backingPool;
     private readonly OptimalImageMemoryPool _imageMemoryPool;
     private readonly ImagePageOwnerTable _pageOwners = new();
+
+    // Registered images by the first byte of their data; a request that matches a cached
+    // image's backing exactly starts where it does, so it needs no page-owner scan.
+    private readonly Dictionary<ulong, List<ResourceSlotIdentifier>> _imagesByStart = new();
     private readonly Dictionary<NullImageKey, ResourceSlotIdentifier> _nullImages = new();
     private RecencyQueue<ResourceSlotIdentifier> _recencyQueue = new();
     private readonly HashSet<ResourceSlotIdentifier> _scheduledReadbacks = new();
@@ -205,12 +209,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         using var held = _lock.Hold();
         var result = ResourceSlotIdentifier.Invalid;
-        var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
-        foreach (var imageIdentifier in candidates)
+        if (!SharpEmu.ShaderCompiler.DbgFlags.Disabled("imgindex") && _imagesByStart.TryGetValue(request.Description.Data.Address, out var starting))
         {
-            if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
+            foreach (var imageIdentifier in starting)
             {
-                result = imageIdentifier;
+                if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
+                {
+                    result = imageIdentifier;
+                }
             }
         }
 
@@ -218,6 +224,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         var viewLayer = -1;
         if (!result.IsValid)
         {
+            var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
             foreach (var candidate in candidates)
             {
                 viewMip = -1;

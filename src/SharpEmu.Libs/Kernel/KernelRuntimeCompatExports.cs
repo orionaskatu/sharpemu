@@ -225,7 +225,7 @@ public static class KernelRuntimeCompatExports
         else
         {
             var processStartCounter = _processStartCounter;
-            var elapsedTicks = Stopwatch.GetTimestamp() - processStartCounter;
+            var elapsedTicks = ScaledElapsed(Stopwatch.GetTimestamp() - processStartCounter);
             if (_stopwatchTicksAreNanoseconds)
             {
                 // Constant divisors let the JIT strength-reduce the division;
@@ -336,9 +336,15 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // TEMP: SHARPEMU_DBG_GUEST_TIME_SCALE slows the process clocks (pair with SHARPEMU_TSC_FREQ_HZ).
+    private static readonly double DbgGuestTimeScale =
+        double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_GUEST_TIME_SCALE"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var scale) && scale > 0 ? scale : 1.0;
+
+    private static long ScaledElapsed(long elapsedTicks) => DbgGuestTimeScale == 1.0 ? elapsedTicks : (long)(elapsedTicks * DbgGuestTimeScale);
+
     internal static ulong ReadProcessTimeMicroseconds()
     {
-        var elapsedTicks = Stopwatch.GetTimestamp() - _processStartCounter;
+        var elapsedTicks = ScaledElapsed(Stopwatch.GetTimestamp() - _processStartCounter);
         var micros = elapsedTicks * 1_000_000L / Stopwatch.Frequency;
         return unchecked((ulong)Math.Max(0, micros));
     }
@@ -359,7 +365,7 @@ public static class KernelRuntimeCompatExports
 
     internal static ulong ReadProcessTimeCounterAt(long timestamp)
     {
-        var elapsedTicks = timestamp - _processStartCounter;
+        var elapsedTicks = ScaledElapsed(timestamp - _processStartCounter);
         return unchecked((ulong)Math.Max(0, elapsedTicks));
     }
 

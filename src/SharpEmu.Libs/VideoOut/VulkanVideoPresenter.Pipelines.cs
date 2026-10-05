@@ -110,6 +110,12 @@ internal static unsafe partial class VulkanVideoPresenter
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
 
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
+        private bool DbgShaderRead(ulong address) // TEMP
+        {
+            _bufferCache.DbgFault(address, "shader-read");
+            return true;
+        }
+
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
@@ -124,8 +130,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
+            // Only the bytes a buffer write covered can differ from guest memory: a GPU write
+            // elsewhere on the page does not make this word stale, so it needs no download.
+            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && _bufferCache.MayHaveGpuDirtyPages(address, 4) && DbgShaderRead(address) &&
+                !_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                    SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
             {
                 return false;
             }
@@ -137,8 +146,29 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (DbgVerifyGpuReads && _bufferCache.DbgReadGpuWord(address, out var gpuWord, out var gpuBase, out _)) // TEMP
+            {
+                _dbgVerified++;
+                if (gpuWord != word)
+                {
+                    if (_dbgMismatch++ < 200 || _dbgMismatch % 1000 == 0)
+                        Console.Error.WriteLine($"[DBG][STALE] addr=0x{address:X} cpu=0x{word:X} gpu=0x{gpuWord:X} buffer=0x{gpuBase:X} dirtyBytes={_bufferCache.HasGpuDirtyBytes(address, 4)} cpuDirty={_bufferCache.HasCpuDirtyPages(address, 4)} n={_dbgMismatch}/{_dbgVerified}");
+                    if (DbgUseGpuReads) word = gpuWord;
+                }
+            }
+            if ((address & ~0xFFFul) == 0x500CDB6000ul && (_dbgSrCount++ % 64) == 0) // TEMP
+                Console.Error.WriteLine($"[DBG][SRVAL] n={_dbgSrCount} addr=0x{address:X} value=0x{word:X} stack={(_dbgSrCount < 300 ? Environment.StackTrace.Replace(Environment.NewLine, " | ") : "")}");
             return true;
         }
+        private static int _dbgSrCount; // TEMP
+        private static readonly bool DbgVerifyGpuReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_VERIFY_GPU_READS") == "1"; // TEMP
+        private static readonly bool DbgUseGpuReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_USE_GPU_READS") == "1"; // TEMP
+        private static long _dbgVerified, _dbgMismatch; // TEMP
+
+        private static readonly bool DbgNoTablePatches = Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_TABLE_PATCHES") == "1"; // TEMP
+
+        public bool IsGpuPendingGuestWord(ulong address) =>
+            !DbgNoTablePatches && _bufferCache.IsGpuOwnedWord(address) && !_imageCache.HasGpuModifiedImageBytes(address, sizeof(uint));
 
         // A mapping query only: nothing is read, so nothing the GPU wrote is synchronized.
         public bool IsGuestMapped(ulong address) => _guestMemory.CanRead(address, sizeof(uint));
@@ -161,13 +191,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
             }
 
-            if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) || _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
+            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
             {
                 _ = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint));
             }
 
-            if ((_bufferCache.MayHaveGpuDirtyPages(address, sizeof(uint)) && _bufferCache.HasGpuDirtyPages(address, sizeof(uint))) ||
-                _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
+            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
                 _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)).Count != 0)
             {
                 return false;
@@ -192,8 +221,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (_bufferCache.HasGpuDirtyPages(address, size) ||
-                (clean && (_bufferCache.HasGpuDirtyBytes(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+            if (_bufferCache.HasGpuDirtyBytes(address, size) ||
+                (clean && _imageCache.HasGpuModifiedImageBytes(address, size)))
             {
                 return false;
             }
@@ -728,6 +757,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 var colorFormats = new Format[colorCount];
                 Array.Copy(rendering.ColorFormats, colorFormats, colorCount);
+                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PIPE_PS") is { } dbgPs && dbgPs.Contains($"{description.PixelStage?.Hash ?? 0:X16}")) // TEMP
+                    for (var index = 0; index < colorCount; index++)
+                        Console.Error.WriteLine($"[DBG][PIPE] ps=0x{description.PixelStage?.Hash ?? 0:X16} att={index} fmt={colorFormats[index]} mask={blends[index].ColorWriteMask} blend={blends[index].BlendEnable} src={blends[index].SrcColorBlendFactor} dst={blends[index].DstColorBlendFactor} op={blends[index].ColorBlendOp} asrc={blends[index].SrcAlphaBlendFactor} adst={blends[index].DstAlphaBlendFactor}");
                 var cullMode = CullModeFlags.None;
                 if (parameters.CullBack)
                 {

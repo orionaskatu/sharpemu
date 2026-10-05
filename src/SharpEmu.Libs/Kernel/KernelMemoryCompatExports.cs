@@ -3198,6 +3198,10 @@ public static partial class KernelMemoryCompatExports
             ReplaceMappedRegionRangeLocked(new MappedRegion(address, length, protection,
                 false, true, directMemoryStart, directMemoryStart));
             GuestGpuMemoryHook.NoteMapped(address, length, mode);
+            if ((protection & (OrbisProtGpuRead | OrbisProtGpuWrite)) != 0 || DbgEagerAllDirect) // TEMP
+                GuestGpuMemoryHook.NoteGpuMapping(address, length);
+            if (ShouldTraceDirectMemory())
+                Console.Error.WriteLine($"[LOADER][TRACE] map_direct protection=0x{protection:X} address=0x{address:X} size=0x{length:X}");
             if (!ctx.TryWriteUInt64(inOutAddressPointer, address))
                 return MemoryFault;
             GuestWriteWatch.OnDirectMapping(address, length, protection);
@@ -3256,6 +3260,8 @@ public static partial class KernelMemoryCompatExports
                 ReplaceMappedRegionRangeLocked(new MappedRegion(block.Address, block.Size, protection,
                     true, false, 0, block.Offset));
             GuestGpuMemoryHook.NoteMapped(address, length, mode);
+            if ((protection & (OrbisProtGpuRead | OrbisProtGpuWrite)) != 0)
+                GuestGpuMemoryHook.NoteGpuMapping(address, length);
             return ctx.TryWriteUInt64(pointer, address) ? 0 : MemoryFault;
         }
     }
@@ -6292,6 +6298,8 @@ public static partial class KernelMemoryCompatExports
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
 
     private static bool ShouldTraceDirectMemory() => _traceDirectMemory;
+
+    private static readonly bool DbgEagerAllDirect = Environment.GetEnvironmentVariable("SHARPEMU_DBG_EAGER_ALL_DIRECT") == "1"; // TEMP
 
 
 

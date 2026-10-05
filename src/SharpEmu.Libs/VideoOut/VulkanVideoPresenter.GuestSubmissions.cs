@@ -103,9 +103,21 @@ internal static unsafe partial class VulkanVideoPresenter
                     retireBuffers));
         }
 
+        // Collecting completed work reads the timeline semaphore and runs deferred callbacks;
+        // per draw that was a tenth of the render thread. Below capacity it runs at most this often.
+        private static readonly long CompletionPollInterval = System.Diagnostics.Stopwatch.Frequency / 2000;
+        private long _lastCompletionPoll;
+
         private void EnsureGuestSubmissionCapacity()
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.SubmissionCapacity);
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!SharpEmu.ShaderCompiler.DbgFlags.Disabled("poll") && _pendingGuestSubmissions.Count < MaxInFlightGuestSubmissions && now - _lastCompletionPoll < CompletionPollInterval)
+            {
+                return;
+            }
+
+            _lastCompletionPoll = now;
             CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {

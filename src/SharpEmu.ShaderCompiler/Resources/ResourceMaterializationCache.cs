@@ -24,6 +24,42 @@ public sealed class ResourceMaterializationCache
     private Dictionary<ulong, Entry> _old = new();
     private byte[] _scratch = new byte[256];
 
+    // A plan whose draws read different words every time (per-draw constant pointers in a
+    // ring) never hits; recording its reads and storing entries is then pure overhead. Such
+    // plans materialize directly, recording one miss in BypassSampling so that a plan whose
+    // inputs start repeating builds entries again and returns to full caching.
+    private const int BypassWarmup = 128;
+    private const int BypassHitDivisor = 16;
+    private const int BypassSampling = 16;
+    private const int StatsDecayAttempts = 4096;
+    private readonly Dictionary<ShaderResourcePlan, PlanStats> _planStats = new(ReferenceEqualityComparer.Instance);
+
+    private sealed class PlanStats
+    {
+        public int Attempts;
+        public int Hits;
+    }
+
+    private PlanStats StatsOf(ShaderResourcePlan plan)
+    {
+        if (!_planStats.TryGetValue(plan, out var stats))
+        {
+            stats = new PlanStats();
+            _planStats.Add(plan, stats);
+        }
+
+        if (++stats.Attempts >= StatsDecayAttempts)
+        {
+            stats.Attempts /= 2;
+            stats.Hits /= 2;
+        }
+
+        return stats;
+    }
+
+    private static bool BypassesRecording(PlanStats stats) =>
+        stats.Attempts >= BypassWarmup && stats.Hits * BypassHitDivisor < stats.Attempts && stats.Attempts % BypassSampling != 0;
+
     public ResourceMaterializationCache(int generationCapacity = 16384)
     {
         _generationCapacity = Math.Max(1, generationCapacity);
@@ -58,10 +94,12 @@ public sealed class ResourceMaterializationCache
         out ResourceMaterializationFailure failure)
     {
         var key = KeyOf(plan, inputs);
+        var stats = StatsOf(plan);
         if (TryFind(key, plan, inputs, out var cached) && MappingsHold(cached, inputs))
         {
             if (Validate(cached, residentReader))
             {
+                stats.Hits++;
                 Hits++;
                 Interlocked.Increment(ref _totalHits);
                 snapshot = cached.Snapshot;
@@ -72,6 +110,7 @@ public sealed class ResourceMaterializationCache
 
             if (TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
             {
+                stats.Hits++;
                 TableRefreshes++;
                 snapshot = refreshed.Snapshot;
                 specialization = refreshed.Specialization;
@@ -82,6 +121,11 @@ public sealed class ResourceMaterializationCache
 
         Misses++;
         Interlocked.Increment(ref _totalMisses);
+        if (BypassesRecording(stats))
+        {
+            return ResourceMaterializer.Materialize(plan, inputs with { AllowTransientTableReuse = !DbgFlags.Disabled("memo") }, ref snapshot, ref specialization, out failure);
+        }
+
         var recorder = new ReadRecorder();
         var recording = inputs with
         {
@@ -146,7 +190,8 @@ public sealed class ResourceMaterializationCache
             ReadCleanWords = recorder.Wrap(inputs.ReadCleanWords),
         };
         var cachedTable = cached.Snapshot.FlattenedResourceTable;
-        if (!ResourceMaterializer.TryEvaluateTable(plan, recording, out var table) || recorder.Failed || table.Length != cachedTable.Length)
+        var patches = new List<TableWordPatch>();
+        if (!ResourceMaterializer.TryEvaluateTable(plan, recording, out var table, patches) || recorder.Failed || table.Length != cachedTable.Length)
             return false;
 
         foreach (var (address, word, _, _) in recorder.Reads)
@@ -181,6 +226,7 @@ public sealed class ResourceMaterializationCache
                 Images = previous.Images,
                 Samplers = previous.Samplers,
                 FlattenedResourceTable = table,
+                TablePatches = [.. patches],
                 UserData = previous.UserData,
                 DeviceAddressRanges = previous.DeviceAddressRanges,
             },

@@ -90,6 +90,18 @@ public sealed class ShaderResourcePlan
         plan.IndirectImages = tracked.IndirectImages;
         plan.BufferCandidateTables = tracked.BufferCandidateTables;
         plan.DynamicReads = plan.DynamicReads.Where(read => !tracked.IndirectReads.Contains(read)).ToList();
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_DEVICE_WRITES") == "1") // TEMP
+        {
+            for (var index = 0; index < plan.Memory.Count; index++)
+            {
+                var memory = plan.Memory[index];
+                if (memory.Access == MemoryAccess.Read) continue;
+                var runtime = memory.DeviceDescriptor || memory.BufferDescriptor is { Provenance: BufferDescriptorProvenance.Runtime } ||
+                    memory.Kind is MemoryResourceKind.Flat or MemoryResourceKind.Global;
+                if (runtime)
+                    Console.Error.WriteLine($"[DBG][DEVWRITE] hash=0x{hash:X16} stage={stage} pc=0x{memory.Pc:X} op={memory.Opcode} kind={memory.Kind} device={memory.DeviceDescriptor} runtime={memory.BufferDescriptor?.Provenance}");
+            }
+        }
 
         var materialization = new List<uint>();
         foreach (var buffer in plan.Info.Buffers)

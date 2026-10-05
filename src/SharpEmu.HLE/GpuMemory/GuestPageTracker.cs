@@ -97,6 +97,18 @@ public sealed class GuestPageTracker
 
     public void MarkGpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Gpu, enable: true, create: true);
 
+    // GPU writes found after the fact: pages the CPU wrote since keep their CPU data.
+    public void MarkGpuDirtyPagesWhereCpuClean(ulong vaddr, ulong size, Action<ulong, ulong> marked)
+    {
+        RejectUploadCallbackReentry();
+        VisitRegions(vaddr, size, create: true, (region, offset, bytes) =>
+        {
+            using var _ = region.Lock.Hold();
+            region.MarkGpuWhereCpuClean(region.BaseAddress + offset, bytes, marked);
+            return false;
+        });
+    }
+
     public void ClearGpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Gpu, enable: false, create: false);
 
     // True when every page of the range has a region, so the range is under tracking.
@@ -402,6 +414,16 @@ public sealed class GuestPageTracker
     // with no region yet starts all dirty, and a region's summary bit is set while any of its
     // pages is dirty. Known-clean blocks are skipped without a lock, the same test
     // HasCpuDirtyPages starts with, so a caller that only uploads dirty pages loses nothing.
+    // Each tracked 4 MiB block that may hold CPU-dirty pages. Untracked blocks hold no buffers.
+    public void ForEachCpuDirtyBlock(Action<ulong, ulong> visit) =>
+        _cpuDirtySummary.ForEachDirty(block =>
+        {
+            if (Volatile.Read(ref _regions[block]) != null)
+            {
+                visit(block * BlockBytes, BlockBytes);
+            }
+        });
+
     public void ForEachPossiblyCpuDirtyRange(ulong vaddr, ulong size, Action<ulong, ulong> visit)
     {
         if (size == 0)

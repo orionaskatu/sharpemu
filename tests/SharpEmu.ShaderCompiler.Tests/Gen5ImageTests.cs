@@ -287,6 +287,21 @@ public sealed class Gen5ImageTests
         return shader.Spirv;
     }
 
+    private static string FindName(byte[] spirv, uint id)
+    {
+        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(spirv).ToArray();
+        for (var index = 5; index < words.Length; index += (int)(words[index] >> 16))
+        {
+            if ((SpirvOp)(words[index] & 0xFFFF) == SpirvOp.Name && words[index + 1] == id)
+            {
+                var length = (int)(words[index] >> 16);
+                return System.Text.Encoding.UTF8.GetString(spirv, (index + 2) * 4, (length - 2) * 4).TrimEnd(' ');
+            }
+        }
+
+        throw new InvalidOperationException($"No name for %{id}.");
+    }
+
     private static int[] GetStoredVgprRegisters(byte[] spirv)
     {
         var instructions = ReadSpirvInstructions(spirv);
@@ -316,15 +331,9 @@ public sealed class Gen5ImageTests
             }
 
             Assert.Equal(SpirvOp.Load, value.Opcode);
-            var pointer = FindResult(
-                instructions,
-                SpirvOp.AccessChain,
-                value.Operands[2]);
-            var register = FindResult(
-                instructions,
-                SpirvOp.Constant,
-                pointer.Operands[^1]);
-            result[component] = checked((int)register.Operands[2]);
+            result[component] = int.Parse(
+                FindName(spirv, value.Operands[2]).AsSpan(1),
+                System.Globalization.CultureInfo.InvariantCulture);
         }
 
         return result;

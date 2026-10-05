@@ -44,12 +44,24 @@ public static class RegisterWriteTable
     public static uint WriteShaderPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
         var consumed = WritePacket(banks, in packet, offset, values, Shader, ShaderIndirect, "shader", emptyIsHandled: false);
+        DbgHullWrites(offset, values, "packet"); // TEMP
         if (Rendering.RenderTrace.Enabled)
         {
             for (var index = 0; index < values.Length && index < consumed; index++)
                 TracePixelRegisterWrite(banks, offset + (uint)index, values[index], packet.PacketAddress, "packet");
         }
         return consumed;
+    }
+
+    private static int _dbgHullWrites; // TEMP
+    private static readonly bool DbgHullWritesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_DBG_HULL_WRITES") == "1"; // TEMP
+    private static void DbgHullWrites(uint offset, ReadOnlySpan<uint> values, string source) // TEMP
+    {
+        if (!DbgHullWritesEnabled || offset + (uint)values.Length <= 0x100 || offset >= 0x150) return;
+        if (Interlocked.Increment(ref _dbgHullWrites) > 400) return;
+        var text = new System.Text.StringBuilder();
+        for (var i = 0; i < values.Length; i++) text.Append($" 0x{offset + i:X3}=0x{values[i]:X8}");
+        Console.Error.WriteLine($"[DBG][HSREG] {source}{text}");
     }
 
     public static uint WriteUserConfigPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values) =>
@@ -88,6 +100,7 @@ public static class RegisterWriteTable
 
     public static void WriteShaderEntry(RegisterBanks banks, uint offset, uint value, ulong tableAddress)
     {
+        DbgHullWrites(offset, [value], "table"); // TEMP
         WriteEntry(banks, offset, value, ShaderIndirect, "shader", tableAddress);
         if (Rendering.RenderTrace.Enabled)
             TracePixelRegisterWrite(banks, offset, value, tableAddress, "table");

@@ -21,6 +21,12 @@ public sealed class SpanSet
             index--;
         }
 
+        // Already covered: re-adding would remove and reinsert the span, moving the tail twice.
+        if (index < _spans.Count && _spans.GetKeyAtIndex(index) <= start && _spans.GetValueAtIndex(index) >= end)
+        {
+            return;
+        }
+
         while (index < _spans.Count && _spans.GetKeyAtIndex(index) <= end)
         {
             start = Math.Min(start, _spans.GetKeyAtIndex(index));
@@ -89,8 +95,15 @@ public sealed class SpanSet
 
     public List<GuestSpan> GetOverlappingRanges(ulong address, ulong size)
     {
-        ValidateRange(address, size);
         var result = new List<GuestSpan>();
+        AddOverlappingRanges(address, size, result);
+        return result;
+    }
+
+    // Appends the overlapping parts of [address, address + size) to a caller-owned list.
+    public void AddOverlappingRanges(ulong address, ulong size, List<GuestSpan> result)
+    {
+        ValidateRange(address, size);
         var end = address + size;
         var index = UpperBound(address);
         if (index > 0 && _spans.GetValueAtIndex(index - 1) > address)
@@ -104,8 +117,6 @@ public sealed class SpanSet
             var stop = Math.Min(end, _spans.GetValueAtIndex(index));
             result.Add(new GuestSpan(start, stop - start));
         }
-
-        return result;
     }
 
     private int LowerBound(ulong key)

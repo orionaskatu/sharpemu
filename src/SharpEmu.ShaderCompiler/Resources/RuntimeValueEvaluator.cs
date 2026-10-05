@@ -143,7 +143,7 @@ public sealed class RuntimeValueEvaluator
                     return false;
                 }
 
-                foreach (var leaf in PhiLeaves(value))
+                foreach (var leaf in _plan.Graph.PhiLeaves(value))
                 {
                     if (EvaluateWide(leaf, out result))
                     {
@@ -210,38 +210,50 @@ public sealed class RuntimeValueEvaluator
         }
     }
 
-    private static List<ScalarValue> PhiLeaves(ScalarValue phi)
-    {
-        var leaves = new List<ScalarValue>();
-        var pending = new Stack<ScalarValue>();
-        var visited = new HashSet<ScalarValue>();
-        pending.Push(phi);
-        while (pending.TryPop(out var current))
-        {
-            if (current.Kind != ScalarValueKind.Phi)
-            {
-                leaves.Add(current);
-                continue;
-            }
-
-            if (visited.Add(current))
-            {
-                foreach (var operand in current.Operands)
-                {
-                    pending.Push(operand);
-                }
-            }
-        }
-
-        return leaves;
-    }
-
     // A raw read adds the immediate and dynamic offsets to the 48-bit handle base, checks
     // a buffer read against its records, and reads one aligned dword.
     private bool EvaluateRawRead(ScalarValue value, out ulong result)
     {
         result = 0;
-        if (value.MemoryIndex >= _plan.Memory.Count)
+        if (!TryResolveRawRead(value, out var address, out var baseAddress))
+        {
+            return false;
+        }
+
+        if (address == OutOfRangeRead)
+        {
+            return true;
+        }
+
+        if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
+        {
+            // Every read is evaluated up front, including ones in branches the shader skips
+            // when a pointer is null. A load through a null base cannot execute on hardware,
+            // so its value is never used.
+            if ((baseAddress & ~3ul) == 0)
+            {
+                result = 0;
+                return true;
+            }
+
+            return false;
+        }
+
+        result = word;
+        return true;
+    }
+
+    // A buffer load past its V# range reads zero without touching memory.
+    private const ulong OutOfRangeRead = ulong.MaxValue;
+
+    // The aligned dword a raw read loads, without loading it; OutOfRangeRead for a buffer
+    // load past its records.
+    internal bool TryResolveRawRead(ScalarValue value, out ulong address, out ulong baseAddress)
+    {
+        address = 0;
+        baseAddress = 0;
+        if (value.Kind is not (ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord) ||
+            value.MemoryIndex >= _plan.Memory.Count)
         {
             return false;
         }
@@ -256,9 +268,8 @@ public sealed class RuntimeValueEvaluator
             return false;
         }
 
-        var baseAddress = ((high << 32) | (uint)low) & AddressMask;
+        baseAddress = ((high << 32) | (uint)low) & AddressMask;
         var immediate = (long)(int)memory.Offset;
-        ulong address;
         if (value.Kind == ScalarValueKind.ScalarBufferWord)
         {
             if (handle.Operands.Length != 4 ||
@@ -281,7 +292,7 @@ public sealed class RuntimeValueEvaluator
             {
                 // A scalar buffer load past the V# range returns zero on hardware, bound or not.
                 // Reads are evaluated up front, including ones in branches the shader skips.
-                result = 0;
+                address = OutOfRangeRead;
                 return true;
             }
 
@@ -296,21 +307,6 @@ public sealed class RuntimeValueEvaluator
             }
         }
 
-        if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
-        {
-            // Every read is evaluated up front, including ones in branches the shader skips
-            // when a pointer is null. A load through a null base cannot execute on hardware,
-            // so its value is never used.
-            if ((baseAddress & ~3ul) == 0)
-            {
-                result = 0;
-                return true;
-            }
-
-            return false;
-        }
-
-        result = word;
         return true;
     }
 
@@ -365,7 +361,8 @@ public sealed class RuntimeValueEvaluator
         out List<DescriptorWords> results,
         out uint[] table,
         out bool[] activeSources,
-        int additionalTableWords = 0)
+        int additionalTableWords = 0,
+        List<TableWordPatch>? patches = null)
     {
         results = [];
         table = [];
@@ -422,6 +419,15 @@ public sealed class RuntimeValueEvaluator
                 {
                     var clean = read.FlatOffset < cleanFlatSlots.Count && cleanFlatSlots[(int)read.FlatOffset] != 0;
                     var selected = clean ? cleanEvaluator : evaluator;
+                    if (!clean && patches is not null && inputs.IsGpuPendingWord is { } pending &&
+                        read.FlatOffset < plan.TableReads.Count &&
+                        evaluator.TryResolveRawRead(read.Value, out var pendingAddress, out _) &&
+                        pendingAddress != OutOfRangeRead && pending(pendingAddress))
+                    {
+                        patches.Add(new TableWordPatch(read.FlatOffset, pendingAddress));
+                        continue;
+                    }
+
                     if (read.FlatOffset >= plan.TableReads.Count || !selected.Evaluate(read.Value, out var word))
                     {
                         return false;
