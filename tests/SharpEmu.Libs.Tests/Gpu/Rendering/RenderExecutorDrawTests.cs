@@ -607,6 +607,23 @@ public sealed class RenderExecutorDrawTests : IDisposable
     }
 
     [Fact]
+    public void TargetlessPixelStorageWrite_IsExecutedEvenWhenColorExportsAreInactive()
+    {
+        var banks = Banks();
+        banks.Context.RenderTargetMask = 0;
+        banks.Context.ShaderInterface.ColorShaderMask = 0;
+        var storage = new ImageResourceInfo(ImageResourceClass.Storage, true);
+        _pipelines.Graphics = Programs(pixelStage: Stage(Program(ShaderStageKind.Pixel, images: [storage])));
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        Assert.Contains("begin_rendering 16384x8192x1 colors=0 samples=1", _host.Calls);
+        Assert.Contains(_host.Calls, c => c.StartsWith("prepare_bindings Pixel", StringComparison.Ordinal));
+        Assert.True(Assert.Single(_pipelines.PipelineRequests).PixelActive);
+        Assert.Contains(_host.Calls, c => c.StartsWith("draw_indexed", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void PixelShaderWithDepthSideEffects_KeepsADrawWithoutColorOutput()
     {
         var banks = Banks();
