@@ -17,6 +17,35 @@ public sealed partial class GuestImageCacheTests
     [Theory]
     [InlineData(1u)]
     [InlineData(2u)]
+    public void LinearColorTarget_UsesExplicitRowPitch(uint channels)
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint width = 37, height = 3, layers = 2;
+        var size = width * height * layers * channels;
+        var address = harness.MapBacked(0x4000, ReadWrite);
+        var input = Enumerable.Range(0, (int)size).Select(index => (byte)(index * 19 + 7)).ToArray();
+        harness.Write(address, input);
+        var request = AsColorTarget(LinearRequest(address, size,
+            channels == 1 ? Format.R8Unorm : Format.R8G8Unorm,
+            channels == 1 ? GuestPixelFormat.Bits8UNorm : GuestPixelFormat.Bits8_8UNorm,
+            GuestImageType.Color2D, new Extent3D(width, height, 1), layers, channels, 1));
+        var identifier = harness.Acquire(ref request);
+        Assert.Equal(input, harness.ReadImageBytes(harness.Image(identifier)));
+        harness.MarkGpuWritten(identifier);
+        var result = harness.Worker.Run(() =>
+        {
+            using var output = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler,
+                GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, (size + 3UL) & ~3UL);
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(output, address, size));
+            return harness.CopyFromDevice(output.Handle, 0, size);
+        });
+        Assert.Equal(input, result);
+    }
+
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(2u)]
     public void ExpandedSrgbBacking_TiledReadbackPreservesInactiveBytes(uint channels)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

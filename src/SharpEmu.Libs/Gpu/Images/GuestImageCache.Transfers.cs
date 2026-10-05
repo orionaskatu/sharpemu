@@ -131,8 +131,22 @@ public sealed unsafe partial class GuestImageCache
         }
 
         var guestLevels = info.FirstLevel + info.Resources.Levels;
+        var guestLinearLevels = GuestLinearLevels(info, guestLevels);
         plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner,
-            GuestLinearLevels(info, guestLevels));
+            guestLinearLevels);
+        if (guestLinearLevels.Length == 0 && role == ImageRole.ColorTarget && info.TileMode == GuestTileMode.Linear && info.FirstLevel == 0 && info.Resources.Levels == 1 && !volume)
+        {
+            // Linear color targets use the target register's pitch, not texture row alignment.
+            var slice = checked((ulong)info.Pitch * info.Extent.Height * info.BytesPerBlock);
+            if (slice > info.Data.Size / layers)
+                throw SubmissionScheduler.Fatal("The linear color target exceeds its guest allocation.");
+            plan.Layout.Pitch = info.Pitch;
+            plan.Layout.SliceStride = info.Data.Size / layers;
+            plan.Layout.Mips[0] = new TransferMipLayout
+            {
+                Size = slice, RowLength = info.Pitch, ImageHeight = info.Extent.Height,
+            };
+        }
         plan.Regions = plan.Layout.BuildCopies();
         if (info.IsDepth)
         {
