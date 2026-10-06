@@ -416,6 +416,52 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // Collection runs before every draw while memory is under pressure. Below the critical
+    // level it must leave the previous frame's images alone: the rest of the frame samples them
+    // again, so evicting them there recreated and uploaded thousands of images every frame.
+    [Fact]
+    public void GarbageCollector_MidFramePressureKeepsThePreviousFramesImages()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        var request = Color32(address + 0x330000);
+        ResourceSlotIdentifier[] images = [harness.Find(ref request)];
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, ulong.MaxValue, 1);
+            harness.Images.ResetRecency(images, 1);
+            for (var draw = 0; draw < 64; draw++)
+            {
+                harness.Images.RunGarbageCollector(endsFrame: false);
+            }
+        });
+        Assert.True(harness.Images.Contains(images[0]));
+
+        harness.Worker.Run(() => harness.Images.RunGarbageCollector(endsFrame: true));
+        Assert.False(harness.Images.Contains(images[0]));
+        harness.Shutdown();
+    }
+
+    // At the critical level an allocation can fail, so the mid-frame pass still reclaims.
+    [Fact]
+    public void GarbageCollector_MidFrameCriticalPressureReclaimsThePreviousFramesImages()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        var request = Color32(address + 0x330000);
+        ResourceSlotIdentifier[] images = [harness.Find(ref request)];
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, 0, 0, 1);
+            harness.Images.ResetRecency(images, 1);
+            harness.Images.RunGarbageCollector(endsFrame: false);
+        });
+        Assert.False(harness.Images.Contains(images[0]));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void ScheduledReadback_PublishesAfterTheTickAndKeepsTheImage()
     {

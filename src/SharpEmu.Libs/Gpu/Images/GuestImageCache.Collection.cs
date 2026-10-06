@@ -112,7 +112,13 @@ public sealed partial class GuestImageCache
             return;
         }
 
-        Collect(tick, allowAggressive: false);
+        // Mid-frame, the images older than this frame are the ones the rest of it samples
+        // again; evicting them below the critical level only recreates and uploads them.
+        if (endsFrame)
+        {
+            Collect(tick, allowAggressive: false);
+        }
+
         if (CollectionMemoryBytes >= _criticalMemoryBytes)
         {
             Collect(tick, allowAggressive: true);
