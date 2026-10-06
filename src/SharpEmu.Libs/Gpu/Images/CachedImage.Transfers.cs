@@ -242,6 +242,9 @@ public sealed unsafe partial class CachedImage
 
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
         VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit, 0, null, 1, &bufferBarrier, 0, null);
+        // Bindless tables and bound views expect the ready layout between draws.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_DOWNLOAD_TRANSITION") != "1") // TEMP
+        Transition(ReadyLayout, ReadyAccess, null, command);
     }
 
     private static (uint SourceLayers, uint DestinationLayers) SanitizeCopyLayers(CachedImage source, CachedImage destination, uint depth)

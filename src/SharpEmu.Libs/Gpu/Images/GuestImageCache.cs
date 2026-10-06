@@ -67,6 +67,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _bufferCache = bufferCache;
         _backing = backing;
         _readbackLinearImages = readbackLinearImages;
+        if (SharpEmu.HLE.GpuMemory.DbgImageReadProbe.Enabled) _dbgOwnership = DbgProbeImage; // TEMP
         RefreshCollectionBudget();
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
@@ -555,8 +556,15 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TakeGpuOwnership(_slots[association]);
     }
 
+    private static Action<CachedImage>? _dbgOwnership; // TEMP
+
+    private void DbgProbeImage(CachedImage image) => // TEMP
+        SharpEmu.HLE.GpuMemory.DbgImageReadProbe.Probe(_pages, image.Description.Data.Address, image.Description.Data.Size,
+            $"fmt={image.Description.PixelFormat} {image.Description.Extent.Width}x{image.Description.Extent.Height} isDepth={image.Description.IsDepth} tile={image.Description.TileMode} rt={image.Uses.RenderTarget} depth={image.DepthOwner.IsValid}");
+
     private static void TakeGpuOwnership(CachedImage image)
     {
+        _dbgOwnership?.Invoke(image); // TEMP
         if (!image.DepthOwner.IsValid && !image.Backing.Exists)
         {
             throw SubmissionScheduler.Fatal($"GPU ownership needs a native image or a stencil association: address=0x{image.Description.Data.Address:X16}.");

@@ -758,6 +758,77 @@ public sealed unsafe partial class GuestImageCache
         return synchronized;
     }
 
+    // Copies the linear GPU-written image that starts at the address into the buffer the
+    // caller obtained as written: a plain copy, recorded where the caller stands.
+    // A linear GPU-written image the guest CPU may read: the caller acquires its range as
+    // GPU-written (no image lock held) and then publishes it into that buffer.
+    public bool CanPublishLinearImage(ulong address)
+    {
+        using var held = _lock.Hold();
+        return FindPublishable(address, checkReadBack: true) is not null;
+    }
+
+    // Copies the image into the buffer the caller acquired as written: a plain copy,
+    // recorded where the caller stands.
+    public bool PublishLinearImage(ulong address, GpuBuffer buffer)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
+        using var held = _lock.Hold();
+        // The acquire made the range GPU-written buffer bytes, which a readback check refuses.
+        var image = FindPublishable(address, checkReadBack: false);
+        var published = image is not null && TryDownloadImageToBuffer(image, buffer);
+        if (DbgPublishLog && _dbgPublished++ < 400) // TEMP
+            Console.Error.WriteLine($"[DBG][PUBLISH] addr=0x{address:X} fmt={image?.Description.PixelFormat} {image?.Description.Extent.Width}x{image?.Description.Extent.Height} ok={published}");
+        return published;
+    }
+
+    private CachedImage? FindPublishable(ulong address, bool checkReadBack)
+    {
+        foreach (var imageIdentifier in FindImagesInRange(address, 1, pageOverlap: false))
+        {
+            var image = _slots[imageIdentifier];
+            if (image.Description.Data.Address == address && !image.Description.IsTiled && !image.Description.Bgra16 &&
+                !image.DepthOwner.IsValid && image.IsGpuModified && !image.BufferHoldsGpuContents && image.SafeToDownload &&
+                (!checkReadBack || CanReadBack(image)) &&
+                (!DbgPublishOnly513 || (image.Description.Extent.Width == 513 && image.Description.Extent.Height == 513))) // TEMP filter
+            {
+                return image;
+            }
+        }
+
+        return null;
+    }
+
+    private static readonly bool DbgPublishLog = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH_LOG") == "1"; // TEMP
+    private static int _dbgPublished, _dbgRegionLogs; // TEMP
+    private static readonly bool DbgPublishOnly513 = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH_ONLY_513") == "1"; // TEMP
+
+    // The bytes past the copy start the linear regions write: their last row ends there.
+    private static ulong LinearFootprint(in ImageDescription info, List<BufferImageCopy> regions)
+    {
+        var shift = info.IsBlock ? 2 : 0;
+        var block = (uint)(1 << shift);
+        ulong footprint = 0;
+        foreach (var region in regions)
+        {
+            var width = (region.ImageExtent.Width + block - 1) >> shift;
+            var height = (region.ImageExtent.Height + block - 1) >> shift;
+            var rowLength = region.BufferRowLength == 0 ? width : (region.BufferRowLength + block - 1) >> shift;
+            var imageHeight = region.BufferImageHeight == 0 ? height : (region.BufferImageHeight + block - 1) >> shift;
+            var slices = (ulong)region.ImageSubresource.LayerCount * Math.Max(region.ImageExtent.Depth, 1u);
+            if (width == 0 || height == 0 || slices == 0)
+            {
+                continue;
+            }
+
+            var rows = (slices - 1) * imageHeight + (height - 1);
+            var end = region.BufferOffset + (rows * rowLength + width) * info.BytesPerBlock;
+            footprint = Math.Max(footprint, end);
+        }
+
+        return footprint;
+    }
+
     private bool TryDownloadImageToBuffer(CachedImage image, GpuBuffer buffer)
     {
         ref readonly var info = ref image.Description;
@@ -826,6 +897,21 @@ public sealed unsafe partial class GuestImageCache
                 color.Tiles = tiles;
                 color.LinearSize = LinearSizeOf(color.Tiles);
             }
+        }
+
+        // A linear copy whose rows reach past the copied bytes would write outside the
+        // range (and possibly the buffer): the description's pitch and size disagree.
+        if (!plan.Depth && !plan.Color.Tiled && LinearFootprint(info, plan.Color.Regions) > copySize)
+        {
+            return false;
+        }
+
+        if (DbgPublishLog && _dbgRegionLogs++ < 30 && !plan.Depth) // TEMP
+        {
+            var text = new System.Text.StringBuilder();
+            foreach (var region in plan.Color.Regions)
+                text.Append($" [off=0x{region.BufferOffset:X} row={region.BufferRowLength} h={region.BufferImageHeight} mip={region.ImageSubresource.MipLevel} layer={region.ImageSubresource.BaseArrayLayer}+{region.ImageSubresource.LayerCount} at={region.ImageOffset.X},{region.ImageOffset.Y},{region.ImageOffset.Z} ext={region.ImageExtent.Width}x{region.ImageExtent.Height}x{region.ImageExtent.Depth}]");
+            Console.Error.WriteLine($"[DBG][PUBREGION] addr=0x{info.Data.Address:X} size=0x{info.Data.Size:X} copy=0x{copySize:X} bufOff=0x{bufferOffset:X} bufSize=0x{buffer.Size:X} levels={levels}/{info.Resources.Levels} layers={info.Resources.Layers} backing={image.Backing.Extent.Width}x{image.Backing.Extent.Height}x{image.Backing.Extent.Depth} fmt={image.Backing.Format} tiled={plan.Color.Tiled} swap={plan.Color.SwapBgra16}{text}");
         }
 
         DownloadToBuffer(image, buffer, bufferOffset, copySize, plan);

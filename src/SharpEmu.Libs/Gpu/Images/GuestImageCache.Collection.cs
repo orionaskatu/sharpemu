@@ -203,6 +203,29 @@ public sealed partial class GuestImageCache
         }
     }
 
+    // Takes the scheduled linear images the GPU wrote, for the caller to move into their
+    // guest buffers. Guest CPU code reads some of them (terrain height tiles) right after a
+    // label, so they become GPU-owned buffer bytes the CPU downloads when it reads them.
+    public void TakeScheduledPublications(List<HLE.GpuMemory.GuestSpan> spans)
+    {
+        if (_scheduledReadbacks.Count == 0)
+        {
+            return;
+        }
+
+        using var held = _lock.Hold();
+        foreach (var imageIdentifier in _scheduledReadbacks)
+        {
+            if (_slots.TryGet(imageIdentifier) is { Registered: true, IsGpuModified: true, BufferHoldsGpuContents: false } owner &&
+                !owner.DepthOwner.IsValid)
+            {
+                spans.Add(owner.Description.Data);
+            }
+        }
+
+        _scheduledReadbacks.Clear();
+    }
+
     // Publishes every scheduled linear GPU-written image to guest memory.
     public void FlushScheduledReadbacks()
     {

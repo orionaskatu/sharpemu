@@ -233,7 +233,9 @@ public static partial class ImageRequestBuilders
         }
         else
         {
-            pitch = width;
+            // A linear target's rows are 256-byte aligned, as a linear texture's are: the same
+            // memory read as a texture, or by the CPU, uses that pitch.
+            pitch = TileGeometry.TexturePitch(transferFormat, width, GuestTileMode.Linear);
         }
 
         var mipSpans = new TileLevelSpan[TiledSurfaceLayout.MaxLevels];

@@ -233,6 +233,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CaptureReadBuffers()
         {
             var list = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_BUFFERS");
+            if (list is { Length: > 1 } && list[0] == '@')
+                list = File.Exists(list[1..]) ? File.ReadAllText(list[1..]).Trim() : null;
             if (string.IsNullOrWhiteSpace(list))
                 return;
             foreach (var item in list.Split(','))

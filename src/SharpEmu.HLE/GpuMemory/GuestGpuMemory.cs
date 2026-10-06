@@ -79,6 +79,11 @@ public sealed class GuestGpuMemory : IDisposable
             return false;
         }
 
+        if (DbgImageReadProbe.TryHit(kind, address)) // TEMP
+        {
+            return true;
+        }
+
         var buffers = Buffers;
         var images = Images;
         bool handled;

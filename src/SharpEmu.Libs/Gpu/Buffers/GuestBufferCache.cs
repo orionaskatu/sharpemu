@@ -990,6 +990,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     // Runs before the image readback flush and both collectors; the order matches the render loop.
+    internal bool DbgFaultProcessPending => _faultProcessPending; // TEMP
+
     public void ProcessPendingFaultBuffer()
     {
         if (_faultProcessPending)

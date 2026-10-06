@@ -103,6 +103,10 @@ public interface ICommandStreamHost
 
     void SynchronizeGpu();
 
+    // Makes GPU results the guest CPU may read after a label it is about to see owned by
+    // tracked guest memory, so a CPU read downloads them.
+    void PublishGpuResults() { }
+
     void RunGarbageCollector();
 
     void EmitGlobalBarrier();

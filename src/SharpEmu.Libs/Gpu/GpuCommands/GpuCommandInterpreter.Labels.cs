@@ -220,6 +220,7 @@ public sealed partial class GpuCommandInterpreter
 
     private void Write32(ulong destination, uint value, bool withWriteBack, bool withInterrupt, int eventId, uint contextId)
     {
+        _host.PublishGpuResults();
         WriteDword(destination, value);
         var kind = withInterrupt
             ? (withWriteBack ? EndOfPipeWriteKind.InterruptWriteBack32 : EndOfPipeWriteKind.Interrupt32)
@@ -229,6 +230,7 @@ public sealed partial class GpuCommandInterpreter
 
     private void Write64(ulong destination, ulong value, bool withWriteBack, bool withInterrupt, int eventId, uint contextId)
     {
+        _host.PublishGpuResults();
         WriteQword(destination, value);
         var kind = withInterrupt
             ? (withWriteBack ? EndOfPipeWriteKind.InterruptWriteBack64 : EndOfPipeWriteKind.Interrupt64)

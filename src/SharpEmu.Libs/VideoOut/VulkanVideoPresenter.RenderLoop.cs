@@ -22,6 +22,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.ImageReadback))
             {
+                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_FLUSH_READBACKS") != "1") // TEMP
                 _imageCache.FlushScheduledReadbacks();
             }
         }

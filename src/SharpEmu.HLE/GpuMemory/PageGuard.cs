@@ -52,6 +52,19 @@ public sealed class PageGuard : IDisposable
                 {
                     if (ReadWatchCount != 0)
                     {
+                        // TEMP: the image-read probe never shares a page; it skips a watched page
+                        // and hands its own page to a real watcher.
+                        if (DbgImageReadProbe.Adding)
+                        {
+                            DbgImageReadProbe.Skipped = true;
+                            return ReadWatchCount;
+                        }
+
+                        if (DbgImageReadProbe.Release(address))
+                        {
+                            return ReadWatchCount;
+                        }
+
                         OnFatal($"Cannot add a read watch. The count is at its limit at 0x{address:X16}.");
                     }
 

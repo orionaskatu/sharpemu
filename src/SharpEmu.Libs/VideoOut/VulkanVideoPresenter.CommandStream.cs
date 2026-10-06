@@ -314,6 +314,50 @@ internal static unsafe partial class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
         }
 
+        private static readonly bool DbgSettleDeviceWrites = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SETTLE_DEVICE_WRITES") == "1"; // TEMP
+        private static long _dbgSettles; // TEMP
+
+        private readonly List<SharpEmu.HLE.GpuMemory.GuestSpan> _publications = new();
+
+        public void PublishGpuResults()
+        {
+            if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH") != "0") // TEMP
+            _imageCache.TakeScheduledPublications(_publications);
+            if (_publications.Count != 0)
+            {
+                _ = BeginBatchedGuestCommands();
+                foreach (var span in _publications)
+                {
+                    // Acquiring the range as written marks its bytes GPU-owned, so a guest read
+                    // downloads them once this work completes; the image is copied in after it.
+                    if (_imageCache.CanPublishLinearImage(span.Address))
+                    {
+                        var dbgMode = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH_MODE"); // TEMP
+                        var (buffer, _) = _bufferCache.ObtainBuffer(span.Address, span.Size, isWritten: dbgMode != "copyonly");
+                        if (dbgMode != "nocopy")
+                        _ = _imageCache.PublishLinearImage(span.Address, buffer);
+                    }
+                }
+
+                _publications.Clear();
+            }
+
+            SettleDeviceWrites(); // TEMP
+        }
+
+        private void SettleDeviceWrites() // TEMP
+        {
+            if (!DbgSettleDeviceWrites || !_bufferCache.DbgFaultProcessPending)
+            {
+                return;
+            }
+
+            _bufferCache.ProcessPendingFaultBuffer();
+            SynchronizeGpu();
+            if ((++_dbgSettles & (_dbgSettles - 1)) == 0)
+                Console.Error.WriteLine($"[DBG][SETTLE] n={_dbgSettles}");
+        }
+
         public void SynchronizeGpu()
         {
             using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandGpuWait);

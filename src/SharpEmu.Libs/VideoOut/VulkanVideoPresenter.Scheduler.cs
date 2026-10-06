@@ -90,7 +90,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CreateImageCache()
         {
             var (memory, _, backing) = RequireGuestMemory("image store");
-            _imageCache = new GuestImageCache(_deviceInfo, _scheduler, memory.Pages, _bufferCache, backing, readbackLinearImages: false);
+            _imageCache = new GuestImageCache(_deviceInfo, _scheduler, memory.Pages, _bufferCache, backing, readbackLinearImages: true);
             _bufferCache.ImageCache = _imageCache;
             _samplerStore = new SamplerStore(_deviceInfo);
         }

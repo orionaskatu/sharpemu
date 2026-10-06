@@ -397,7 +397,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
                         var argsBase = (words[26] | ((ulong)words[27] << 32)) & 0xFFFF_FFFF_FFFFUL;
                         var listBase = (words[30] | ((ulong)words[31] << 32)) & 0xFFFF_FFFF_FFFFUL;
-                        Console.Error.WriteLine($"[DBG][CULLR] flags={words[0]},{words[1]},{words[2]} records=0x{recordsBase:X} range@0x{rangePointer:X}=[{rangeWords[2]}+{rangeWords[3]}] args=0x{argsBase:X}+{words[28]} list=0x{listBase:X}{lods}");
+                        Console.Error.WriteLine($"[DBG][CULLR] flags={words[0]},{words[1]},{words[2]} records=0x{recordsBase:X} range@0x{rangePointer:X}=[{rangeWords[2]}+{rangeWords[3]}] args=0x{argsBase:X}+{words[28]} list=0x{listBase:X} lodbuf=0x{((words[34] | ((ulong)words[35] << 32)) & 0xFFFF_FFFF_FFFFUL):X}+{words[36]} ud=0x{constants:X} p={string.Join(";", System.Runtime.InteropServices.MemoryMarshal.Cast<uint, float>(words.Slice(3, 16)).ToArray().Select(v => v.ToString("R", System.Globalization.CultureInfo.InvariantCulture)))}{lods}");
                     }
                 }
 
