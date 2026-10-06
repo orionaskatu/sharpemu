@@ -211,6 +211,13 @@ public sealed partial class RenderExecutor
         }
 
         var exportMasks = pixelProgram?.PixelColorExportMasks ?? 0u;
+        if (DbgDropPs is { } dbgPs && pixelProgram is not null && dbgPs.Contains($"{pixelProgram.Hash:X16}") && _dbgDropLogs++ < 40) // TEMP
+        {
+            var slots = new System.Text.StringBuilder();
+            for (var i = 0; i < state.ColorCount; i++)
+                slots.Append($" [slot={state.Colors[i].Slot} map=0x{state.Colors[i].Resolution.ExportMapping.ApplyMask(0xF):X} cbmask=0x{context.RenderTargetMaskForSlot(state.Colors[i].Slot):X} unwritten={IsUnwrittenColorTarget(context, state.Colors[i].Slot, state.Colors[i].Resolution.ExportMapping, exportMasks)}]");
+            Console.Error.WriteLine($"[DBG][DROP] ps=0x{pixelProgram.Hash:X16} exportMasks=0x{exportMasks:X} cbShaderMask=0x{context.ShaderInterface.ColorShaderMask:X8} colFormats={string.Join(",", context.ShaderInterface.TargetOutputModes)}{slots}");
+        }
         var kept = 0u;
         for (var i = 0; i < state.ColorCount; i++)
         {
@@ -225,6 +232,9 @@ public sealed partial class RenderExecutor
 
         state.ColorCount = kept;
     }
+
+    private static readonly string? DbgDropPs = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DROP_PS"); // TEMP
+    private static int _dbgDropLogs; // TEMP
 
     internal static bool IsUnwrittenColorTarget(ContextRegisters context, uint slot, ColorComponentMap exportMapping, uint pixelColorExportMasks) =>
         exportMapping.ApplyMask(context.RenderTargetMaskForSlot(slot)) == 0 ||

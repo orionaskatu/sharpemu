@@ -473,10 +473,19 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3, _command.DebugArg4);
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
+        var dbgOps = DbgWaitEachTick ? string.Join(" | ", _command.DbgOps) : ""; // TEMP
         _command.Buffer = 0;
         _submitted?.Invoke(tick);
+        if (DbgWaitEachTick) // TEMP: the first tick that never completes is the hang.
+        {
+            Console.Error.WriteLine($"[DBG][TICKWAIT] tick={tick} ops: {dbgOps}");
+            _timeline.Wait(tick);
+        }
+
         return tick;
     }
+
+    private static readonly bool DbgWaitEachTick = Environment.GetEnvironmentVariable("SHARPEMU_DBG_WAIT_EACH_TICK") == "1"; // TEMP
 
     // Report the last operation in each saved submission. Earlier GPU work can cause device loss.
     internal IEnumerable<string> FormatRecentSubmissions()

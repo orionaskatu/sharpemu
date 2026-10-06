@@ -119,6 +119,16 @@ public readonly record struct Gen5ColorComponentMapping
     }
 }
 
+// SPI_SHADER_COL_FORMAT selects the representation carried by a compressed EXP.
+public enum Gen5PixelExportFormat : byte
+{
+    Float16 = 4,
+    Unorm16 = 5,
+    Snorm16 = 6,
+    Uint16 = 7,
+    Sint16 = 8,
+}
+
 public readonly record struct Gen5PixelOutputBinding(
     uint GuestSlot,
     uint HostLocation,
@@ -143,6 +153,8 @@ public readonly record struct Gen5PixelOutputBinding(
         get => _exportTarget ?? GuestSlot;
         init => _exportTarget = value;
     }
+
+    public Gen5PixelExportFormat ExportFormat { get; init; } = Gen5PixelExportFormat.Float16;
 }
 
 public readonly record struct Gen5ComputeSystemRegisters(

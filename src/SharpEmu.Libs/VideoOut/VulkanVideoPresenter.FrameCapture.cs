@@ -316,6 +316,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
             const ulong budget = 8ul * 1024 * 1024 * 1024;
             var backing = target.Image.Backing;
+            // TEMP: SHARPEMU_CAPTURE_LAST_ADDRS=addr,... keeps only the last write of those images
+            // (one readback buffer per address, overwritten by every later pass).
+            if (_captureLastAddresses is { } lastAddresses && !lastAddresses.Contains(target.Address))
+                return;
+            var lastIndex = _captureLastAddresses is null ? -1 : _captureReadbacks.FindIndex(entry => entry.Target.Address == target.Address && entry.Slot == slot);
             var texelBytes = TexelBytes(target.Format, depth);
             var width = Math.Max(1u, backing.Extent.Width >> (int)target.View.BaseLevel);
             var height = Math.Max(1u, backing.Extent.Height >> (int)target.View.BaseLevel);
@@ -325,6 +330,25 @@ internal static unsafe partial class VulkanVideoPresenter
                 target.View.BaseLevel >= backing.MipLevels || target.View.BaseLayer >= backing.Layers)
             {
                 _captureManifest.Add($"pass={_capturePass} slot={slot} skip addr=0x{target.Address:X} fmt={target.Format} {width}x{height} samples={backing.Samples} type={backing.ImageType}");
+                return;
+            }
+
+            if (lastIndex >= 0 && _captureReadbacks[lastIndex].Size == (ulong)width * height * texelBytes)
+            {
+                var previous = _captureReadbacks[lastIndex];
+                var reuseCommand = new CommandBuffer(_scheduler.Current.Handle);
+                var reuseRange = new SubresourceRange(target.View.BaseLevel, 1, target.View.BaseLayer, 1);
+                target.Image.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, reuseRange, reuseCommand);
+                var reuseRegion = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(depth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit, target.View.BaseLevel, target.View.BaseLayer, 1),
+                    ImageExtent = new Extent3D(width, height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(reuseCommand, backing.Handle, ImageLayout.TransferSrcOptimal, previous.Buffer, 1, &reuseRegion);
+                target.Image.Transition(attachment.Layout, depth
+                    ? AccessFlags.DepthStencilAttachmentReadBit | AccessFlags.DepthStencilAttachmentWriteBit
+                    : AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit, reuseRange, reuseCommand);
+                _captureReadbacks[lastIndex] = previous with { Pass = _capturePass };
                 return;
             }
 
@@ -345,6 +369,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 : AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit, range, command);
             _captureReadbacks.Add((_capturePass, slot, target with { Width = width, Height = height }, buffer, memory, size, texelBytes));
         }
+
+        private static readonly HashSet<ulong>? _captureLastAddresses = // TEMP
+            Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_LAST_ADDRS") is { Length: > 0 } lastText
+                ? lastText.Split(',').Select(text => Convert.ToUInt64(text.Trim(), 16)).ToHashSet()
+                : null;
 
         // Storage images a compute dispatch writes, snapshotted right after the dispatch.
         // SHARPEMU_CAPTURE_STORAGE_ADDRS=addr,addr (hex) selects the images.

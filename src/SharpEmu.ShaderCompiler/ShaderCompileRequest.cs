@@ -205,6 +205,7 @@ public sealed class ShaderCompileRequest
     public int RequiredVertexOutputCount { get; init; }
     public IReadOnlyList<ShaderVertexInput> VertexInputs { get; init; } = [];
     public uint PositionExportControl { get; init; }
+    public bool SupportsClipDistance { get; init; } = true;
     public ShaderClipSpaceTransform ClipSpace { get; init; }
 
     public uint LocalSizeX { get; init; } = 1;

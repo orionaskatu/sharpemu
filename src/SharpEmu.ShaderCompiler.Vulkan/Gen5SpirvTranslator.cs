@@ -191,6 +191,7 @@ public static partial class Gen5SpirvTranslator
         private uint _layerOutput;
         private uint _viewportIndexOutput;
         private uint _clipDistanceCount;
+        private uint _invalidPositionClipDistance = uint.MaxValue;
         private uint _cullDistanceCount;
         private uint _vertexIndexInput;
         private uint _instanceIndexInput;
@@ -251,7 +252,8 @@ public static partial class Gen5SpirvTranslator
             uint Variable,
             uint Type,
             Gen5PixelOutputKind Kind,
-            Gen5ColorComponentMapping ComponentMapping);
+            Gen5ColorComponentMapping ComponentMapping,
+            Gen5PixelExportFormat ExportFormat);
 
         public bool TryCompile(out Gen5SpirvShader shader, out string error)
         {
@@ -399,6 +401,10 @@ public static partial class Gen5SpirvTranslator
                     var laneActive = Load(
                         _boolType,
                         _usesPixelValidMask ? _pixelValidMaskActive : _exec);
+                    if (DbgNoKillAddresses.Contains(_request.Program.Address)) // TEMP: keep every fragment
+                    {
+                        laneActive = _module.ConstantBool(true);
+                    }
                     _module.AddStatement(
                         SpirvOp.SelectionMerge,
                         returnLabel,
@@ -983,7 +989,8 @@ public static partial class Gen5SpirvTranslator
                             variable,
                             outputType,
                             binding.Kind,
-                            binding.ComponentMapping));
+                            binding.ComponentMapping,
+                            binding.ExportFormat));
                     _interfaces.Add(variable);
                 }
             }
@@ -1392,6 +1399,11 @@ public static partial class Gen5SpirvTranslator
                     _floatType,
                     fragCoord,
                     component);
+                if (component == 3)
+                {
+                    value = _module.AddInstruction(SpirvOp.FDiv, _floatType, Float(1f), value);
+                }
+
                 StoreV(vgpr, Bitcast(_uintType, value), guardWithExec: false);
             }
 
@@ -1842,16 +1854,34 @@ public static partial class Gen5SpirvTranslator
         // header), so the guards after the loop pick up where the invocation continues.
         private bool TryEmitStructuredLoop(IReadOnlyList<ShaderBlock> blocks, int header, int latch, out string error)
         {
+            // Once a single-block loop is entered, its back edge already proves that
+            // this block is active and next. Keep its entry guard outside the loop;
+            // a conditional around every iteration obstructs driver optimization.
+            var singleBlock = header == latch;
+            var entryMerge = singleBlock ? _module.AllocateId() : 0u;
+            var skippedEntry = singleBlock ? _module.AllocateId() : 0u;
             var loopHeader = _module.AllocateId();
             var loopBody = _module.AllocateId();
             var loopContinue = _module.AllocateId();
             var loopMerge = _module.AllocateId();
-            _module.AddStatement(SpirvOp.Branch, loopHeader);
+            if (singleBlock)
+            {
+                var enters = LogicalAnd(Load(_boolType, _programActive),
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, Load(_uintType, _programCounter), UInt((uint)header)));
+                _module.AddStatement(SpirvOp.SelectionMerge, entryMerge, 0);
+                _module.AddStatement(SpirvOp.BranchConditional, enters, loopHeader, skippedEntry);
+            }
+            else
+            {
+                _module.AddStatement(SpirvOp.Branch, loopHeader);
+            }
             _module.AddLabel(loopHeader);
             _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
             _module.AddStatement(SpirvOp.Branch, loopBody);
             _module.AddLabel(loopBody);
-            if (!TryEmitStructuredRange(blocks, header, latch, header, out error))
+            if (!(singleBlock
+                    ? TryEmitBlock(blocks, header, out error)
+                    : TryEmitStructuredRange(blocks, header, latch, header, out error)))
             {
                 return false;
             }
@@ -1875,6 +1905,19 @@ public static partial class Gen5SpirvTranslator
 
             _module.AddStatement(SpirvOp.BranchConditional, again, loopHeader, loopMerge);
             _module.AddLabel(loopMerge);
+            if (singleBlock)
+            {
+                _module.AddStatement(SpirvOp.Branch, entryMerge);
+                _module.AddLabel(skippedEntry);
+                // The previous guarded do-while still counted one iteration when
+                // the block was skipped. Preserve that diagnostic safety budget.
+                if (_maxDispatcherSteps > 0)
+                {
+                    Store(_iterationGuard, IAdd(Load(_uintType, _iterationGuard), UInt(1)));
+                }
+                _module.AddStatement(SpirvOp.Branch, entryMerge);
+                _module.AddLabel(entryMerge);
+            }
             return true;
         }
 
@@ -5269,6 +5312,11 @@ public static partial class Gen5SpirvTranslator
                     }
                 }
 
+                if (resource.ComponentKind is not (ImageComponentKind.Sint or ImageComponentKind.Uint) && DbgForceStoreAddresses.Contains(_request.Program.Address)) // TEMP
+                {
+                    components = [Float(1), Float(0), Float(1), Float(1)];
+                }
+
                 var texel = _module.AddInstruction(
                     SpirvOp.CompositeConstruct,
                     resource.VectorType,
@@ -6551,21 +6599,7 @@ public static partial class Gen5SpirvTranslator
 
                     if (export.Compressed)
                     {
-                        var value = LoadCompressedExportComponent(
-                            instruction,
-                            component);
-                        values[component] = output.Kind switch
-                        {
-                            Gen5PixelOutputKind.Uint => _module.AddInstruction(
-                                SpirvOp.ConvertFToU,
-                                _uintType,
-                                value),
-                            Gen5PixelOutputKind.Sint => _module.AddInstruction(
-                                SpirvOp.ConvertFToS,
-                                _intType,
-                                value),
-                            _ => value,
-                        };
+                        values[component] = LoadPixelCompressedExportComponent(instruction, component, output);
                         continue;
                     }
 
@@ -6749,6 +6783,12 @@ public static partial class Gen5SpirvTranslator
             {
                 outputValue = ConvertPositionToClipSpace(outputValue);
             }
+            if (export.Target == 12 && DbgPosZHalf.Contains(_request.Program.Address)) // TEMP: z = 0.5 w
+            {
+                var w = _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, outputValue, 3);
+                outputValue = _module.AddInstruction(SpirvOp.CompositeInsert, _vec4Type,
+                    _module.AddInstruction(SpirvOp.FMul, _floatType, w, Float(0.5f)), outputValue, 2);
+            }
             if (_request.Program.Address == 0x0000000500780000ul &&
                 export.Target is >= 32 and < 36 &&
                 Environment.GetEnvironmentVariable(
@@ -6769,6 +6809,20 @@ public static partial class Gen5SpirvTranslator
                 outputValue,
                 Load(_vec4Type, outputVariable));
             Store(outputVariable, outputValue);
+            if (export.Target == 12 && _invalidPositionClipDistance != uint.MaxValue)
+            {
+                var equal = _module.AddInstruction(
+                    SpirvOp.FOrdEqual,
+                    _module.TypeVector(_boolType, 4),
+                    outputValue,
+                    _module.ConstantNull(_vec4Type));
+                var invalid = _module.AddInstruction(SpirvOp.All, _boolType, equal);
+                // A zero position has an undefined perspective divide. Collapse its primitive
+                // to the remaining edge, as the guest's clipping-error cull does.
+                var distance = _module.AddInstruction(
+                    SpirvOp.Select, _floatType, invalid, Float(-1f), Float(0f));
+                StoreDistanceConditional(_clipDistanceOutput, _invalidPositionClipDistance, distance);
+            }
             return true;
         }
 
@@ -6875,6 +6929,14 @@ public static partial class Gen5SpirvTranslator
                         cullCount = Math.Max(cullCount, output.CullDistance + 1);
                     }
                 }
+            }
+
+            if (_request.SupportsClipDistance && clipCount + cullCount < 8 &&
+                _request.Program.Instructions.Any(static instruction =>
+                    instruction.Control is Gen5ExportControl { Target: 12, EnableMask: not 0 }))
+            {
+                // Use a separate plane so auxiliary position exports keep their own distances.
+                _invalidPositionClipDistance = clipCount++;
             }
 
             if (needPointSize)
@@ -7378,6 +7440,45 @@ public static partial class Gen5SpirvTranslator
                    _request.Program.Address == address;
         }
 
+        private uint LoadPixelCompressedExportComponent(
+            Gen5ShaderInstruction instruction, int component, SpirvPixelOutput output)
+        {
+            if (output.ExportFormat is Gen5PixelExportFormat.Uint16 or Gen5PixelExportFormat.Sint16)
+            {
+                var signed = output.ExportFormat == Gen5PixelExportFormat.Sint16;
+                var packed = LoadV(instruction.Sources[component >> 1].Value);
+                var value = _module.AddInstruction(
+                    signed ? SpirvOp.BitFieldSExtract : SpirvOp.BitFieldUExtract,
+                    signed ? _intType : _uintType,
+                    signed ? Bitcast(_intType, packed) : packed,
+                    UInt((uint)(component & 1) * 16), UInt(16));
+                return output.Kind switch
+                {
+                    Gen5PixelOutputKind.Uint => signed ? Bitcast(_uintType, value) : value,
+                    Gen5PixelOutputKind.Sint => signed ? value : Bitcast(_intType, value),
+                    _ => _module.AddInstruction(signed ? SpirvOp.ConvertSToF : SpirvOp.ConvertUToF, _floatType, value),
+                };
+            }
+
+            uint decoded;
+            if (output.ExportFormat is Gen5PixelExportFormat.Unorm16 or Gen5PixelExportFormat.Snorm16)
+            {
+                var unpacked = Ext(output.ExportFormat == Gen5PixelExportFormat.Unorm16 ? 61u : 60u,
+                    _vec2Type, LoadV(instruction.Sources[component >> 1].Value));
+                decoded = _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, unpacked, (uint)(component & 1));
+            }
+            else
+            {
+                decoded = LoadCompressedExportComponent(instruction, component);
+            }
+            return output.Kind switch
+            {
+                Gen5PixelOutputKind.Uint => _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, decoded),
+                Gen5PixelOutputKind.Sint => _module.AddInstruction(SpirvOp.ConvertFToS, _intType, decoded),
+                _ => decoded,
+            };
+        }
+
         private uint LoadCompressedExportComponent(
             Gen5ShaderInstruction instruction,
             int component)
@@ -7601,6 +7702,17 @@ public static partial class Gen5SpirvTranslator
                 () => Store(BufferWordPointer(binding, dwordAddress), value));
         }
 
+        private static readonly HashSet<ulong> DbgPosZHalf = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_POSZ_HALF") ?? "") // TEMP
+            .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+
+        // TEMP: SHARPEMU_DBG_PS_NO_KILL=addr,... never kills fragments of those pixel programs.
+        private static readonly HashSet<ulong> DbgNoKillAddresses = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_NO_KILL") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+
+        // TEMP: SHARPEMU_DBG_FORCE_STORE=addr,... makes those programs store magenta through float image stores.
+        private static readonly HashSet<ulong> DbgForceStoreAddresses = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_FORCE_STORE") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+
         private uint IsBufferWordInRange(int binding, uint dwordAddress)
         {
             var buffer = _module.AddInstruction(
@@ -7738,11 +7850,12 @@ public static partial class Gen5SpirvTranslator
         private List<(uint Register, uint Lane)> FindLaneSpillSlots()
         {
             var slots = new List<(uint Register, uint Lane)>();
-            if (UsesSubgroupOperations())
+            if (_emulateWave64)
             {
                 return slots;
             }
 
+            var ownsLaneZero = !UsesSubgroupOperations();
             var readRegisters = _request.Program.Instructions
                 .Where(static instruction => instruction.Opcode == "VReadlaneB32" &&
                     instruction.Sources.Count > 0 &&
@@ -7755,7 +7868,7 @@ public static partial class Gen5SpirvTranslator
                     TryGetVectorDestination(instruction, out var register) &&
                     readRegisters.Contains(register) &&
                     TryGetConstantLane(instruction, out var lane) &&
-                    lane != 0 &&
+                    (lane != 0 || !ownsLaneZero) &&
                     !slots.Contains((register, lane)))
                 {
                     slots.Add((register, lane));
@@ -7786,8 +7899,26 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            lane = value & (_waveLaneCount - 1);
+            lane = value & LaneSelectMask;
             return true;
+        }
+
+        private uint LaneSelectMask => _stage == Gen5SpirvStage.Compute ? _waveLaneCount - 1 : 63u;
+
+        private uint ReadLaneSpillSlot(Gen5ShaderInstruction instruction, uint selectedLane, uint value)
+        {
+            if (instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+            {
+                return value;
+            }
+
+            var register = instruction.Sources[0].Value;
+            if (TryGetConstantLane(instruction, out var lane))
+            {
+                return _laneSpillSlots.TryGetValue((register, lane), out var slot) ? Load(_uintType, slot) : value;
+            }
+
+            return SelectLaneSpillSlot(register, selectedLane, value);
         }
 
         // Folds the spill slots of register into value: selected lane == slot lane reads the slot.

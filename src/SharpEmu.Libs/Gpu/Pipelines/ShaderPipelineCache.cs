@@ -334,6 +334,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             outputs.Add(new Gen5PixelOutputBinding(slot, location++, kind, mapping)
             {
                 ExportTarget = exportTarget >= 0 ? (uint)exportTarget : ContextRegisters.ColorTargetCount + slot,
+                ExportFormat = exportTarget >= 0
+                    ? (Gen5PixelExportFormat)context.ShaderInterface.TargetOutputModes[exportTarget]
+                    : Gen5PixelExportFormat.Float16,
             });
         }
 

@@ -155,12 +155,16 @@ public static class DepthTargetResolver
         return new DepthTargetState(target, ResolveState(context, target.HasStencil, fatal));
     }
 
+    private static readonly bool DbgStencilLog = Environment.GetEnvironmentVariable("SHARPEMU_DBG_STENCIL_LOG") == "1"; // TEMP
+    private static readonly HashSet<string> DbgStencilSeen = new(); // TEMP
+    private static readonly bool DbgNoStencil = Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_STENCIL") == "1"; // TEMP
+
     public static DepthStencilState ResolveState(ContextRegisters context, bool hasStencil, Func<string, Exception> fatal)
     {
         var depth = context.DepthTarget;
         var control = context.StencilControl;
         var masks = context.StencilMask;
-        var stencilTest = hasStencil && depth.StencilTestEnabled;
+        var stencilTest = hasStencil && depth.StencilTestEnabled && !DbgNoStencil; // TEMP switch
         var front = StencilOperations.Default;
         var frontMasks = default(StencilMasks);
         var back = front;
@@ -191,6 +195,12 @@ public static class DepthTargetResolver
                     $"front=(fail={control.Fail} pass={control.Pass} depthFail={control.DepthFail} test=0x{masks.TestValue:X2} mask=0x{masks.Mask:X2} operation=0x{masks.OperationValue:X2} write=0x{frontWriteMask:X2}) " +
                     $"back=(fail={control.FailBack} pass={control.PassBack} depthFail={control.DepthFailBack} test=0x{masks.TestValueBack:X2} mask=0x{masks.MaskBack:X2} operation=0x{masks.OperationValueBack:X2} write=0x{backWriteMask:X2}).");
             }
+        }
+
+        if (DbgStencilLog && stencilTest) // TEMP
+        {
+            var key = $"cmp={depth.StencilCompare} fail={control.Fail} pass={control.Pass} zfail={control.DepthFail} test=0x{masks.TestValue:X2} mask=0x{masks.Mask:X2} op=0x{masks.OperationValue:X2} write=0x{masks.WriteMask:X2} -> {front} {frontMasks} zcmp={depth.DepthCompare} zwrite={depth.DepthWriteEnabled}";
+            lock (DbgStencilSeen) if (DbgStencilSeen.Add(key)) Console.Error.WriteLine($"[DBG][STENCIL] {key}");
         }
 
         return new DepthStencilState(

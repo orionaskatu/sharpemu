@@ -71,8 +71,11 @@ public sealed class RecordingBuffer
 
     public SubmissionContext Context => _context ?? throw SubmissionScheduler.Fatal("The command buffer has no submission context.");
 
+    internal readonly List<string> DbgOps = new(); // TEMP
+
     public void SetDebugInfo(uint op, ulong submitId, uint arg0 = 0, uint arg1 = 0, uint arg2 = 0, uint arg3 = 0, ulong arg4 = 0)
     {
+        if (op != 0 && DbgOps.Count < 64) DbgOps.Add($"{(RecordedOperation)op}:{submitId}:{arg0},{arg1},{arg2},{arg3},0x{arg4:X}"); // TEMP
         DebugOp = op;
         DebugSubmitId = submitId;
         DebugArg0 = arg0;
@@ -101,6 +104,7 @@ public sealed class RecordingBuffer
 
         _device.BeginBuffer(Buffer);
         _handleWasRequested = false;
+        DbgOps.Clear(); // TEMP
         SetDebugInfo((uint)RecordedOperation.Unknown, 0);
     }
 

@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.ShaderCompiler;
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Tests.Gpu.Scheduling;
@@ -147,6 +148,31 @@ public sealed class ShaderProgramCacheTests : IDisposable
         Assert.NotEqual(first.Id, second.Id);
         Assert.Equal(2, _guest.Programs.ProgramCount);
         Assert.All(_guest.Programs.Entries, entry => Assert.Single(entry.Permutations));
+    }
+
+    [Fact]
+    public void PixelExportFormatChange_CompilesANewProgramForTheSameTargetKind()
+    {
+        _guest.RegisterProgram(CodeA, HeaderA, PipelineTestGuest.EndProgram);
+        var source = _guest.Source(CodeA, ShaderStage.Pixel, []);
+        ShaderProgram CompileFormat(Gen5PixelExportFormat format)
+        {
+            var formats = new byte[PixelInputInfo.TargetCount];
+            formats[0] = (byte)format;
+            var options = new StageCompileOptions
+            {
+                PixelInfo = new PixelInputInfo { TargetExportFormats = formats },
+                PixelOutputs = [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float) { ExportFormat = format }],
+            };
+            var cursor = 0u;
+            return _guest.Programs.GetOrCompile(source, options, ref cursor, out _);
+        }
+        var half = CompileFormat(Gen5PixelExportFormat.Float16);
+        var normalized = CompileFormat(Gen5PixelExportFormat.Unorm16);
+        Assert.NotEqual(half.Id, normalized.Id);
+        Assert.Equal(normalized.Id, CompileFormat(Gen5PixelExportFormat.Unorm16).Id);
+        Assert.Equal(2, _guest.Compiler.Requests.Count);
+        Assert.Equal(Gen5PixelExportFormat.Unorm16, _guest.Compiler.Requests[1].PixelOutputs[0].ExportFormat);
     }
 
     [Fact]

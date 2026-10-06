@@ -144,6 +144,7 @@ public sealed class PixelInputInfo
     public uint PerspectiveCenterRegister { get; init; } = NoPerspectiveCenterRegister;
     public uint[] InterpolatorSettings { get; init; } = new uint[InterpolatorCount];
     public byte[] TargetOutputModes { get; init; } = new byte[TargetCount];
+    public byte[] TargetExportFormats { get; init; } = new byte[TargetCount];
     public ColorComponentMap[] TargetExportMappings { get; init; } = new ColorComponentMap[TargetCount];
     public uint ScratchDwords { get; init; }
     public bool PositionX { get; init; }

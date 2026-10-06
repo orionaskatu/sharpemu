@@ -643,7 +643,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdSetBlendConstants(command, blendConstants);
             _vk.CmdSetDepthTestEnable(command, state.DepthTestEnabled);
             _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
-            _dbgDepthState = $"test={state.DepthTestEnabled} write={state.DepthWriteEnabled} cmp={state.DepthCompare} stencil={state.StencilTestEnabled} bounds={state.DepthBoundsTestEnabled}:{state.DepthBoundsMin}-{state.DepthBoundsMax} vp={state.ViewportWidth}x{state.ViewportHeight} z={state.ViewportMinDepth}-{state.ViewportMaxDepth} scissor={state.Scissor.Left},{state.Scissor.Top},{state.Scissor.Right},{state.Scissor.Bottom}"; // TEMP
+            _dbgDepthState = $"test={state.DepthTestEnabled} write={state.DepthWriteEnabled} cmp={state.DepthCompare} stencil={state.StencilTestEnabled} bounds={state.DepthBoundsTestEnabled}:{state.DepthBoundsMin}-{state.DepthBoundsMax} vp={state.ViewportWidth}x{state.ViewportHeight} z={state.ViewportMinDepth}-{state.ViewportMaxDepth} scissor={state.Scissor.Left},{state.Scissor.Top},{state.Scissor.Right},{state.Scissor.Bottom} front={state.FrontStencil} back={state.BackStencil}"; // TEMP
             _vk.CmdSetDepthCompareOp(command, _dbgEqualToLequal && state.DepthCompare == CompareOp.Equal ? CompareOp.LessOrEqual : state.DepthCompare); // TEMP
             _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
             if (state.DepthBiasEnabled)
@@ -878,6 +878,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _vk.CmdBindPipeline(command, bindPoint, entry.Pipeline);
             _profileComputePipeline = entry.Id;
+            _dbgComputeHash = entry.ProfileComputeHash; // TEMP
         }
 
         private void CountDraw()
@@ -972,12 +973,15 @@ internal static unsafe partial class VulkanVideoPresenter
             CountDraw();
         }
 
+        private ulong _dbgComputeHash; // TEMP
+
         public void Dispatch(uint groupsX, uint groupsY, uint groupsZ)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            if (DebugCapturing) DebugNote($"dispatch pass={_capturePass} cs=0x{_dbgComputeHash:X} groups={groupsX}x{groupsY}x{groupsZ}"); // TEMP
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
                 _profileComputePipeline, groupsX, groupsY, groupsZ);
             CaptureSnapshotStorage(command); // TEMP
@@ -1002,6 +1006,7 @@ internal static unsafe partial class VulkanVideoPresenter
             };
             VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
             _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
+            if (DebugCapturing) { DebugNote($"dispatch pass={_capturePass} cs=0x{_dbgComputeHash:X} indirect=0x{argumentsAddress:X}"); DebugCaptureIndirectArguments(new BufferBinding(buffer.Handle.Handle, offset)); CaptureNoteIndirect(new BufferBinding(buffer.Handle.Handle, offset)); } // TEMP
             CaptureSnapshotStorage(command); // TEMP
             CountDraw();
             return true;
