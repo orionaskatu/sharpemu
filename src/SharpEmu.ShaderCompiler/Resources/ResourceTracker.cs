@@ -86,6 +86,9 @@ public sealed partial class ResourceTracker
         }
     }
 
+    private static readonly HashSet<ulong> DbgCollectHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_COLLECT") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet(); // TEMP
+
     public static Result Track(ShaderResourcePlan plan) => new ResourceTracker(plan).Run();
 
     private Result Run()
@@ -94,6 +97,13 @@ public sealed partial class ResourceTracker
         for (var index = 0; index < _plan.Memory.Count; index++)
         {
             Collect(index);
+            if (DbgCollectHashes.Contains(_plan.Hash)) // TEMP: SHARPEMU_DBG_COLLECT=hash,... logs how each memory access of those plans was planned
+            {
+                var memory = _plan.Memory[index];
+                Console.Error.WriteLine($"[DBG][COLLECT] hash=0x{_plan.Hash:X16} mem={index} pc=0x{memory.Pc:X} op={memory.Opcode} kind={memory.Kind} planningOnly={memory.PlanningOnly} device={memory.DeviceDescriptor} " +
+                    $"bufDesc={memory.BufferDescriptor?.Provenance.ToString() ?? "-"} runtimeImg={memory.RuntimeDescriptor} resource={memory.Resource} force={ForceDeviceDescriptors} formatted={memory.Formatted} access={memory.Access} " +
+                    $"handle={(_plan.Accesses[index]?.Handle is { } dbgHandle ? $"{dbgHandle.Kind}/{dbgHandle.Operands.Length}/[{string.Join(",", dbgHandle.Operands.Select(dword => $"{dword.Type}/{dword.Kind}:{(DependsOnScalarAddressWord(dword) ? "A" : "-")}{(DependsOnScalarBufferWord(dword) ? "B" : "-")}"))}]" : "-")}");
+            }
         }
 
         LinkImageAliases();
@@ -408,6 +418,35 @@ public sealed partial class ResourceTracker
             }
 
             if (current.Kind == ScalarValueKind.ScalarAddressWord)
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
+    // TEMP: SHARPEMU_DEVICE_DESCRIPTORS_TABLE=1 also reads V#s assembled from flattened table words on the GPU.
+    private static readonly bool ForceTableDeviceDescriptors = Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DESCRIPTORS_TABLE") == "1";
+
+    private static bool DependsOnResourceTableWord(ScalarValue value)
+    {
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.ResourceTableWord)
             {
                 return true;
             }
@@ -942,7 +981,7 @@ public sealed partial class ResourceTracker
         if (isBuffer && ForceDeviceDescriptors && memory.Kind == MemoryResourceKind.Buffer &&
             access.Handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } deviceHandle &&
             deviceHandle.Operands.All(dword => dword.Type == ScalarValueType.U32) &&
-            deviceHandle.Operands.Any(DependsOnScalarAddressWord) &&
+            (deviceHandle.Operands.Any(DependsOnScalarAddressWord) || (ForceTableDeviceDescriptors && memory.Access == MemoryAccess.Read && deviceHandle.Operands.Any(DependsOnResourceTableWord))) &&
             !memory.Opcode.StartsWith("TBuffer", StringComparison.Ordinal) &&
             !(memory.Formatted && memory.Access != MemoryAccess.Read))
         {

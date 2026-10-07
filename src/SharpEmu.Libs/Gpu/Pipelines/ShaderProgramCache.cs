@@ -188,6 +188,23 @@ internal sealed class ShaderProgramCache
 
     private sealed class ShaderProgramRejectedException(string message) : Exception(message);
 
+    // TEMP: SHARPEMU_DBG_MAT_STATS=1 reports per-program materialization hit rates and time.
+    private static readonly bool _dbgMat = Environment.GetEnvironmentVariable("SHARPEMU_DBG_MAT_STATS") == "1";
+    private static readonly Dictionary<ulong, (int Count, int Hits, long Ticks)> _dbgMatStats = new();
+    private static long _dbgMatLast = Environment.TickCount64;
+    private static void DbgMaterialize(ulong hash, bool hit, long ticks)
+    {
+        if (!_dbgMat) return;
+        _dbgMatStats.TryGetValue(hash, out var entry);
+        _dbgMatStats[hash] = (entry.Count + 1, entry.Hits + (hit ? 1 : 0), entry.Ticks + ticks);
+        if (Environment.TickCount64 - _dbgMatLast < 10000) return;
+        _dbgMatLast = Environment.TickCount64;
+        Console.Error.WriteLine($"[DBG][MAT] total_ms={_dbgMatStats.Values.Sum(v => v.Ticks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} ops={_dbgMatStats.Values.Sum(v => v.Count)}");
+        foreach (var (k, v) in _dbgMatStats.OrderByDescending(x => x.Value.Ticks).Take(12))
+            Console.Error.WriteLine($"[DBG][MAT]   0x{k:X16} n={v.Count} hits={v.Hits} ms={v.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} us/op={v.Ticks * 1e6 / System.Diagnostics.Stopwatch.Frequency / v.Count:F0}");
+        _dbgMatStats.Clear();
+    }
+
     private ShaderProgram GetOrCompileCore(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor, out ShaderStageResources stage)
     {
         ProgramKey key;
@@ -234,11 +251,14 @@ internal sealed class ShaderProgramCache
             SharpEmu.Libs.Diagnostics.DbgReadbackStats.CurrentShader = source.Hash; // TEMP
             SharpEmu.Libs.Diagnostics.DbgReadbackStats.CurrentLabel = source.Label; // TEMP
             // Failure capture needs the full walk, so a dump run bypasses the cache.
+            var dbgMatStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
+            var dbgHitsBefore = _materializations?.Hits ?? 0; // TEMP
             var materialized = _materializations is not null && captureIndirectImageFailure is null
                 ? _materializations.Materialize(entry.Plan, inputs, _host.TryReadResidentGuestBytes, ref snapshot, ref specialization,
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
+            DbgMaterialize(source.Hash, (_materializations?.Hits ?? 0) != dbgHitsBefore, System.Diagnostics.Stopwatch.GetTimestamp() - dbgMatStart); // TEMP
             if (!materialized)
             {
                 var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";

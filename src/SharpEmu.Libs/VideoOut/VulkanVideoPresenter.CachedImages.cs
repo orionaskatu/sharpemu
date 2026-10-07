@@ -107,6 +107,7 @@ internal static unsafe partial class VulkanVideoPresenter
     private sealed class TextureResource
     {
         public ulong Address;
+        public int PassMark;
         public ResourceSlotIdentifier ImageIdentifier;
         public ImageRequest Request;
         public CachedImage? CachedImage;

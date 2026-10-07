@@ -201,5 +201,9 @@ public interface IRenderHost
 
     bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue);
 
+    // A small constant fill the CPU can apply to guest memory and the buffers that mirror it
+    // without a GPU dispatch; false when the GPU owns any of the bytes.
+    bool TryFillGuestMemoryOnCpu(ulong address, ulong size, uint value) => false;
+
     Exception Fatal(string message);
 }

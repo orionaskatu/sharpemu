@@ -297,6 +297,12 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x400);
         }
 
+        if (DbgClampInstances is { } clamp && emission.IndirectArgumentsAddress != 0 && !emission.Indexed && (vertexInput.Stage.Program?.Hash ?? 0) == clamp.Hash) // TEMP
+        {
+            _host.EndRendering();
+            _host.DebugFillBuffer(emission.IndirectArgumentsAddress + 4, 4, clamp.Count);
+        }
+
         _host.BeginRendering(in state.Rendering);
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (setAutoDebug)
@@ -354,6 +360,12 @@ public sealed partial class RenderExecutor
     // irradiance alone. The blurred buffer carries no albedo (the albedo multiply is not reproduced yet), so skin
     // turns white-gray up close. Skipping the passes keeps the deferred skin shading (what distant skin uses).
     // SHARPEMU_SKIP_PS=off keeps them; a hash list overrides the default.
+    // TEMP: SHARPEMU_DBG_CLAMP_INST=vsHash:count clamps the instance count of that vertex shader's non-indexed indirect draws.
+    private static readonly (ulong Hash, uint Count)? DbgClampInstances =
+        Environment.GetEnvironmentVariable("SHARPEMU_DBG_CLAMP_INST") is { Length: > 0 } dbgClampText && dbgClampText.Split(':') is { Length: 2 } dbgClampParts
+            ? (Convert.ToUInt64(dbgClampParts[0].Replace("0x", ""), 16), Convert.ToUInt32(dbgClampParts[1]))
+            : null;
+
     private static readonly HashSet<ulong> SkippedPixelHashes = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_PS") switch
     {
         null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL],

@@ -53,7 +53,11 @@ internal static unsafe partial class VulkanVideoPresenter
         private long _lastPipelineCacheSaveTick;
         // Reading a mature driver cache can itself take several seconds. Keep the
         // render thread focused on pipeline warm-up; teardown still saves eagerly.
-        private const long PipelineCacheCheckpointIntervalMs = 300_000;
+        // SHARPEMU_VK_PIPELINE_CACHE_CHECKPOINT_S shortens the checkpoint for short runs.
+        private static readonly long PipelineCacheCheckpointIntervalMs =
+            long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_CHECKPOINT_S"), out var checkpointSeconds) && checkpointSeconds > 0
+                ? checkpointSeconds * 1000
+                : 300_000;
         private Queue _queue;
         private uint _queueFamilyIndex;
 

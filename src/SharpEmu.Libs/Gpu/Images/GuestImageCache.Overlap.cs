@@ -643,8 +643,14 @@ public sealed partial class GuestImageCache
         var record = _slots[association];
 
         TouchImage(record);
+        // A lookup resolved earlier only changes when the association itself does.
+        var associationChanged = record.DepthOwner != depthImageIdentifier;
         record.AssociateDepth(depthImageIdentifier);
-        BumpStructureVersion();
+        if (associationChanged)
+        {
+            LogStructureChange(stencil.Address, stencil.Size);
+        }
+
         return association;
     }
 }

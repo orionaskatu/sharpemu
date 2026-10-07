@@ -132,7 +132,9 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        var dbgT0 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+        var dbgT1 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         if (computeProgram.Consumed)
         {
             return;
@@ -278,16 +280,21 @@ public sealed partial class RenderExecutor
         }
 
         _host.EndRendering();
+        var dbgT2 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
+        long dbgT3 = 0, dbgT4 = 0, dbgT5 = 0;
         using (_host.BeginPreparation())
         {
             var pipeline = _pipelines.CreateComputePipeline(input, computeProgram.Program);
+            dbgT3 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             var bindings = _host.PrepareBindings(input.Stage);
+            dbgT4 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             if (program.UsesDeviceAddresses)
             {
                 _host.PrepareDeviceAddresses();
             }
 
             _host.BindResources(bindings);
+            dbgT5 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             Span<IPreparedBindings> stages = [bindings];
             _host.CommitBindings(PipelineBindPoint.Compute, in pipeline, stages);
             var hasStorageWrites = HasBufferWrites(input.Stage);
@@ -349,7 +356,26 @@ public sealed partial class RenderExecutor
             }
         }
 
+        DbgDispStat(program.Hash, dbgT0, dbgT1, dbgT2, dbgT3, dbgT4, dbgT5, System.Diagnostics.Stopwatch.GetTimestamp(), program.Buffers.Length, program.Images.Length); // TEMP
         _host.ResetBindings();
+    }
+
+    // TEMP: SHARPEMU_DBG_DISP_STATS=1 prints per-program dispatch phase costs every 10 s.
+    private static readonly bool _dbgDispStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISP_STATS") == "1";
+    private static readonly Dictionary<ulong, long[]> _dbgDispPhases = new();
+    private static long _dbgDispPhasesLast = Environment.TickCount64;
+    private static void DbgDispStat(ulong hash, long t0, long t1, long t2, long t3, long t4, long t5, long t6, int buffers, int images)
+    {
+        if (!_dbgDispStats) return;
+        if (!_dbgDispPhases.TryGetValue(hash, out var a)) _dbgDispPhases[hash] = a = new long[8];
+        a[0]++; a[1] += t1 - t0; a[2] += t3 - t2; a[3] += t4 - t3; a[4] += t5 - t4; a[5] += t6 - t5; a[6] = buffers; a[7] = images;
+        if (Environment.TickCount64 - _dbgDispPhasesLast < 10000) return;
+        _dbgDispPhasesLast = Environment.TickCount64;
+        var f = System.Diagnostics.Stopwatch.Frequency / 1e6;
+        Console.Error.WriteLine($"[DBG][DISPPH] programs={_dbgDispPhases.Count} total_ms={_dbgDispPhases.Values.Sum(v => v[1] + v[2] + v[3] + v[4] + v[5]) / f / 1000:F0}");
+        foreach (var (h, v) in _dbgDispPhases.OrderByDescending(x => x.Value[1] + x.Value[2] + x.Value[3] + x.Value[4] + x.Value[5]).Take(14))
+            Console.Error.WriteLine($"[DBG][DISPPH]   0x{h:X16} n={v[0]} us/op: program={v[1] / f / v[0]:F0} pipeline={v[2] / f / v[0]:F0} prepare={v[3] / f / v[0]:F0} bind={v[4] / f / v[0]:F0} record={v[5] / f / v[0]:F0} bufs={v[6]} imgs={v[7]}");
+        _dbgDispPhases.Clear();
     }
 
     private static readonly (ulong Hash, int Slot, uint Value)[] DbgFillAfter = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_FILL_AFTER") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
@@ -525,10 +551,31 @@ public sealed partial class RenderExecutor
         return consumed;
     }
 
+    // TEMP: SHARPEMU_DBG_CLEARS=1 reports how clear/fill dispatches were handled.
+    private static readonly bool _dbgClears = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CLEARS") == "1";
+    private static readonly Dictionary<string, int> _dbgClearCounts = new();
+    private static long _dbgClearLast = Environment.TickCount64;
+    private static void DbgClear(string outcome, ulong hash, ulong address, ulong size, uint value)
+    {
+        if (!_dbgClears || outcome == "nodecode") return;
+        var key = $"{outcome} hash=0x{hash:X} addr=0x{address:X} size=0x{size:X} value=0x{value:X8}";
+        _dbgClearCounts.TryGetValue(key, out var count);
+        _dbgClearCounts[key] = count + 1;
+        if (Environment.TickCount64 - _dbgClearLast < 10000) return;
+        _dbgClearLast = Environment.TickCount64;
+        foreach (var (k, v) in _dbgClearCounts.OrderByDescending(x => x.Value).Take(14))
+            Console.Error.WriteLine($"[DBG][CLEARS] {v} {k}");
+        _dbgClearCounts.Clear();
+    }
+
+    private static bool IsDccFillPattern(uint value) =>
+        value == (value & 0xFFu) * 0x01010101u && value is 0x00000000u or 0x20202020u or 0x40404040u or 0x80808080u or 0xC0C0C0C0u;
+
     private bool TryConsumeImageClear(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator)
     {
         if (TryDecodeImageClear(input, groupsX, groupsY, groupsZ, dispatchInitiator) is not { } clear)
         {
+            DbgClear("nodecode", input.Stage.Program!.Hash, 0, 0, 0); // TEMP
             return false;
         }
 
@@ -538,6 +585,15 @@ public sealed partial class RenderExecutor
         {
             // A metadata fill may run before its target is bound; the store keeps it pending and the dispatch runs.
             var registered = _host.TryAbsorbDccFill(address, clear.Size, clear.PackedClear);
+            // A DCC-code fill of metadata that is still pending its target is applied on the CPU: the
+            // dispatch would leave the bytes GPU-dirty and the target's discovery would wait for them.
+            if (!registered && IsDccFillPattern(clear.PackedClear) && _host.TryFillGuestMemoryOnCpu(address, clear.Size, clear.PackedClear))
+            {
+                DbgClear("cpu-fill", hash, address, clear.Size, clear.PackedClear); // TEMP
+                return true;
+            }
+
+            DbgClear(registered ? "absorbed" : "pending-run", hash, address, clear.Size, clear.PackedClear); // TEMP
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
             {
                 RenderTrace.Write(
@@ -547,6 +603,7 @@ public sealed partial class RenderExecutor
             return registered;
         }
 
+        DbgClear("cleared", hash, address, clear.Size, clear.PackedClear); // TEMP
         if (RenderTrace.Enabled && RenderTrace.ImageClear())
         {
             RenderTrace.Write($"Consumed a compute image clear: shader=0x{hash:X16} address=0x{address:X16} size=0x{clear.Size:X16} value=0x{clear.PackedClear:X8}");

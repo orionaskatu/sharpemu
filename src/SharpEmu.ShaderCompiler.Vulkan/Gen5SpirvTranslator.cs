@@ -3345,17 +3345,14 @@ public static partial class Gen5SpirvTranslator
             var selector = SelectBufferCandidate(table, probeKey);
             var emitted = true;
             var caseError = string.Empty;
-            for (uint index = 0; index < table.CandidateCount && emitted; index++)
+            EmitCaseTree(selector, 0, table.CandidateCount, index =>
             {
                 var candidate = table.FirstCandidate + index;
-                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt(index)), () =>
+                if (!EmitResolvedBufferMemory(instruction, control, (int)candidate, out caseError))
                 {
-                    if (!EmitResolvedBufferMemory(instruction, control, (int)candidate, out caseError))
-                    {
-                        emitted = false;
-                    }
-                });
-            }
+                    emitted = false;
+                }
+            }, () => !emitted);
 
             error = caseError;
             return emitted;
@@ -5122,28 +5119,26 @@ public static partial class Gen5SpirvTranslator
                     // One case per descriptor over a constant element, like a switch on the selector.
                     var emitted = true;
                     var caseError = string.Empty;
-                    for (var index = 0; index < elements.Count && emitted; index++)
+                    var caseElements = elements;
+                    EmitCaseTree(selector, 0, (uint)caseElements.Count, index =>
                     {
-                        var elementCase = elements[index];
-                        EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt((uint)index)), () =>
+                        var elementCase = caseElements[(int)index];
+                        if (!TryResolveLayoutImage(instruction, image, out var caseResource, out var caseImageObject, out var caseDstSelect, out caseError,
+                                elementCase))
                         {
-                            if (!TryResolveLayoutImage(instruction, image, out var caseResource, out var caseImageObject, out var caseDstSelect, out caseError,
-                                    elementCase))
-                            {
-                                emitted = false;
-                                return;
-                            }
+                            emitted = false;
+                            return;
+                        }
 
-                            // A sampled mip load keeps its mip operand; a storage case is already its own mip view.
-                            var caseMipLevel = instruction.Opcode == "ImageLoadMip" && !caseResource.IsStorage
-                                ? LoadImageIntegerAddress(image, (int)ImageCoordinateComponentCount(caseResource))
-                                : UInt(0);
-                            if (!EmitImageOperation(instruction, image, caseResource, caseImageObject, caseDstSelect, caseMipLevel, out caseError))
-                            {
-                                emitted = false;
-                            }
-                        });
-                    }
+                        // A sampled mip load keeps its mip operand; a storage case is already its own mip view.
+                        var caseMipLevel = instruction.Opcode == "ImageLoadMip" && !caseResource.IsStorage
+                            ? LoadImageIntegerAddress(image, (int)ImageCoordinateComponentCount(caseResource))
+                            : UInt(0);
+                        if (!EmitImageOperation(instruction, image, caseResource, caseImageObject, caseDstSelect, caseMipLevel, out caseError))
+                        {
+                            emitted = false;
+                        }
+                    }, () => !emitted);
 
                     error = caseError;
                     return emitted;
@@ -8661,6 +8656,28 @@ public static partial class Gen5SpirvTranslator
             emit();
             _module.AddStatement(SpirvOp.Branch, mergeLabel);
             _module.AddLabel(mergeLabel);
+        }
+
+        // One case per selector value in [low, high), reached through a balanced decision tree: a
+        // run-time selector costs log2(count) comparisons instead of one per case.
+        private void EmitCaseTree(uint selector, uint low, uint high, Action<uint> emitCase, Func<bool> failed)
+        {
+            if (low >= high || failed())
+            {
+                return;
+            }
+
+            if (high - low == 1)
+            {
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt(low)), () => emitCase(low));
+                return;
+            }
+
+            var middle = low + (high - low) / 2;
+            EmitConditional(
+                _module.AddInstruction(SpirvOp.ULessThan, _boolType, selector, UInt(middle)),
+                () => EmitCaseTree(selector, low, middle, emitCase, failed),
+                () => EmitCaseTree(selector, middle, high, emitCase, failed));
         }
 
         private void EmitConditional(uint condition, Action whenTrue, Action whenFalse)

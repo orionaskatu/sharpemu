@@ -217,8 +217,27 @@ public sealed unsafe partial class GuestImageCache
         var size = (ulong)layerCount * sliceSize;
         if (IsValidRange(address, size) && _bufferCache.HasGpuDirtyBytes(address, size))
         {
+            var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             _ = _bufferCache.TrySynchronizeCpuRead(address, size);
+            DbgDccSync(address, size, System.Diagnostics.Stopwatch.GetTimestamp() - dbgStart); // TEMP
         }
+    }
+
+    // TEMP: SHARPEMU_DBG_DCC_SYNC=1 reports the metadata ranges whose CPU read waits for the GPU.
+    private static readonly bool _dbgDccSync = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DCC_SYNC") == "1";
+    private static readonly Dictionary<(ulong, ulong), (int Count, long Ticks)> _dbgDcc = new();
+    private static long _dbgDccLast = Environment.TickCount64;
+    private static void DbgDccSync(ulong address, ulong size, long ticks)
+    {
+        if (!_dbgDccSync) return;
+        _dbgDcc.TryGetValue((address, size), out var entry);
+        _dbgDcc[(address, size)] = (entry.Count + 1, entry.Ticks + ticks);
+        if (Environment.TickCount64 - _dbgDccLast < 10000) return;
+        _dbgDccLast = Environment.TickCount64;
+        Console.Error.WriteLine($"[DBG][DCCSYNC] ranges={_dbgDcc.Count} syncs={_dbgDcc.Values.Sum(v => v.Count)} ms={_dbgDcc.Values.Sum(v => v.Ticks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}");
+        foreach (var (k, v) in _dbgDcc.OrderByDescending(x => x.Value.Ticks).Take(8))
+            Console.Error.WriteLine($"[DBG][DCCSYNC]   0x{k.Item1:X} size=0x{k.Item2:X} n={v.Count} ms={v.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}");
+        _dbgDcc.Clear();
     }
 
     public bool SetMetadataSlice(ulong address, uint slice, bool isClear)

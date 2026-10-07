@@ -16,7 +16,105 @@ public sealed partial class GuestImageCache
     // valid until it changes.
     private long _structureVersion;
     public long StructureVersion => Volatile.Read(ref _structureVersion);
-    internal void BumpStructureVersion() => Interlocked.Increment(ref _structureVersion);
+    internal void BumpStructureVersion() => LogStructureChange(0, ulong.MaxValue);
+
+    // The address range each recent version change touched, so a lookup resolved at an older
+    // version stays valid when none of the changes since overlap what it resolved.
+    private const int ChangeLogSize = 8192;
+    private readonly long[] _changeLogVersion = new long[ChangeLogSize];
+    private readonly ulong[] _changeLogStart = new ulong[ChangeLogSize];
+    private readonly ulong[] _changeLogEnd = new ulong[ChangeLogSize];
+
+    // TEMP: SHARPEMU_DBG_STRUCT_STATS=1 reports where structure changes happen.
+    private static readonly bool DbgStructStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_STRUCT_STATS") == "1";
+    private static readonly Dictionary<string, int> _dbgStruct = new();
+    private static long _dbgStructLast = Environment.TickCount64;
+    private static void DbgStruct(ulong address, ulong size)
+    {
+        lock (_dbgStruct)
+        {
+            var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+            var key = $"size={(size >= 1UL << 40 ? "ALL" : (size >> 12).ToString())}p " + string.Join(" < ", frames.Take(4).Select(frame => frame.GetMethod()?.Name ?? "?"));
+            _dbgStruct.TryGetValue(key, out var count);
+            _dbgStruct[key] = count + 1;
+            if (Environment.TickCount64 - _dbgStructLast < 10000) return;
+            _dbgStructLast = Environment.TickCount64;
+            Console.Error.WriteLine($"[DBG][STRUCT] changes={_dbgStruct.Values.Sum()}");
+            foreach (var (k, v) in _dbgStruct.OrderByDescending(x => x.Value).Take(10))
+                Console.Error.WriteLine($"[DBG][STRUCT]   {v} {k}");
+            _dbgStruct.Clear();
+        }
+    }
+
+    private void LogStructureChange(ulong address, ulong size)
+    {
+        if (DbgStructStats) DbgStruct(address, size);
+        var version = Interlocked.Increment(ref _structureVersion);
+        var slot = (int)(version & (ChangeLogSize - 1));
+        _changeLogStart[slot] = address;
+        _changeLogEnd[slot] = size >= ulong.MaxValue - address ? ulong.MaxValue : address + Math.Max(size, 1);
+        Volatile.Write(ref _changeLogVersion[slot], version);
+    }
+
+    // The address ranges of the changes after entryVersion; false when too many or too old to list.
+    public bool TryGetChangesSince(long entryVersion, Span<(ulong Start, ulong End)> changes, out int count, out long currentVersion)
+    {
+        currentVersion = StructureVersion;
+        count = 0;
+        if (currentVersion - entryVersion > changes.Length)
+        {
+            return false;
+        }
+
+        for (var version = entryVersion + 1; version <= currentVersion; version++)
+        {
+            var slot = (int)(version & (ChangeLogSize - 1));
+            if (Volatile.Read(ref _changeLogVersion[slot]) != version)
+            {
+                return false;
+            }
+
+            var start = _changeLogStart[slot];
+            var end = _changeLogEnd[slot];
+            if (Volatile.Read(ref _changeLogVersion[slot]) != version)
+            {
+                return false;
+            }
+
+            changes[count++] = (start, end);
+        }
+
+        return true;
+    }
+
+    // True when no image overlapping [start, end) entered or left the index after the entry's
+    // version; validatedVersion is the version the answer holds for.
+    public bool TryRevalidate(long entryVersion, ulong start, ulong end, out long validatedVersion)
+    {
+        validatedVersion = StructureVersion;
+        if (validatedVersion - entryVersion >= ChangeLogSize)
+        {
+            return false;
+        }
+
+        for (var version = entryVersion + 1; version <= validatedVersion; version++)
+        {
+            var slot = (int)(version & (ChangeLogSize - 1));
+            if (Volatile.Read(ref _changeLogVersion[slot]) != version)
+            {
+                return false;
+            }
+
+            var changeStart = _changeLogStart[slot];
+            var changeEnd = _changeLogEnd[slot];
+            if (Volatile.Read(ref _changeLogVersion[slot]) != version || (changeStart < end && start < changeEnd))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     // The bookkeeping FindImage does for a hit, for a caller that resolved the image earlier.
     public void TouchFoundImage(ResourceSlotIdentifier imageIdentifier)
@@ -29,8 +127,8 @@ public sealed partial class GuestImageCache
 
     private void AddToIndex(ResourceSlotIdentifier imageIdentifier)
     {
-        Interlocked.Increment(ref _structureVersion);
         var image = _slots[imageIdentifier];
+        LogStructureChange(image.Description.Data.Address, image.Description.Data.Size);
         if (image.Registered || ImageDescription.IsEmptyRange(image.Description.Data))
         {
             throw SubmissionScheduler.Fatal($"The image registration is invalid: address=0x{image.Description.Data.Address:X16} size=0x{image.Description.Data.Size:X} registered={image.Registered}.");
@@ -60,8 +158,8 @@ public sealed partial class GuestImageCache
 
     private void RemoveFromIndex(ResourceSlotIdentifier imageIdentifier)
     {
-        Interlocked.Increment(ref _structureVersion);
         var image = _slots[imageIdentifier];
+        LogStructureChange(image.Description.Data.Address, image.Description.Data.Size);
         if (!image.Registered)
         {
             return;

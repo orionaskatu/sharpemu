@@ -116,10 +116,17 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        private readonly record struct PageHistory(ulong Contents, int Streak, int SinceConfirm);
+        private readonly Dictionary<ulong, PageHistory> _pageHistory = new();
+        private static readonly bool SpeculateReads = Environment.GetEnvironmentVariable("SHARPEMU_SPECULATE_READS") == "1";
+        private const int SpeculationStreak = 4;
+        private const int SpeculationInterval = 8;
+
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            var speculated = false;
             // Resource planning can inspect a dynamic descriptor before the draw has
             // supplied a valid guest address.  Do not pass an invalid range to the
             // page tracker: it treats that as an emulator invariant violation and
@@ -134,6 +141,19 @@ internal static unsafe partial class VulkanVideoPresenter
             // elsewhere on the page does not make this word stale, so it needs no download.
             if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && _bufferCache.MayHaveGpuDirtyPages(address, 4) && DbgShaderRead(address))
             {
+                // A page the GPU keeps rewriting with the same contents costs a full GPU wait per read. One
+                // that held its contents across several waits is read as last synchronized, and a real
+                // read confirms it every few uses, so a change shows up within a few draws.
+                if (SpeculateReads && _pageHistory.TryGetValue(address >> 7, out var history) &&
+                    history.Streak >= SpeculationStreak && history.SinceConfirm < SpeculationInterval)
+                {
+                    _pageHistory[address >> 7] = history with { SinceConfirm = history.SinceConfirm + 1 };
+                    speculated = true;
+                    _dbgSpecSkips++; // TEMP
+                }
+
+                if (!speculated)
+                {
                 var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
                 var synchronized = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
                     SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
@@ -142,6 +162,34 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (!synchronized)
                 {
                     return false;
+                }
+
+                if (SpeculateReads)
+                {
+                    var pageBytes = new byte[128];
+                    if (_guestMemory.TryRead(address & ~0x7Ful, pageBytes))
+                    {
+                        var contents = System.IO.Hashing.XxHash3.HashToUInt64(pageBytes);
+                        _pageHistory[address >> 7] = _pageHistory.TryGetValue(address >> 7, out var previous) && previous.Contents == contents
+                            ? new PageHistory(contents, previous.Streak + 1, 0)
+                            : new PageHistory(contents, 0, 0);
+                        if (_pageHistory.Count > 16384)
+                        {
+                            _pageHistory.Clear();
+                        }
+                    }
+                }
+
+                if (_dbgStability) // TEMP: how often do the GPU-written words that cost a wait change?
+                {
+                    var dbgBytes = new byte[4];
+                    if (_guestMemory.TryRead(address, dbgBytes))
+                    {
+                        DbgStability(address, BitConverter.ToUInt32(dbgBytes), System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds);
+                        if (_pageHistory.TryGetValue(address >> 7, out var dbgHistory) && address == 0x50CDB59C38UL)
+                            Console.Error.WriteLine($"[DBG][STAB] line history streak={dbgHistory.Streak} since={dbgHistory.SinceConfirm} contents=0x{dbgHistory.Contents:X}");
+                    }
+                }
                 }
             }
 
@@ -166,6 +214,22 @@ internal static unsafe partial class VulkanVideoPresenter
                 Console.Error.WriteLine($"[DBG][SRVAL] n={_dbgSrCount} addr=0x{address:X} value=0x{word:X} stack={(_dbgSrCount < 300 ? Environment.StackTrace.Replace(Environment.NewLine, " | ") : "")}");
             return true;
         }
+        private static long _dbgSpecSkips; // TEMP
+        private static readonly bool _dbgStability = Environment.GetEnvironmentVariable("SHARPEMU_DBG_STABILITY") == "1"; // TEMP
+        private static readonly Dictionary<ulong, (uint Last, int Reads, int Changes, double Ms)> _dbgStab = new();
+        private static long _dbgStabLast = Environment.TickCount64;
+        private static void DbgStability(ulong address, uint value, double ms)
+        {
+            _dbgStab.TryGetValue(address, out var e);
+            _dbgStab[address] = (value, e.Reads + 1, e.Changes + (e.Reads > 0 && e.Last != value ? 1 : 0), e.Ms + ms);
+            if (Environment.TickCount64 - _dbgStabLast < 20000) return;
+            _dbgStabLast = Environment.TickCount64;
+            Console.Error.WriteLine($"[DBG][STAB] speculated_skips={_dbgSpecSkips} addresses={_dbgStab.Count} reads={_dbgStab.Values.Sum(v => v.Reads)} changes={_dbgStab.Values.Sum(v => v.Changes)} ms={_dbgStab.Values.Sum(v => v.Ms):F0}");
+            foreach (var (k, v) in _dbgStab.OrderByDescending(x => x.Value.Ms).Take(14))
+                Console.Error.WriteLine($"[DBG][STAB]   0x{k:X} reads={v.Reads} changes={v.Changes} ms={v.Ms:F0} last=0x{v.Last:X8}");
+            _dbgStab.Clear();
+        }
+
         private static int _dbgSrCount; // TEMP
         private static readonly bool DbgVerifyGpuReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_VERIFY_GPU_READS") == "1"; // TEMP
         private static readonly bool DbgUseGpuReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_USE_GPU_READS") == "1"; // TEMP

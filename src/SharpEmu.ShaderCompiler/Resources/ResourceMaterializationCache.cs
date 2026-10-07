@@ -95,10 +95,12 @@ public sealed class ResourceMaterializationCache
     {
         var key = KeyOf(plan, inputs);
         var stats = StatsOf(plan);
+        var dbgReason = 0; // TEMP
         if (TryFind(key, plan, inputs, out var cached) && MappingsHold(cached, inputs))
         {
             if (Validate(cached, residentReader))
             {
+                DbgCacheReason(plan, 9); // TEMP
                 stats.Hits++;
                 Hits++;
                 Interlocked.Increment(ref _totalHits);
@@ -108,8 +110,10 @@ public sealed class ResourceMaterializationCache
                 return true;
             }
 
+            dbgReason = 3; // TEMP: the entry's bytes changed or the GPU owns a range
             if (TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
             {
+                DbgCacheReason(plan, 8); // TEMP
                 stats.Hits++;
                 TableRefreshes++;
                 snapshot = refreshed.Snapshot;
@@ -121,6 +125,7 @@ public sealed class ResourceMaterializationCache
 
         Misses++;
         Interlocked.Increment(ref _totalMisses);
+        DbgCacheReason(plan, BypassesRecording(stats) ? 4 : dbgReason); // TEMP
         if (BypassesRecording(stats))
         {
             return ResourceMaterializer.Materialize(plan, inputs with { AllowTransientTableReuse = !DbgFlags.Disabled("memo") }, ref snapshot, ref specialization, out failure);
@@ -263,6 +268,26 @@ public sealed class ResourceMaterializationCache
             return false;
         offset = entry.RangeOffsets[found] + (int)delta;
         return true;
+    }
+
+    // TEMP: SHARPEMU_DBG_CACHE=1 reports why materializations missed, per plan.
+    private static readonly bool _dbgCache = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CACHE") == "1";
+    private static readonly Dictionary<(ulong, int), int> _dbgCacheCounts = new();
+    private static long _dbgCacheLast = Environment.TickCount64;
+    private static void DbgCacheReason(ShaderResourcePlan plan, int reason)
+    {
+        if (!_dbgCache) return;
+        lock (_dbgCacheCounts)
+        {
+            _dbgCacheCounts.TryGetValue((plan.Hash, reason), out var count);
+            _dbgCacheCounts[(plan.Hash, reason)] = count + 1;
+            if (Environment.TickCount64 - _dbgCacheLast < 10000) return;
+            _dbgCacheLast = Environment.TickCount64;
+            Console.Error.WriteLine("[DBG][CACHE] reasons: 0=no entry/user data differs 3=bytes changed/GPU-owned 4=bypass 8=table refresh hit 9=hit");
+            foreach (var group in _dbgCacheCounts.GroupBy(x => x.Key.Item1).OrderByDescending(g => g.Where(x => x.Key.Item2 != 9 && x.Key.Item2 != 8).Sum(x => x.Value)).Take(10))
+                Console.Error.WriteLine($"[DBG][CACHE]   0x{group.Key:X16} " + string.Join(" ", group.OrderBy(x => x.Key.Item2).Select(x => $"r{x.Key.Item2}={x.Value}")));
+            _dbgCacheCounts.Clear();
+        }
     }
 
     private static ulong KeyOf(ShaderResourcePlan plan, ResourceRuntimeInputs inputs)

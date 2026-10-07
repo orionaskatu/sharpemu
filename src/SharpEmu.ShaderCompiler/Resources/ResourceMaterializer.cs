@@ -1220,12 +1220,12 @@ public static class ResourceMaterializer
             }
 
             imageCount += table.Descriptors.Count - 1;
-            mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
+            mappingWordCount = checked(mappingWordCount + 1 + MappingCapacity(table.Keys.Count) * 2);
         }
 
         foreach (var table in snapshot.BufferCandidateTables)
         {
-            mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
+            mappingWordCount = checked(mappingWordCount + 1 + MappingCapacity(table.Keys.Count) * 2);
         }
 
         // Each draw owns these arrays. Only indirect candidates require a larger table.
@@ -1255,9 +1255,9 @@ public static class ResourceMaterializer
             {
                 IndirectRoot = table.Resource,
                 IndirectMappingOffset = mappingOffset,
-                IndirectSearchIterations = (uint)BitOperations.Log2((uint)table.Keys.Count) + 1,
+                IndirectSearchIterations = (uint)BitOperations.Log2((uint)MappingCapacity(table.Keys.Count)) + 1,
             };
-            mappingCursor += 1 + table.Keys.Count * 2;
+            mappingCursor += 1 + MappingCapacity(table.Keys.Count) * 2;
             var order = Enumerable.Range(0, table.Keys.Count).OrderBy(index => table.Keys[index]).ToArray();
             snapshot.FlattenedTable[(int)mappingOffset] = (uint)table.Keys.Count;
             for (var entry = 0; entry < order.Length; entry++)
@@ -1615,10 +1615,10 @@ public static class ResourceMaterializer
                 snapshot.FlattenedTable[offset + 1] = table.Candidates[source];
             }
 
-            mappingCursor += 1 + table.Keys.Count * 2;
+            mappingCursor += 1 + MappingCapacity(table.Keys.Count) * 2;
             candidateTables.Add(new BufferCandidateTableSpecialization(
                 (uint)bufferCursor, (uint)table.Descriptors.Count, mappingOffset,
-                (uint)BitOperations.Log2((uint)table.Keys.Count) + 1));
+                (uint)BitOperations.Log2((uint)MappingCapacity(table.Keys.Count)) + 1));
             bufferCursor += table.Descriptors.Count;
         }
 
@@ -1632,6 +1632,13 @@ public static class ResourceMaterializer
         specializedSnapshot = snapshot;
         return true;
     }
+
+    // The key mapping's offset and search depth are baked into the shader. Reserving a
+    // power-of-two capacity keeps them stable while a table gains keys, so the shader is
+    // compiled again only when a table outgrows its reservation. The unused tail is never
+    // read: the search is bounded by the stored count.
+    private static int MappingCapacity(int keyCount) =>
+        (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(keyCount, 16));
 
     private sealed class SamplerPlan
     {

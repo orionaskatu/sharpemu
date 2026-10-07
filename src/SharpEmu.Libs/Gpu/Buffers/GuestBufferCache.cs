@@ -366,13 +366,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         DbgStacks.Record(key, 0, size, depth: 0);
     }
 
+    // TEMP: SHARPEMU_DBG_GUEST_FAULTS=1 lists the pages guest threads wait on while the GPU still owns them.
+    private static readonly bool _dbgGuestFaults = Environment.GetEnvironmentVariable("SHARPEMU_DBG_GUEST_FAULTS") == "1";
+    private static readonly Dictionary<ulong, (int Count, long Ticks, ulong Size)> _dbgGuestPages = new();
+    private static long _dbgGuestLast = Environment.TickCount64;
+    private static void DbgGuestFault(ulong address, ulong size, long ticks)
+    {
+        if (!_dbgGuestFaults) return;
+        lock (_dbgGuestPages)
+        {
+            var page = address >> 12;
+            _dbgGuestPages.TryGetValue(page, out var entry);
+            _dbgGuestPages[page] = (entry.Count + 1, entry.Ticks + ticks, Math.Max(entry.Size, size));
+            if (Environment.TickCount64 - _dbgGuestLast < 10000) return;
+            _dbgGuestLast = Environment.TickCount64;
+            Console.Error.WriteLine($"[DBG][GFAULT] pages={_dbgGuestPages.Count} faults={_dbgGuestPages.Values.Sum(v => v.Count)} ms={_dbgGuestPages.Values.Sum(v => v.Ticks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}");
+            foreach (var (k, v) in _dbgGuestPages.OrderByDescending(x => x.Value.Ticks).Take(12))
+                Console.Error.WriteLine($"[DBG][GFAULT]   page=0x{k << 12:X} n={v.Count} ms={v.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} size={v.Size}");
+            _dbgGuestPages.Clear();
+        }
+    }
+
     public bool DownloadToCpu(ulong address, ulong size)
     {
         var tracked = _tracker.HasRegion(address, size);
         var dirty = tracked && _tracker.HasGpuDirtyPages(address, size);
 
+        var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         var completed = tracked && (!dirty || ReadMemoryOrAwaitShutdown(address, size, isWrite: false,
             GuestMemoryProfile.ReadbackSource.StoreDownload));
+        if (dirty) DbgGuestFault(address, size, System.Diagnostics.Stopwatch.GetTimestamp() - dbgStart); // TEMP
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"buffer-read tracked={tracked} gpu_dirty={dirty} completed={completed}");
         return completed;
@@ -645,6 +668,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private static readonly bool DbgAllFills = Environment.GetEnvironmentVariable("SHARPEMU_DBG_ALL_FILLS") == "1"; // TEMP
+
+    // The CPU half of FillBuffer for a small range nothing on the GPU owns: the bytes land in
+    // guest memory and in the buffers mirroring it, so no GPU write makes them dirty.
+    public bool TryFillHostMemory(ulong guestAddress, ulong size, uint value)
+    {
+        if (guestAddress == 0 || (guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > 0x20000 || size > ulong.MaxValue - guestAddress)
+        {
+            return false;
+        }
+
+        var images = RequireImageCache();
+        var region = images.QueryRegion(guestAddress, size);
+        if (HasGpuDirtyBytes(guestAddress, size) || region.GpuImageBytes || region.ImageBytes)
+        {
+            return false;
+        }
+
+        var values = new uint[size / sizeof(uint)];
+        Array.Fill(values, value);
+        WriteHostMemory(guestAddress, MemoryMarshal.AsBytes<uint>(values));
+        return true;
+    }
 
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {

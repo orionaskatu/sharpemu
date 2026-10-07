@@ -1135,5 +1135,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue) => _imageCache.TryAbsorbDccFill(address, size, fillValue);
+
+        public bool TryFillGuestMemoryOnCpu(ulong address, ulong size, uint value) => _bufferCache.TryFillHostMemory(address, size, value);
     }
 }
