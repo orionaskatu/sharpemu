@@ -76,18 +76,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     streamRetention.Dispose();
                     if (StencilStorageImages is { } stencilImages)
                     {
+                        // The working image belongs to its attachment and is reused by later
+                        // preparations; the attachment disposes it.
                         foreach (var (attachment, storage) in stencilImages)
                         {
-                            try
-                            {
-                                if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
-                                    StencilStorageWriteBackImages.Contains(attachment))
-                                    attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
-                            }
-                            finally
-                            {
-                                owner._scheduler.QueueCompletionAction(storage.Dispose);
-                            }
+                            if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
+                                StencilStorageWriteBackImages.Contains(attachment))
+                                attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
                         }
                     }
 

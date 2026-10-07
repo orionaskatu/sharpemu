@@ -34,11 +34,18 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
     [MemberData(nameof(Operands))]
     public void PackedArithmeticIsCorrectlyRoundedForEveryHalf(uint multiplier, uint addend)
     {
-        CheckPackedArithmetic(multiplier, addend, fmac: false);
-        CheckPackedArithmetic(multiplier, addend, fmac: true);
+        foreach (var fast in new[] { true, false })
+        {
+            CheckPackedArithmetic(multiplier, addend, fmac: false, fast);
+            CheckPackedArithmetic(multiplier, addend, fmac: true, fast);
+        }
     }
 
-    private void CheckPackedArithmetic(uint multiplier, uint addend, bool fmac)
+    // fast is the production default (native f16vec2 arithmetic). The exact path (the
+    // ExactFloat16Arithmetic opt-in) multiplies in f32, where a driver may drop the sign of a
+    // zero result because only the f16 float controls are declared, so it is compared with
+    // -0 and +0 equal.
+    private void CheckPackedArithmetic(uint multiplier, uint addend, bool fmac, bool fast)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
@@ -47,7 +54,7 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
             Assert.False(GatePrerequisites.DeviceRequired, "The required gate needs exact native float16 support.");
             return;
         }
-        var output = Run(vulkan, multiplier, addend, native: true, fmac);
+        var output = Run(vulkan, multiplier, addend, native: true, fmac, fast);
         var failures = new List<string>();
         for (var value = 0; value < 0x10000; value++)
         {
@@ -69,9 +76,9 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
                 }
 
                 var actual = BitConverter.ToUInt32(output, value * 16 + result * 4);
-                if (!SameHalves(expected, actual) && failures.Count < 8)
+                if (!SameHalves(expected, actual, ignoreZeroSign: !fast) && failures.Count < 8)
                 {
-                    failures.Add($"half=0x{value:X4} result={result} expected=0x{expected:X8} actual=0x{actual:X8}");
+                    failures.Add($"fast={fast} fmac={fmac} half=0x{value:X4} result={result} expected=0x{expected:X8} actual=0x{actual:X8}");
                 }
             }
         }
@@ -80,14 +87,15 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
     }
 
     // Equal halves, where any two NaNs are equal: the sign of a NaN result is not defined.
-    private static bool SameHalves(uint left, uint right)
+    private static bool SameHalves(uint left, uint right, bool ignoreZeroSign)
     {
         for (var lane = 0; lane < 2; lane++)
         {
             var a = (ushort)(left >> (16 * lane));
             var b = (ushort)(right >> (16 * lane));
             var bothNan = (a & 0x7FFF) > 0x7C00 && (b & 0x7FFF) > 0x7C00;
-            if (a != b && !bothNan) return false;
+            var bothZero = ignoreZeroSign && ((a | b) & 0x7FFF) == 0;
+            if (a != b && !bothNan && !bothZero) return false;
         }
 
         return true;
@@ -120,7 +128,7 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
         return Narrow(sum);
     }
 
-    private static byte[] Run(HeadlessVulkan vulkan, uint multiplier, uint addend, bool native, bool fmac)
+    private static byte[] Run(HeadlessVulkan vulkan, uint multiplier, uint addend, bool native, bool fmac, bool fast)
     {
         // v2 = s8 + v0 (the f16 value), v3 = that f16 in both lanes;
         // v4 = v3 * s9, v5 = fma(v3, s9, s10), v6 = v3 * v3; stored at v2 * 16.
@@ -143,6 +151,7 @@ public sealed class Float16ConversionDeviceTests(HeadlessVulkanFixture fixture) 
         {
             LocalSizeX = LocalSize,
             SupportsExactFloat16Conversions = native,
+            FastFloat16Arithmetic = fast,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         using var harness = new ImageTestHarness(vulkan);

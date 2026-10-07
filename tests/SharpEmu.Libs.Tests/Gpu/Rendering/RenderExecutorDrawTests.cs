@@ -101,14 +101,30 @@ public sealed class RenderExecutorDrawTests : IDisposable
         Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indexed ", StringComparison.Ordinal));
     }
 
+    // Strips are drawn from the GPU-read arguments too (the metadata clear quads included).
     [Fact]
-    public void IndirectIndexedStrip_ReadsTheArgumentsOnTheCpu()
+    public void IndirectIndexedStrip_LetsTheGpuReadTheArguments()
     {
-        WriteIndirectArguments(6, 2, 4, 3, 1);
         var arguments = Indexed(40, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
         _executor.DrawIndexed(7, Banks(PrimitiveTriangleStrip), arguments);
 
-        AssertOrder("obtain 100500008 C written=False", "draw_indexed 6 2 0 3 1", "reset_bindings");
+        AssertOrder("obtain 100500000 50 written=False", "draw_indexed_indirect", "reset_bindings");
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indexed ", StringComparison.Ordinal));
+    }
+
+    // A restart index other than the index type's maximum is converted on the CPU, which needs
+    // the counts.
+    [Fact]
+    public void IndirectIndexedStripWithACustomRestartIndex_ReadsTheArgumentsOnTheCpu()
+    {
+        WriteIndirectArguments(6, 2, 4, 3, 1);
+        var banks = Banks(PrimitiveTriangleStrip);
+        banks.UserConfig.PrimitiveResetControl = 1;
+        banks.Context.PrimitiveResetIndex = 0xFF;
+        var arguments = Indexed(40, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawIndexed(7, banks, arguments);
+
+        AssertOrder("upload_transient 18", "draw_indexed 6 2 0 3 1", "reset_bindings");
         Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indexed_indirect", StringComparison.Ordinal));
     }
 
