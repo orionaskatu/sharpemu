@@ -80,7 +80,7 @@ internal sealed class PresenterUnderTest : IDisposable
             "_pipelineEntries", "_shaderModules", "_shaderModuleSpirvBytes",
             "_preparedTextures", "_barriersAfterRendering", "_feedbackSnapshotPool",
             "_runtimeDescriptorSets",
-            "_preparedImages", "_nullTextures", "_textureBindings", "_boundSets", "_setChanged",
+            "_preparedImages", "_nullTextures", "_textureBindings", "_boundSets", "_setChanged", "_acquiredViews", "_replacedTextures", "_capturePendingStorage",
         })
         {
             var field = PresenterType.GetField(name, InstanceMembers)!;
