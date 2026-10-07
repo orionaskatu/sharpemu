@@ -215,8 +215,13 @@ public sealed partial class RenderExecutor
         {
             return;
         }
+
+        if (DbgBisectSkip(vertexInput.Stage.Program?.Hash ?? 0, state.PixelActive)) // TEMP
+        {
+            return;
+        }
         var pixelInput = state.Programs.PixelInput;
-        if (state.PixelActive && SkippedPixelHashes.Count != 0 && SkippedPixelHashes.Contains(pixelInput.Stage.Program?.Hash ?? 0))
+        if (state.PixelActive && SkippedPixelHashes.Count != 0 && !DbgNoSkipNow() && SkippedPixelHashes.Contains(pixelInput.Stage.Program?.Hash ?? 0))
         {
             return;
         }
@@ -400,6 +405,47 @@ public sealed partial class RenderExecutor
         Environment.GetEnvironmentVariable("SHARPEMU_DBG_CLAMP_INST") is { Length: > 0 } dbgClampText && dbgClampText.Split(':') is { Length: 2 } dbgClampParts
             ? (Convert.ToUInt64(dbgClampParts[0].Replace("0x", ""), 16), Convert.ToUInt32(dbgClampParts[1]))
             : null;
+
+    // TEMP: SHARPEMU_DBG_VS_BISECT=start:len:group counts draws per vertex shader before `start` seconds, then each window of
+    // `len` seconds skips the next `group` vertex shaders (ranked by draw count) to find which one draws the garbage geometry.
+    private static readonly double[]? DbgBisect = Environment.GetEnvironmentVariable("SHARPEMU_DBG_VS_BISECT") is { Length: > 0 } dbgBs
+        ? dbgBs.Split(':').Select(part => double.Parse(part, System.Globalization.CultureInfo.InvariantCulture)).ToArray() : null;
+    private static readonly Dictionary<ulong, long> DbgBisectCounts = new();
+    private static ulong[]? DbgBisectRanked;
+    private static int DbgBisectWindowLogged = -1;
+    private static bool DbgBisectSkip(ulong vertexHash, bool pixelActive)
+    {
+        if (DbgBisect is not { Length: 3 } cfg || vertexHash == 0 || !pixelActive) return false;
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgNoSkipStart).TotalSeconds;
+        if (elapsed < cfg[0])
+        {
+            DbgBisectCounts[vertexHash] = DbgBisectCounts.GetValueOrDefault(vertexHash) + 1;
+            return false;
+        }
+
+        DbgBisectRanked ??= DbgBisectCounts.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).ToArray();
+        var window = (int)((elapsed - cfg[0]) / cfg[1]);
+        var group = (int)cfg[2];
+        if (window != DbgBisectWindowLogged)
+        {
+            DbgBisectWindowLogged = window;
+            var skipped = DbgBisectRanked.Skip(window * group).Take(group).Select(hash => $"0x{hash:X16}({DbgBisectCounts[hash]})");
+            Console.Error.WriteLine($"[DBG][BISECT] t={elapsed:F1} window={window} skips {string.Join(" ", skipped)}");
+        }
+
+        return DbgBisectRanked.Skip(window * group).Take(group).Contains(vertexHash);
+    }
+
+    // TEMP: SHARPEMU_DBG_NOSKIP_WINDOW=from:len draws the skipped skin shaders in that window of process time.
+    private static readonly (double From, double Length)? DbgNoSkipWindow = Environment.GetEnvironmentVariable("SHARPEMU_DBG_NOSKIP_WINDOW") is { Length: > 0 } dbgNs && dbgNs.Split(':') is { Length: 2 } dbgNsParts
+        ? (double.Parse(dbgNsParts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(dbgNsParts[1], System.Globalization.CultureInfo.InvariantCulture)) : null;
+    private static readonly long DbgNoSkipStart = System.Diagnostics.Stopwatch.GetTimestamp();
+    private static bool DbgNoSkipNow()
+    {
+        if (DbgNoSkipWindow is not { } window) return false;
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgNoSkipStart).TotalSeconds;
+        return elapsed >= window.From && elapsed < window.From + window.Length;
+    }
 
     private static readonly HashSet<ulong> SkippedPixelHashes = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_PS") switch
     {

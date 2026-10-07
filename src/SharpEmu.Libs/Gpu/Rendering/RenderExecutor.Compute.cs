@@ -225,6 +225,26 @@ public sealed partial class RenderExecutor
 
         if (DbgSkipHashes.Contains(program.Hash) || Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_ALL_CS") == "1" || (DbgRunOnly.Count != 0 && !DbgRunOnly.Contains(program.Hash))) return; // TEMP
         DbgVcullWatch(program, input); // TEMP
+        if (program.Hash == 0x17444E6ABBF4F82CUL && Environment.GetEnvironmentVariable("SHARPEMU_DBG_VCULL_TABLES") == "1" && Interlocked.Increment(ref _dbgVcullTableLogs) <= 3) // TEMP
+        {
+            for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
+            {
+                var words = input.Stage.Resources.Buffers[index];
+                if (words.Length < 4) continue;
+                var descriptor = BufferDescriptorWords.From(words);
+                var footprint = descriptor.Footprint() ?? 0;
+                var bytes = new byte[Math.Min(footprint, 4096UL * 4)];
+                var ok = descriptor.Address != 0 && _host.TryReadGuest(descriptor.Address, bytes);
+                var dwords = Enumerable.Range(0, bytes.Length / 4).Select(i => BitConverter.ToUInt32(bytes, i * 4)).ToArray();
+                Console.Error.WriteLine($"[DBG][VTAB] buf[{index}] addr=0x{descriptor.Address:X} bytes=0x{footprint:X} written={program.Buffers[index].Written} read={ok} nonzero={dwords.Count(x => x != 0)} first={string.Join(",", dwords.Take(48).Select(x => x.ToString("X")))}");
+            }
+
+            var ud = input.Stage.Resources.UserData;
+            Console.Error.WriteLine($"[DBG][VTAB] groups={groupsX}x{groupsY}x{groupsZ} ud={string.Join(",", ud.Take(16).Select(x => x.ToString("X")))}");
+            var rect = new byte[16];
+            if (ud.Length >= 2 && _host.TryReadGuest(ud[0] | ((ulong)ud[1] << 32), rect))
+                Console.Error.WriteLine($"[DBG][VTAB] ud-struct rect={string.Join(",", Enumerable.Range(0, 4).Select(i => BitConverter.ToUInt32(rect, i * 4).ToString("X")))}");
+        }
         if (DbgFillWrittenHashes.Contains(program.Hash) && DbgInBootWindow() && !DbgInRealVcullWindow()) // TEMP: replace the dispatch by all-ones fills of its written buffers
         {
             for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
@@ -448,6 +468,7 @@ public sealed partial class RenderExecutor
                 Console.Error.WriteLine($"[DBG][VCULL] dispatch cs=0x{stageProgram.Hash:X16} binds watched image[{index}] addr=0x{address:X} t#={string.Join(",", images[index].Take(8).Select(word => word.ToString("X8")))}");
         }
     }
+    private static int _dbgVcullTableLogs;
     private static long DbgBeginPrep; // TEMP: ticks spent in BeginPreparation (flush + capacity wait)
     private static long DbgEndRendering; // TEMP
     private static readonly Dictionary<ulong, long[]> _dbgDispPhases = new();

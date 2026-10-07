@@ -295,6 +295,8 @@ public sealed partial class GpuCommandInterpreter
                 throw _host.Fatal($"The packet is longer than the buffer: offset=0x{offset:X5} header=0x{header:X8} length={length} remaining={remaining} address=0x{packetAddress:X16}.");
             }
 
+            if (SharpEmu.Libs.Diagnostics.DbgSequence.Active && PacketHeader.IsPredicated(header)) // TEMP
+                SharpEmu.Libs.Diagnostics.DbgSequence.Note($"  predicated opcode=0x{PacketHeader.Opcode(header):X} skip={PredicateSkip}");
             if (PacketHeader.IsPredicated(header) && PredicateSkip)
             {
                 cursor.Offset += length;

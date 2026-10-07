@@ -74,6 +74,8 @@ public sealed partial class GpuCommandInterpreter
 
                 _host.FlushAndWait();
                 var value = ReadQword(address);
+                if (SharpEmu.Libs.Diagnostics.DbgSequence.Active) // TEMP
+                    SharpEmu.Libs.Diagnostics.DbgSequence.Note($"SET_PREDICATION cond={condition} addr=0x{address:X} value=0x{value:X}");
                 PredicateSkip = condition switch
                 {
                     0 => value != 0,
