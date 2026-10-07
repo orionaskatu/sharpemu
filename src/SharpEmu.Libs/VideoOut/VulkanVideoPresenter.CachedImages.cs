@@ -65,8 +65,6 @@ internal static unsafe partial class VulkanVideoPresenter
         public Format Format;
         public Image Image;
         public DeviceMemory Memory;
-        // Made by CreateGuestFlipSnapshot: its image goes back to the snapshot pool.
-        public bool FromSnapshotPool;
     }
 
     // A cached color target bound to one draw or resolve.
@@ -354,7 +352,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             foreach (var slice in slices)
             {
-                _bufferCache.FillBuffer(slice, sliceSize, uint.MaxValue, false);
+                _bufferCache.FillDccMetadata(slice, sliceSize, uint.MaxValue);
             }
 
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
@@ -379,7 +377,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (_imageCache.TryReadGuestDccClear(description.Metadata.Range.Address, sliceSize, baseLayer + layer, out var slice, out _))
                 {
-                    _bufferCache.FillBuffer(slice, sliceSize, uint.MaxValue, false);
+                    _bufferCache.FillDccMetadata(slice, sliceSize, uint.MaxValue);
                 }
             }
         }
@@ -1173,10 +1171,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void DestroyGuestImage(GuestImageResource resource)
         {
-            if (resource.FromSnapshotPool && resource.Image.Handle != 0 && ReturnFlipSnapshot(resource))
+            if (TryPoolFlipSnapshot(resource))
             {
-                resource.Image = default;
-                resource.Memory = default;
                 return;
             }
 

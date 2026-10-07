@@ -114,6 +114,31 @@ public sealed unsafe class SharedBackingTransferTests
         Assert.Equal(Marker, *(ulong*)(mapping.Address + Segment));
     }
 
+    [Fact]
+    public void AResolvedAliasReadsTheViewBytesUntilTheMappingChanges()
+    {
+        if (!Supported) return;
+        using var mapping = new TransferMappings();
+        Assert.True(mapping.Store.TryWriteBacking(mapping.Address + Segment + 8, BitConverter.GetBytes(Marker)));
+        var snapshot = mapping.Store.AliasSnapshot;
+        Assert.True(mapping.Store.TryEnterAliasAccess());
+        try
+        {
+            Assert.True(mapping.Store.TryResolveAlias(mapping.Address + Segment, 16, out var alias));
+            Assert.Equal(Marker, *(ulong*)(alias + 8));
+            Assert.Same(snapshot, mapping.Store.AliasSnapshot);
+            Assert.False(mapping.Store.TryResolveAlias(mapping.Address + Segment - 8, 16, out _));
+        }
+        finally
+        {
+            mapping.Store.ExitAliasAccess();
+        }
+
+        Assert.True(mapping.Store.Unmap(mapping.Address + Segment, Segment, out _));
+        Assert.NotSame(snapshot, mapping.Store.AliasSnapshot);
+        Assert.False(mapping.Store.TryResolveAlias(mapping.Address + Segment, 16, out _));
+    }
+
     private sealed class TransferMappings : IDisposable
     {
         public IHostViewMemory Host { get; } = HostViewMemory.Create();

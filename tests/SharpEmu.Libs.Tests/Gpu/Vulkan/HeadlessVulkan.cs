@@ -43,13 +43,14 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     // Dynamic rendering support required by the presenter's render host.
     public bool SupportsDynamicRendering { get; }
     public bool SupportsFragmentShaderBarycentric { get; private init; }
+    public bool SupportsFillRectangle { get; private init; }
 
     private static readonly string[] RenderingExtensionNames =
     [
         "VK_KHR_push_descriptor",
     ];
 
-    // The push descriptor limit of the device; the render host pushes sets that fit it.
+    // The push descriptor limit the render host may use on this device (none on MoltenVK).
     public uint MaxPushDescriptors
     {
         get
@@ -57,7 +58,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             var pushDescriptors = new PhysicalDevicePushDescriptorPropertiesKHR { SType = StructureType.PhysicalDevicePushDescriptorPropertiesKhr };
             var properties = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &pushDescriptors };
             Vk.GetPhysicalDeviceProperties2(Physical, &properties);
-            return pushDescriptors.MaxPushDescriptors;
+            return SharpEmu.Libs.Gpu.Vulkan.VulkanPushDescriptorPolicy.UsableCount(Vk, Physical, pushDescriptors.MaxPushDescriptors);
         }
     }
 
@@ -338,6 +339,9 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SamplerAnisotropy = baseFeatures.SamplerAnisotropy,
             ShaderStorageImageExtendedFormats = baseFeatures.ShaderStorageImageExtendedFormats,
             ShaderInt64 = baseFeatures.ShaderInt64,
+            ShaderClipDistance = baseFeatures.ShaderClipDistance,
+            ShaderCullDistance = baseFeatures.ShaderCullDistance,
+            RobustBufferAccess = baseFeatures.RobustBufferAccess,
         };
         var priority = 1f;
         var queueInfo = new DeviceQueueCreateInfo
@@ -381,6 +385,9 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         var extensionNames = new List<string>();
         if (dynamicRendering) extensionNames.AddRange(RenderingExtensionNames);
         if (barycentric) extensionNames.Add(barycentricExtension);
+        const string fillRectangleExtension = "VK_NV_fill_rectangle";
+        var fillRectangle = HasDeviceExtensions(vk, physical, [fillRectangleExtension]);
+        if (fillRectangle) extensionNames.Add(fillRectangleExtension);
         var deviceExtensions = extensionNames.Count > 0 ? SilkMarshal.StringArrayToPtr(extensionNames.ToArray()) : 0;
         var deviceInfo = new DeviceCreateInfo
         {
@@ -409,6 +416,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         {
             SupportsFragmentShaderBarycentric = barycentric,
             ExactFloat16Conversions = exactFloat16,
+            SupportsFillRectangle = fillRectangle,
         };
         if (validation)
         {

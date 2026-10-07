@@ -85,6 +85,7 @@ public sealed class ShaderCompileRequest
         ReadsShaderBase = BindingLayout.ReadsShaderBase(Program);
 
         FlattenedSlotByMemoryIndex = new Dictionary<int, uint>(plan.FlattenedSlotByMemoryIndex);
+        FlattenedTableReservedWords = (uint)plan.FlattenedTableReservedCount;
         IndirectKeyMemoryIndices = plan.IndirectImages.Select(access => access.Key.MemoryIndex).ToHashSet();
         IndirectOffsetKeyMemoryIndices = plan.IndirectImages.Where(access => access.KeyIsAddressOffset)
             .Select(access => access.Key.MemoryIndex).ToHashSet();
@@ -141,6 +142,10 @@ public sealed class ShaderCompileRequest
 
     // Host-flattened scalar reads: memory index → flattened table slot.
     public IReadOnlyDictionary<int, uint> FlattenedSlotByMemoryIndex { get; }
+
+    // The materialized flattened table always holds at least this many words (the planned table
+    // reads and written ranges), so a constant slot below it needs no bounds check.
+    public uint FlattenedTableReservedWords { get; }
 
     // Scalar reads whose loaded dword selects an indirect image at a later instruction.
     public IReadOnlySet<int> IndirectKeyMemoryIndices { get; }
@@ -208,10 +213,12 @@ public sealed class ShaderCompileRequest
     public bool SupportsClipDistance { get; init; } = true;
     public ShaderClipSpaceTransform ClipSpace { get; init; }
 
+    // The LDS the dispatch allocates (COMPUTE_PGM_RSRC2.LDS_SIZE), 0 when unknown.
+    public uint LocalDataShareDwords { get; init; }
+
     public uint LocalSizeX { get; init; } = 1;
     public uint LocalSizeY { get; init; } = 1;
     public uint LocalSizeZ { get; init; } = 1;
-    public uint LocalDataShareDwords { get; init; }
 
     // Fixed bounds for standalone modules; runtime-limit layouts read the dispatch data.
     public uint ThreadCountX { get; init; } = UnboundedThreadCount;

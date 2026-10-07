@@ -34,6 +34,7 @@ public sealed class TrackedRegion
         _readable.Fill();
         _summary?.Set(BaseAddress / BlockBytes, dirty: true);
         _summary?.MarkPending(BaseAddress / BlockBytes);
+        _summary?.NoteDirtied();
     }
 
     public RegionLock Lock { get; } = new();
@@ -236,9 +237,10 @@ public sealed class TrackedRegion
     private void UpdateCpuProtection(bool track)
     {
         _summary?.Set(BaseAddress / BlockBytes, _cpuDirty.Any);
-        if ((_cpuDirty & ~_writable).Any)
+        if (_summary is not null && (_cpuDirty & ~_writable).Any)
         {
-            _summary?.MarkPending(BaseAddress / BlockBytes);
+            _summary.MarkPending(BaseAddress / BlockBytes);
+            _summary.NoteDirtied();
         }
 
         var mask = _cpuDirty ^ _writable;

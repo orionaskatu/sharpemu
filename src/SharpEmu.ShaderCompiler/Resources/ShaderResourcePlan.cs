@@ -42,13 +42,49 @@ public sealed class ShaderResourcePlan
     public bool RequiresSpecializationMemory { get; private set; }
     public ShaderResourceInfo Info { get; private set; } = new();
 
+    internal RawReadPrefetchPlan? RawReadPrefetch { get; set; }
+    private readonly object _compileGate = new();
+    private CompiledResourceEvaluator? _compiledEvaluator;
+    private int _compiledEvaluatorState;
+
+    internal CompiledResourceEvaluator? CompiledEvaluator
+    {
+        get
+        {
+            if (Volatile.Read(ref _compiledEvaluatorState) == 2) return _compiledEvaluator;
+            if (Interlocked.CompareExchange(ref _compiledEvaluatorState, 1, 0) == 0) CompiledResourceEvaluator.Enqueue(this);
+            return null;
+        }
+    }
+
+    internal CompiledResourceEvaluator? CompileEvaluatorNow()
+    {
+        lock (_compileGate)
+        {
+            if (Volatile.Read(ref _compiledEvaluatorState) == 2) return _compiledEvaluator;
+            CompiledResourceEvaluator? compiled;
+            try
+            {
+                compiled = CompiledResourceEvaluator.Build(this);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                compiled = null;
+            }
+
+            _compiledEvaluator = compiled;
+            Volatile.Write(ref _compiledEvaluatorState, 2);
+            return compiled;
+        }
+    }
+
     // The handles each memory access reads, after flattened reads were replaced.
     public MemoryAccessBinding?[] Accesses { get; private set; } = [];
 
     public static ShaderResourcePlan Extract(Gen5ShaderProgram program, ShaderStage stage, ulong hash, uint userDataBase, uint userDataCount,
         IReadOnlySet<uint>? fixedFunctionVertexLoads = null, Action<ShaderResourcePlan>? beforeResourceTracking = null, uint waveSize = 64)
     {
-        var graph = ScalarValueGraph.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
+        var graph = ScalarGraphDiskCache.Build(program, userDataBase, userDataCount, fixedFunctionVertexLoads, waveSize);
         var plan = new ShaderResourcePlan(graph, stage, hash);
         var reads = ResourceTableReadPlanner.Plan(graph, stage, hash);
         var memo = new Dictionary<ScalarValue, ScalarValue>();

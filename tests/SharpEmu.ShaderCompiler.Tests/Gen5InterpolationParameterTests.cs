@@ -114,6 +114,23 @@ public sealed class Gen5InterpolationParameterTests
     }
 
     [Fact]
+    public void PixelSystemInputs_ReadTheirBuiltIns()
+    {
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(
+            Request(0, false, inputs: 0xF002, opcode: "VInterpP2F32"), out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var builtIns = instructions
+            .Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+                instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn)
+            .Select(instruction => instruction.Operands[2]).ToArray();
+        Assert.Contains((uint)SpirvBuiltIn.FrontFacing, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.Layer, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.SampleMask, builtIns);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.ShiftLeftLogical);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
     public void SlotsReadingOneParameter_ShareOneInput()
     {
         // PS slots 1 and 2 both read VS parameter 1; the second slot must not move to a
@@ -173,6 +190,67 @@ public sealed class Gen5InterpolationParameterTests
             instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn && instruction.Operands[2] == (uint)SpirvBuiltIn.BaryCoordKhr);
         Assert.Equal(4, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
             instruction.Operands[2] == input));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(0x800u, 1)]
+    [InlineData(0x400u, 0)]
+    public void PositionW_IsTheReciprocalOfTheFragmentCoordinate(uint inputs, int reciprocals)
+    {
+        var program = ResourceTestProgram.Program(ResourceTestProgram.EndProgram(0));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { PixelInputAddress = inputs, PixelInputEnable = inputs };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var position = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn && instruction.Operands[2] == (uint)SpirvBuiltIn.FragCoord).Operands[0];
+        var loaded = instructions.Where(instruction => instruction.Opcode == SpirvOp.Load && instruction.Operands[2] == position)
+            .Select(instruction => instruction.Operands[1]).ToHashSet();
+        var w = instructions.Where(instruction => instruction.Opcode == SpirvOp.CompositeExtract &&
+            loaded.Contains(instruction.Operands[2]) && instruction.Operands[3] == 3).Select(instruction => instruction.Operands[1]).ToHashSet();
+        Assert.Equal(reciprocals, instructions.Count(instruction => instruction.Opcode == SpirvOp.FDiv && w.Contains(instruction.Operands[3])));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(ShaderStage.Pixel, 32u)]
+    [InlineData(ShaderStage.Pixel, 64u)]
+    [InlineData(ShaderStage.Vertex, 32u)]
+    [InlineData(ShaderStage.Vertex, 64u)]
+    public void LaneSpills_AreReadBackWithoutTheHostSubgroup(ShaderStage stage, uint waveSize)
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.WriteLane(0, vectorRegister: 18, scalarRegister: 84, lane: 5),
+            ResourceTestProgram.WriteLane(8, vectorRegister: 18, scalarRegister: 85, lane: 37),
+            ResourceTestProgram.ReadLane(16, scalarRegister: 86, vectorRegister: 18, lane: 5),
+            ResourceTestProgram.ReadLane(24, scalarRegister: 87, vectorRegister: 18, lane: 37),
+            ResourceTestProgram.EndProgram(32));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, stage, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = waveSize, EnableGraphicsSubgroupOperations = true };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.DoesNotContain(Instructions(shader.Spirv), instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+        var text = System.Text.Encoding.ASCII.GetString(shader.Spirv);
+        Assert.Contains("v18_lane5", text, StringComparison.Ordinal);
+        Assert.Contains("v18_lane37", text, StringComparison.Ordinal);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(ShaderStage.Pixel, 0)]
+    [InlineData(ShaderStage.Vertex, 0)]
+    [InlineData(ShaderStage.Compute, 2)]
+    public void ReadlaneOfAnUnspilledLane_UsesTheHostSubgroupOnlyInCompute(ShaderStage stage, int broadcasts)
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.WriteLane(0, vectorRegister: 18, scalarRegister: 84, lane: 5),
+            ResourceTestProgram.ReadLane(8, scalarRegister: 86, vectorRegister: 18, lane: 6),
+            ResourceTestProgram.ReadLane(16, scalarRegister: 87, vectorRegister: 19, lane: 5),
+            ResourceTestProgram.EndProgram(24));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, stage, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = 32, EnableGraphicsSubgroupOperations = true };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.Equal(broadcasts, Instructions(shader.Spirv).Count(instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast));
         ValidateWhenAvailable(shader.Spirv);
     }
 

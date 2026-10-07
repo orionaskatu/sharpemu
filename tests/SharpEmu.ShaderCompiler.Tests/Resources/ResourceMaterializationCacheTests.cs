@@ -145,6 +145,27 @@ public sealed class ResourceMaterializationCacheTests
     }
 
     [Fact]
+    public void AlternatingDescriptorsReuseEveryRecentVariant()
+    {
+        var plan = Plan();
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        var word = HeapBase + 0x100 + 5 * 32;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var first, out _));
+        heap.Words[word] = 0x3000;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var second, out _));
+        Assert.Equal((0, 2), (cache.Hits, cache.Misses));
+
+        heap.Words[word] = 0x1000;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var firstAgain, out _));
+        heap.Words[word] = 0x3000;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var secondAgain, out _));
+        Assert.Same(first, firstAgain);
+        Assert.Same(second, secondAgain);
+        Assert.Equal((2, 2), (cache.Hits, cache.Misses));
+    }
+
+    [Fact]
     public void AChangedMaskMaterializesAgain()
     {
         var plan = Plan();
@@ -194,6 +215,29 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(ok, Run(cache, plan, heap, [0x1000, 0], out _, out _));
         Assert.True(heap.Reads > reads);
         Assert.Equal(0, cache.Hits);
+    }
+
+    [Fact]
+    public void AFailedRecordingDoesNotPoisonTheNextReader()
+    {
+        var plan = Plan();
+        var incomplete = new Heap();
+        incomplete.Words.Remove(HeapBase + 0x100 + 5 * 32 + 4);
+        var cache = new ResourceMaterializationCache();
+        Run(cache, plan, incomplete, [0x1000, 0], out _, out _);
+
+        var complete = new Heap();
+        Assert.True(Run(cache, plan, complete, [0x1000, 0], out var first, out _));
+        Assert.True(Run(cache, plan, complete, [0x1000, 0], out var second, out _));
+        Assert.Same(first, second);
+        Assert.Equal(1, cache.Hits);
+
+        // Retained entries must not refer to scratch reads reused for another key.
+        complete.Words[HeapBase + 0x80] = 1u << 1;
+        Assert.True(Run(cache, plan, complete, [0x1000, 0], out _, out _, shaderBase: 0x100));
+        var original = new Heap();
+        Assert.True(Run(cache, plan, original, [0x1000, 0], out var restored, out _));
+        Assert.Same(first, restored);
     }
 
     // The table pointer in s[0:1]; the rest of the nine user-data registers the program declares.

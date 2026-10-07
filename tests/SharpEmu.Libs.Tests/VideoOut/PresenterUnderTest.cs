@@ -54,6 +54,7 @@ internal sealed class PresenterUnderTest : IDisposable
         SetField("_physicalDevice", vulkan.Physical);
         SetField("_device", vulkan.Device);
         SetField("_supportsFragmentShaderBarycentric", vulkan.SupportsFragmentShaderBarycentric);
+        SetField("_supportsFillRectangle", vulkan.SupportsFillRectangle);
         SetField("_deviceInfo", vulkan.DeviceInfo);
         SetField("_scheduler", Harness.Scheduler);
         SetField("_relay", Harness.Worker.Relay);
@@ -76,14 +77,19 @@ internal sealed class PresenterUnderTest : IDisposable
         {
             "_batchResources", "_batchRetireBuffers", "_pendingGuestSubmissions",
             "_deferredGuestImageVersionDestroys",
-            "_pipelineEntries", "_shaderModules",
+            "_pipelineEntries", "_shaderModules", "_shaderModuleSpirvBytes",
+            "_preparedTextures", "_barriersAfterRendering", "_feedbackSnapshotPool",
             "_runtimeDescriptorSets",
+            "_preparedImages", "_nullTextures", "_textureBindings", "_boundSets", "_setChanged",
         })
         {
             var field = PresenterType.GetField(name, InstanceMembers)!;
             field.SetValue(Instance, Activator.CreateInstance(field.FieldType, nonPublic: true));
         }
 
+        SetField("_shaderModuleCacheIdentities", new Dictionary<ulong, string>());
+        var cacheShards = PresenterType.GetField("_pipelineCacheShards", InstanceMembers)!;
+        cacheShards.SetValue(Instance, Activator.CreateInstance(cacheShards.FieldType, nonPublic: true));
         forwarder.Target = this;
     }
 
@@ -114,7 +120,8 @@ internal sealed class PresenterUnderTest : IDisposable
         }
         catch (TargetInvocationException exception) when (exception.InnerException is not null)
         {
-            throw exception.InnerException;
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
+            throw;
         }
     }
 

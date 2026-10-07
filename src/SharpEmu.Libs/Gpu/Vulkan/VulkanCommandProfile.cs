@@ -20,6 +20,8 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
     private long _reportStart = Stopwatch.GetTimestamp();
     private ulong _skippedMarkers;
     private ulong _unavailableBuffers;
+    internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1";
+    private readonly List<(ulong Start, ulong End)> _spans = new();
 
     internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow }
     private readonly record struct IntervalKey(IntervalKind Kind, ulong Pipeline);
@@ -94,6 +96,11 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
 
     public void WriteMarker(CommandBuffer command, IntervalKind kind, ulong pipeline = 0, uint first = 0, uint second = 0, uint third = 0)
     {
+        if (!PerCommandMarkers && kind != IntervalKind.Tail)
+        {
+            return;
+        }
+
         if (!_buffers.TryGetValue(command.Handle, out var queries))
         {
             _skippedMarkers++;
@@ -138,6 +145,12 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
             }
         }
 
+        var last = queries.Count - 1;
+        if (last > 0 && values[1] != 0 && values[last * 2 + 1] != 0)
+        {
+            _spans.Add((values[0], values[last * 2]));
+        }
+
         for (var index = 1; index < queries.Count; index++)
         {
             if (values[index * 2 + 1] == 0 || values[(index - 1) * 2 + 1] == 0)
@@ -162,8 +175,58 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
             Report();
     }
 
+    internal static (ulong Busy, ulong Longest) MergeSpans(List<(ulong Start, ulong End)> spans)
+    {
+        spans.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+        ulong busy = 0;
+        ulong longest = 0;
+        ulong runStart = 0;
+        ulong runEnd = 0;
+        var open = false;
+        foreach (var (start, end) in spans)
+        {
+            if (end < start)
+            {
+                continue;
+            }
+
+            longest = Math.Max(longest, end - start);
+            if (open && start <= runEnd)
+            {
+                runEnd = Math.Max(runEnd, end);
+                continue;
+            }
+
+            if (open)
+            {
+                busy += runEnd - runStart;
+            }
+
+            runStart = start;
+            runEnd = end;
+            open = true;
+        }
+
+        if (open)
+        {
+            busy += runEnd - runStart;
+        }
+
+        return (busy, longest);
+    }
+
     private void Report()
     {
+        var windowSeconds = Stopwatch.GetElapsedTime(_reportStart).TotalSeconds;
+        if (_spans.Count != 0 && windowSeconds > 0)
+        {
+            var (busy, longest) = MergeSpans(_spans);
+            var busyMilliseconds = busy * (double)_timestampPeriod / 1_000_000;
+            _write(FormattableString.Invariant(
+                $"[PERF][GPU_BUSY] window_s={windowSeconds:F1} submissions={_spans.Count} busy_ms={busyMilliseconds:F1} busy_pct={busyMilliseconds / (windowSeconds * 10):F1} longest_submission_ms={longest * (double)_timestampPeriod / 1_000_000:F2} per_draw_markers={PerCommandMarkers}"));
+        }
+
+        _spans.Clear();
         if (_totals.Count != 0 || _skippedMarkers != 0 || _unavailableBuffers != 0)
         {
             _write($"[PERF][GPU_INTERVAL] completed_ms={_totals.Values.Sum(total => total.Milliseconds):F3} intervals={_totals.Values.Sum(total => (long)total.Count)} skipped_markers={_skippedMarkers} unavailable_buffers={_unavailableBuffers}");

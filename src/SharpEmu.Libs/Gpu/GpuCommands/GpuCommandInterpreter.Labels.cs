@@ -118,6 +118,7 @@ public sealed partial class GpuCommandInterpreter
                                     break;
                                 case 0x14:
                                 case 0x28:
+                                case 0x2F:
                                     if (eventIndex == 0x00)
                                     {
                                         Write64(destination, value, withWriteBack: false, withInterrupt, eventId, interruptContextId);
@@ -127,7 +128,6 @@ public sealed partial class GpuCommandInterpreter
                                     break;
                                 case 0x2B:
                                 case 0x2D:
-                                case 0x2F:
                                 case 0x30:
                                     if (eventIndex == 0x00 && !withInterrupt)
                                     {

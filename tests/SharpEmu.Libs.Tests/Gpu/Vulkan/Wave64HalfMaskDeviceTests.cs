@@ -207,6 +207,32 @@ public sealed class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : I
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ASingleBlockLoop_GroupsBothWaveHalvesAndCanBeSkipped(bool skip)
+    {
+        if (!Ready()) return;
+        Lane();
+        Add(Vop2(0, "VAndB32", 3, Operand(3), Gen5Operand.Vector(2)));
+        Add(MoveVector(0, 4, 0));
+        Add(Sop1(0, "SMovB64", 20, Gen5Operand.Scalar(Exec)));
+        uint? bypass = skip ? Add(Branch(0, "SBranch", 0)) : null;
+        var header = Add(ReadFirstLane(0, 22, 3));
+        Add(Vopc(0, "VCmpxEqU32", Gen5Operand.Scalar(22), 3));
+        Add(Vop2(0, "VAddU32", 4, Operand(1), Gen5Operand.Vector(3)));
+        Add(Sop2(0, "SAndn2B64", 20, Gen5Operand.Scalar(20), Gen5Operand.Scalar(Exec)));
+        Add(Sop1(0, "SMovB64", Exec, Gen5Operand.Scalar(20)));
+        var back = Add(Branch(0, "SCbranchScc1", 0));
+        var done = Add(Sop1(0, "SMovB64", Exec, AllLanes));
+        Point(back, header);
+        if (bypass is { } branch) Point(branch, done);
+
+        var lanes = Run();
+        for (uint lane = 0; lane < 64; lane++)
+            Assert.Equal(skip ? 0u : (lane & 3) + 1, lanes[lane]);
+    }
+
+    [Theory]
     [InlineData(40u, 140u)]
     [InlineData(3u, 103u)]
     [InlineData(64u, 100u)]

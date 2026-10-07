@@ -127,4 +127,27 @@ public sealed class GuestRedZoneEnclosingSpanTests
         Assert.False(GuestRedZonePatcher.TryBuildEnclosingSpan(
             code, Base, Base + 2, out _, out _, out _, out _));
     }
+
+    [Fact]
+    public void BuildsASpanOverRegisterOnlyShaInstructions()
+    {
+        // sha256msg1 xmm1, xmm2 -> 4 bytes, no memory operand: the rewrite site
+        // sha256msg2 xmm1, xmm2 -> 4 bytes, taken to reach the 5-byte jump
+        // ret
+        byte[] code =
+        [
+            0x0F, 0x38, 0xCC, 0xCA,
+            0x0F, 0x38, 0xCD, 0xCA,
+            0xC3,
+        ];
+
+        // A span with no guest memory access has nothing to keep outside the RSP shift, so
+        // the whole span is the core. Refusing it left SHA instructions unrewritten.
+        Assert.True(GuestRedZonePatcher.TryBuildForwardSpan(
+            code, Base, Base, out var length, out var coreStart, out var coreCount));
+
+        Assert.Equal(8, length);
+        Assert.Equal(0, coreStart);
+        Assert.Equal(2, coreCount);
+    }
 }

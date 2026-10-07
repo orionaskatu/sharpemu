@@ -5,6 +5,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
+using SharpEmu.HLE.GpuMemory;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -23,6 +24,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	private const int PosixSigIll = 4;
 	private const int PosixSigTrap = 5;
 	private const int PosixSigAbort = 6;
+	private const int PosixSigFpe = 8;
 	private const int PosixSigSegv = 11;
 	private static readonly int PosixSigBus = OperatingSystem.IsMacOS() ? 10 : 7;
 
@@ -77,6 +79,7 @@ public sealed unsafe partial class DirectExecutionBackend
 
 	private static DirectExecutionBackend? _posixSignalBackend;
 	private static bool _posixSignalHandlersInstalled;
+	private static nint _posixSignalTrampoline;
 	private static bool _posixRawRecoveryEnabled;
 	private static bool _posixSignalWarmup;
 	private static readonly nint[] _posixPreviousActions = new nint[32];
@@ -104,6 +107,7 @@ public sealed unsafe partial class DirectExecutionBackend
 		_posixSignalBackend = this;
 		if (_posixSignalHandlersInstalled)
 		{
+			PublishSignalStackState();
 			return;
 		}
 
@@ -117,17 +121,20 @@ public sealed unsafe partial class DirectExecutionBackend
 		WarmUpPosixSignalPath();
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
 
+		_posixSignalTrampoline = CreatePosixSignalTrampoline();
+		PublishSignalStackState();
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
 			!InstallPosixSignalHandler(PosixSigIll) ||
 			!InstallPosixSignalHandler(PosixSigTrap) ||
-			!InstallPosixSignalHandler(PosixSigAbort))
+			!InstallPosixSignalHandler(PosixSigAbort) ||
+			!InstallPosixSignalHandler(PosixSigFpe))
 		{
 			throw new InvalidOperationException("Failed to install POSIX fault signal handlers");
 		}
 
 		_posixSignalHandlersInstalled = true;
-		Console.Error.WriteLine("[LOADER][INFO] POSIX signal exception bridge installed (SIGSEGV/SIGBUS/SIGILL)");
+		Console.Error.WriteLine("[LOADER][INFO] POSIX signal exception bridge installed (SIGSEGV/SIGBUS/SIGILL/SIGFPE)");
 	}
 
 	/// <summary>
@@ -191,7 +198,7 @@ public sealed unsafe partial class DirectExecutionBackend
 	{
 		byte* action = stackalloc byte[PosixSigactionSize];
 		new Span<byte>(action, PosixSigactionSize).Clear();
-		*(nint*)action = (nint)(delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal;
+		*(nint*)action = _posixSignalTrampoline;
 		// No SA_ONSTACK: the runtime's alternate stacks are far too small for
 		// the recovery/diagnostic path (JIT compilation of cold handler code
 		// can run inside the signal frame). Guest faults deliver onto the 2MB
@@ -238,9 +245,21 @@ public sealed unsafe partial class DirectExecutionBackend
 			// address (safe for host and guest threads alike) and must resume
 			// the faulting write immediately after restoring write access.
 			if (signal != PosixSigIll &&
+				signal != PosixSigFpe &&
 				siginfo != 0 &&
 				SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
 					*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset)))
+			{
+				return;
+			}
+
+			// GPU-tracked pages fault on every first CPU access after the GPU or an upload used them,
+			// thousands of times a second in a frame. Resolving them needs only the address and the
+			// access kind, so they skip the Win64 context conversion and the other handlers.
+			if (PosixGpuFaultFastPath && !_posixSignalWarmup &&
+				(signal == PosixSigSegv || signal == PosixSigBus) &&
+				siginfo != 0 &&
+				TryResolvePosixGpuFault(siginfo, ucontext))
 			{
 				return;
 			}
@@ -260,6 +279,28 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 
 		ChainPreviousPosixAction(signal, siginfo, ucontext);
+	}
+
+	private static readonly bool PosixGpuFaultFastPath =
+		Environment.GetEnvironmentVariable("SHARPEMU_POSIX_GPU_FAULT_FAST_PATH") != "0";
+
+	private static bool TryResolvePosixGpuFault(nint siginfo, nint ucontext)
+	{
+		byte* registers = GetPosixRegisterBase(ucontext);
+		if (registers == null)
+		{
+			return false;
+		}
+
+		ulong faultAddress = GetPosixFaultAddress(siginfo, registers);
+		ulong rip = *(ulong*)(registers + PosixRegisterOffsets[16]);
+		var kind = GetPosixAccessType(registers, faultAddress, rip) switch
+		{
+			0 => FaultKind.Read,
+			1 => FaultKind.Write,
+			_ => FaultKind.Unknown,
+		};
+		return kind != FaultKind.Unknown && GuestGpuMemoryHook.TryResolveFault(kind, faultAddress);
 	}
 
 	private static bool TryHandlePosixFault(int signal, nint siginfo, nint ucontext)
@@ -304,6 +345,11 @@ public sealed unsafe partial class DirectExecutionBackend
 		else if (signal == PosixSigAbort)
 		{
 			record.ExceptionCode = 1073741845u;
+		}
+		else if (signal == PosixSigFpe)
+		{
+			// STATUS_INTEGER_DIVIDE_BY_ZERO: #DE from div/idiv (zero divisor or quotient overflow).
+			record.ExceptionCode = 3221225620u;
 		}
 		else
 		{

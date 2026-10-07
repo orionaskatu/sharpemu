@@ -12,6 +12,18 @@ namespace SharpEmu.Libs.Tests.AvPlayer;
 public sealed class AvPlayerAbiTests
 {
     [Theory]
+    [InlineData(true, 0x1000UL, true)]
+    [InlineData(false, 0UL, true)]
+    [InlineData(true, 0UL, true)]
+    [InlineData(false, 0x1000UL, false)]
+    public void APlayerWithoutAnEventCallbackStartsOnItsOwn(bool autoStartRequested, ulong eventCallback, bool expected)
+    {
+        // Only a title that registers an event callback can see the ready state and call Start;
+        // without one the player plays by itself, ends, and reports inactive.
+        Assert.Equal(expected, AvPlayerExports.StartsAutomatically(autoStartRequested, eventCallback));
+    }
+
+    [Theory]
     [InlineData(Generation.Gen4, false, 108UL)]
     [InlineData(Generation.Gen5, false, 108UL)]
     [InlineData(Generation.Gen4, true, 164UL)]

@@ -134,7 +134,7 @@ public sealed partial class DirectExecutionBackend
 			try
 			{
 				var state = _activeGuestThreadState;
-				if (state is { Name: "tbb_thead" })
+				if (LogThreadMode && state is { Name: "tbb_thead" })
 				{
 					var n = Interlocked.Increment(ref _tbbNativeRunEnterCount);
 					if (n <= 12 || n % 64 == 0)
@@ -750,6 +750,7 @@ public sealed partial class DirectExecutionBackend
 			_activeGuestThreadYieldReason = null;
 			_activeGuestThreadState = _runState;
 			backend.BindTlsBase(_runContext!);
+			RouteGuestAccessFaultsToSignals();
 			TlsSetValue(backend._hostRspSlotTlsIndex, _runHostRspSlot);
 			if (backend._workerDoneEventTlsIndex != uint.MaxValue)
 			{

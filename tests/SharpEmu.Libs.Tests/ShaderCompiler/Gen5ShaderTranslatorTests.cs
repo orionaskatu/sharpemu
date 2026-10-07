@@ -272,6 +272,42 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal(
             [0u, 4u, 0x100u, 0x104u],
             program.Instructions.Select(static instruction => instruction.Pc));
+        Assert.All(program.Instructions, static instruction => Assert.Null(instruction.AddressOffset));
+    }
+
+    private sealed class TwoRegionMemory(FakeCpuMemory first, FakeCpuMemory second) : ICpuMemory
+    {
+        public bool TryRead(ulong virtualAddress, Span<byte> destination) =>
+            first.TryRead(virtualAddress, destination) || second.TryRead(virtualAddress, destination);
+
+        public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source) =>
+            first.TryWrite(virtualAddress, source) || second.TryWrite(virtualAddress, source);
+    }
+
+    [Theory]
+    [InlineData(0x1_8000_0000L)]
+    [InlineData(-0x1000L)]
+    public void FusedProgramKeepsAFarContinuationsAddressForGetPc(long distance)
+    {
+        var continuationAddress = unchecked(ProgramAddress + (ulong)distance);
+        const ulong entryHeaderAddress = ProgramAddress + 0x400;
+        var continuationHeaderAddress = continuationAddress + 0x400;
+        var entry = new FakeCpuMemory(ProgramAddress, 0x800);
+        var continuation = new FakeCpuMemory(continuationAddress, 0x800);
+        WriteWords(entry, ProgramAddress, 0xBF800000u, 0xBE802000u);
+        WriteWords(continuation, continuationAddress, 0xBE801F00u, 0xBF810000u);
+        WriteUInt32(entry, entryHeaderAddress + 0x44, 2 * sizeof(uint));
+        WriteUInt32(continuation, continuationHeaderAddress + 0x44, 2 * sizeof(uint));
+
+        var context = new CpuContext(new TwoRegionMemory(entry, continuation), Generation.Gen5);
+        Gen5ShaderTranslator.RegisterFusedProgram(context, ProgramAddress, entryHeaderAddress, continuationAddress, continuationHeaderAddress);
+
+        Assert.True(Gen5ShaderTranslator.TryDecodeProgram(context, ProgramAddress, out var program, out var error), error);
+        Assert.Equal(["SNop", "SNop", "SGetpcB64", "SEndpgm"], program.Instructions.Select(static instruction => instruction.Opcode));
+        Assert.Equal([0u, 4u, 0x100u, 0x104u], program.Instructions.Select(static instruction => instruction.Pc));
+        Assert.Equal((ulong)distance, program.Instructions[2].ProgramOffset);
+        Assert.Equal(unchecked((ulong)distance + 4), program.Instructions[3].ProgramOffset);
+        Assert.Equal(continuationAddress, unchecked(program.Address + program.Instructions[2].ProgramOffset));
     }
 
     [Fact]

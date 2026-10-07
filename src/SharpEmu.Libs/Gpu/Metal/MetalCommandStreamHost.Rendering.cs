@@ -1192,4 +1192,16 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
         _ = (address, size, fillValue);
         return false;
     }
+
+    bool IRenderHost.TryFillDccMetadata(ulong address, ulong size, uint fillValue)
+    {
+        _ = (address, size, fillValue);
+        return false;
+    }
+
+    bool IRenderHost.TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
+    {
+        _ = (destination, source, sourceWords, words);
+        return false;
+    }
 }

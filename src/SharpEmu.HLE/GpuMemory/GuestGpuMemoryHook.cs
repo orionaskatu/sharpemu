@@ -121,6 +121,9 @@ public static class GuestGpuMemoryHook
     public static bool NoteProtected(ulong address, ulong size, GuestPageProtection protection) =>
         _current != null && IsWithinGpuAddressSpace(address, size) && _current.NoteProtected(address, size, protection);
 
+    public static bool OverlapsRegistered(ulong address, ulong size) =>
+        _current != null && IsWithinGpuAddressSpace(address, size) && _current.OverlapsRegistered(address, size);
+
     public static void NoteUnmapped(ulong address, ulong size)
     {
         if (_current == null || !IsWithinGpuAddressSpace(address, size))

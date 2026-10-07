@@ -131,8 +131,37 @@ public sealed unsafe partial class CachedImage
             return;
         }
 
+        // Attachment accesses inside one rendering scope are already ordered by rasterization
+        // order, so a barrier that only repeats an attachment write in the same layout matters
+        // only to what runs after the scope; it waits for the scope to end instead of ending it.
+        if (OnlyRepeatsAttachmentAccess(barriers) &&
+            _scheduler.TryDeferUntilRenderingEnds(sourceStages == 0 ? PipelineStageFlags.TopOfPipeBit : sourceStages, stage, barriers))
+        {
+            return;
+        }
+
         _scheduler.EndRendering();
         RecordBarriers(command, sourceStages, stage, null, barriers);
+    }
+
+    private const AccessFlags2 AttachmentAccess =
+        AccessFlags2.ColorAttachmentReadBit | AccessFlags2.ColorAttachmentWriteBit |
+        AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit;
+
+    private static bool OnlyRepeatsAttachmentAccess(List<ImageMemoryBarrier2> barriers)
+    {
+        foreach (var barrier in barriers)
+        {
+            if (barrier.OldLayout != barrier.NewLayout ||
+                barrier.SrcAccessMask == 0 ||
+                (barrier.SrcAccessMask & ~AttachmentAccess) != 0 ||
+                (barrier.DstAccessMask & ~AttachmentAccess) != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void RecordBarriers(CommandBuffer command, PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, BufferMemoryBarrier2* bufferBarrier, List<ImageMemoryBarrier2> imageBarriers)
@@ -603,5 +632,31 @@ public sealed unsafe partial class CachedImage
         source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
         _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, copyCount, copies);
         Transition(ReadyLayout, ReadyAccess, null, command);
+    }
+
+    // Copies a rectangle of the source's first mip into one mip of this image, at its origin.
+    public void CopyRegionFrom(CachedImage source, uint sourceX, uint sourceY, uint mip, uint width, uint height)
+    {
+        if (mip >= Backing.MipLevels || sourceX + width > source.Backing.Extent.Width || sourceY + height > source.Backing.Extent.Height)
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The region copy is out of range: mip={mip} levels={Backing.MipLevels} region={sourceX},{sourceY} {width}x{height} " +
+                $"source={source.Backing.Extent.Width}x{source.Backing.Extent.Height}.");
+        }
+
+        _scheduler.EndRendering();
+        var copy = new ImageCopy
+        {
+            SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+            SrcOffset = new Offset3D((int)sourceX, (int)sourceY, 0),
+            DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, mip, 0, 1),
+            Extent = new Extent3D(width, height, 1),
+        };
+        var command = new CommandBuffer(_scheduler.Current.Handle);
+        Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
+        source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
+        _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &copy);
+        Transition(ReadyLayout, ReadyAccess, null, command);
+        source.Transition(ReadyLayout, ReadyAccess, null, command);
     }
 }

@@ -377,7 +377,12 @@ public sealed record Gen5ShaderInstruction(
     IReadOnlyList<uint> Words,
     IReadOnlyList<Gen5Operand> Sources,
     IReadOnlyList<Gen5Operand> Destinations,
-    Gen5InstructionControl? Control);
+    Gen5InstructionControl? Control)
+{
+    public ulong? AddressOffset { get; init; }
+
+    public ulong ProgramOffset => AddressOffset ?? Pc;
+}
 
 public sealed record Gen5ShaderProgram(
     ulong Address,

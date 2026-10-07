@@ -18,6 +18,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private const uint MaxPageFaults = 1024;
     private const ulong PageFaultAreaSize = MaxPageFaults * sizeof(ulong);
 
+    private static long _reportedFaults;
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
     private readonly GuestBufferCache _cache;
@@ -325,6 +326,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(faults[index], _pageSize))
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(faults[index], _pageSize,
                         $"device-address-fault scan_tick={scanTick} callback_tick={_scheduler.CurrentTick} registered={_cache.IsRegionRegistered(faults[index], _pageSize)} reported_count={(uint)faults[0]} retained_count={count}");
+                var reported = Interlocked.Increment(ref _reportedFaults);
+                if (reported <= 16 || (reported & (reported - 1)) == 0)
+                {
+                    Console.Error.WriteLine($"[GPU][INFO] Accessed non-GPU cached memory at 0x{faults[index]:X16} count={reported}");
+                }
             }
 
             _faultRanges.ForEach((start, size) =>

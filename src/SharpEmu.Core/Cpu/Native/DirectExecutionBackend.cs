@@ -613,9 +613,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private Action? _work;
 		private volatile bool _stopping;
 
+		// Every guest call that blocks in an HLE import resumes through a managed
+		// continuation frame, so a guest thread that blocks deep inside its own call
+		// tree nests host frames rather than unwinding. Demon's Souls' render thread
+		// overflowed the default thread stack within a minute of reaching its main
+		// loop; the reservation is virtual, so a generous stack costs nothing until
+		// it is touched.
+		private const int GuestExecutionStackBytes = 64 * 1024 * 1024;
+
 		public GuestExecutionRunner(ulong guestThreadHandle, string name, ThreadPriority priority)
 		{
-			_thread = new Thread(() => ThreadMain(guestThreadHandle))
+			_thread = new Thread(() => ThreadMain(guestThreadHandle), GuestExecutionStackBytes)
 			{
 				IsBackground = true,
 				Name = $"SharpEmu-{name}",
@@ -1232,6 +1240,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_patchedEa020eLookupCall = false;
 		MarkExecutionProgress();
 		BindTlsBase(context);
+		RouteGuestAccessFaultsToSignals();
 		var previousGuestThreadScheduler = GuestThreadExecution.Scheduler;
 		GuestThreadExecution.Scheduler = this;
 		try
@@ -1280,6 +1289,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		Console.Error.WriteLine($"[LOADER][INFO] Setting up {importStubs.Count} import stubs...");
 		ClearImportHandlerTrampolines();
+		ConfigureGuestFastPath();
 		_importEntries = new ImportStubEntry[importStubs.Count];
 		HashSet<ulong> hashSet = new HashSet<ulong>(importStubs.Keys);
 		int num = 0;
@@ -1346,6 +1356,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				LastError = "Failed to create import trampoline for NID " + text2;
 				return false;
 			}
+			if (TryCreateGuestFastPathStub(text2, num5, out var fastPathStub))
+			{
+				num5 = fastPathStub;
+			}
 			if (_logAllImports)
 			{
 				Console.Error.WriteLine($"[LOADER][DEBUG] SetupImportStubs: Trampoline for {text2} -> 0x{num5:X16}");
@@ -1358,7 +1372,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			num2++;
 			num++;
 		}
-		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3})");
+		Console.Error.WriteLine($"[LOADER][INFO] Setup {num2}/{importStubs.Count} import stubs (direct bridge, lle_redirects={num3}, fast_path_stubs={_guestFastPathStubCount})");
 		return num2 == importStubs.Count;
 	}
 
@@ -1442,6 +1456,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 				var importIndex = currentEntries.Length + i;
 				var trampoline = CreateImportHandlerTrampoline(importIndex);
+				if (trampoline != 0 &&
+					TryCreateGuestFastPathStub(nid, trampoline, out var runtimeFastPathStub))
+				{
+					trampoline = runtimeFastPathStub;
+				}
 				if (trampoline == 0 || !PatchImportStub((nint)(long)address, trampoline))
 				{
 					error = $"failed to install runtime import trampoline at 0x{address:X16}";
@@ -2279,12 +2298,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 
 			Emit(0x49); Emit(0x89); Emit(0xC3); // mov r11, rax
-			// Fiber switches replace the guest stack without passing through a
-			// guest-entry stub, so keep the Windows TEB bounds in sync here.
-			EmitLoadFromR11Disp32(10, 160);     // r10 = target stack top
-			EmitStackBound(code, ref offset, 10, 8, store: true);
-			EmitLoadFromR11Disp32(10, 168);     // r10 = target stack bottom
-			EmitStackBound(code, ref offset, 10, 16, store: true);
+			EmitFiberStackBounds(code, ref offset);
 			// A new >=3.50 fiber receives the SDK-defined MXCSR verbatim. A
 			// resumed fiber follows _sceFiberLongJmp: preserve status bits 0-5
 			// while restoring the saved control bits.
@@ -2347,7 +2361,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// A trampoline only encodes its import index, so a runtime module load that sets up every
+	// module's stubs again reuses them: the stubs then keep their bytes and are not rewritten
+	// under guest threads that may be executing them.
+	private readonly Dictionary<int, nint> _importHandlerTrampolineByIndex = new();
+
 	private unsafe nint CreateImportHandlerTrampoline(int importIndex)
+	{
+		lock (ImportStubPatchGate)
+		{
+			if (_importHandlerTrampolineByIndex.TryGetValue(importIndex, out var existing))
+			{
+				return existing;
+			}
+
+			var created = CreateImportHandlerTrampolineCore(importIndex);
+			if (created != 0)
+			{
+				_importHandlerTrampolineByIndex[importIndex] = created;
+			}
+
+			return created;
+		}
+	}
+
+	private unsafe nint CreateImportHandlerTrampolineCore(int importIndex)
 	{
 		const uint stubSize = 1024u;
 		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
@@ -2523,8 +2561,35 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// Patches unprotect and re-protect whole pages: two threads patching code that shares a page
+	// (runtime module loads, lazy TLS site patches on guest threads) would restore the other's page
+	// to read-execute while it is still writing, so every patch runs under one gate.
+	private static readonly object ImportStubPatchGate = new();
+
 	private unsafe bool PatchImportStub(nint address, nint trampoline)
 	{
+		lock (ImportStubPatchGate)
+		{
+			return PatchImportStubLocked(address, trampoline);
+		}
+	}
+
+	private unsafe bool PatchImportStubLocked(nint address, nint trampoline)
+	{
+		// Every runtime module load sets up the stubs of all loaded modules again; a stub that
+		// already jumps to this trampoline needs no unprotect/write/restore cycle.
+		Span<byte> patch = stackalloc byte[16];
+		patch[0] = 0x48;
+		patch[1] = 0xB8;
+		System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(patch[2..], trampoline);
+		patch[10] = 0xFF;
+		patch[11] = 0xE0;
+		patch[12..].Fill(0x90);
+		if (new ReadOnlySpan<byte>((void*)address, 16).SequenceEqual(patch))
+		{
+			return true;
+		}
+
 		uint flNewProtect = default(uint);
 		if (!VirtualProtect((void*)address, 16u, 64u, &flNewProtect))
 		{
@@ -2561,6 +2626,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		_importHandlerTrampolines.Clear();
+		_importHandlerTrampolineByIndex.Clear();
 	}
 
 	private unsafe void CreateTlsHandler()
@@ -3714,6 +3780,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static unsafe bool WriteTlsInstruction(nint address, ReadOnlySpan<byte> replacement)
 	{
+		// Guest threads patch their TLS sites as they first reach them; two sites on one page would
+		// otherwise race the unprotect/restore pair exactly like the import stubs.
+		lock (ImportStubPatchGate)
+		{
+			return WriteTlsInstructionLocked(address, replacement);
+		}
+	}
+
+	private static unsafe bool WriteTlsInstructionLocked(nint address, ReadOnlySpan<byte> replacement)
+	{
 		if (replacement.Length is < 1 or > 15 ||
 			VirtualQuery((void*)address, out var information, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
 			information.RegionSize > ulong.MaxValue - information.BaseAddress)
@@ -3901,6 +3977,33 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	}
 
 	public bool SupportsGuestContextTransfer => true;
+
+	public bool TryGetGuestThreadStackBounds(
+		ulong threadHandle,
+		out ulong stackBase,
+		out ulong stackSize)
+	{
+		stackBase = 0;
+		stackSize = 0;
+		if (threadHandle == 0)
+		{
+			return false;
+		}
+
+		lock (_guestThreadGate)
+		{
+			if (!_guestThreads.TryGetValue(threadHandle, out var thread) ||
+				thread.StackBase == 0 ||
+				thread.StackSize == 0)
+			{
+				return false;
+			}
+
+			stackBase = thread.StackBase;
+			stackSize = thread.StackSize;
+			return true;
+		}
+	}
 
 	public void RegisterGuestThreadContext(ulong threadHandle, CpuContext context)
 	{
@@ -5671,6 +5774,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var hostAffinityMask = MapGuestThreadAffinity(guestAffinityMask);
 		if (hostAffinityMask == 0)
 		{
+			SharpEmu.HLE.Host.HostLaneReservation.ApplyToGuestThread();
 			return;
 		}
 
@@ -6111,6 +6215,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
+			RouteGuestAccessFaultsToSignals();
 			byte* ptr2 = (byte*)ptr;
 			// Rosetta does not reliably permit a generated x86 thunk to write data
 			// in the same page from which it is currently executing, even when the
@@ -6337,6 +6442,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
+			RouteGuestAccessFaultsToSignals();
 			byte* ptr2 = (byte*)ptr;
 			ulong hostRspSlot = (ulong)hostRspStorage;
 			var emitter = new NativeCodeEmitter(ptr2);
@@ -6567,6 +6673,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		Console.Error.WriteLine($"[LOADER][INFO] ExecuteEntry starting at 0x{entryPoint:X16}");
 		Console.Error.WriteLine($"[LOADER][INFO] RSP=0x{context[CpuRegister.Rsp]:X16}, RDI=0x{context[CpuRegister.Rdi]:X16}");
+		SharpEmu.HLE.Host.HostLaneReservation.ApplyToGuestThread();
 		ulong num = context[CpuRegister.Rsp];
 		if (num == 0)
 		{
@@ -6609,6 +6716,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			_activeGuestThreadYieldRequested = false;
 			_activeGuestThreadYieldReason = null;
 			BindTlsBase(context);
+			RouteGuestAccessFaultsToSignals();
 			byte* ptr2 = (byte*)ptr;
 			ulong num2 = (ulong)hostRspStorage;
 			int num3 = 0;

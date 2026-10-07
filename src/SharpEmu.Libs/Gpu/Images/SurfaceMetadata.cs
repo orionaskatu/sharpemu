@@ -51,4 +51,5 @@ public sealed class SurfaceMetadata
         (_upperSlices ??= new System.Collections.BitArray((int)(MaxSlices - 32)))[(int)(slice - 32)] = isClear;
         return true;
     }
+    public ulong Size;
 }

@@ -117,7 +117,7 @@ public sealed partial class ResourceTracker
 
         // A key carried unchanged around a loop is bounded by the value it carries.
         var key = _graph.ResolveInvariantPhi(scaled.Operands[0]) ?? scaled.Operands[0];
-        var bound = DenseKeyBound(key);
+        var bound = BoundBySamplerLoads(DenseKeyBound(key), heapHandle, tableOffset);
         var waveIndexed = TryCreateWaveIndexedImageSelector(key, reads);
         if (bound == 0 && waveIndexed is null)
         {
@@ -194,6 +194,31 @@ public sealed partial class ResourceTracker
         }
 
         return true;
+    }
+
+    private uint BoundBySamplerLoads(uint bound, ScalarValue heapHandle, uint tableOffset)
+    {
+        foreach (var access in _plan.Accesses)
+        {
+            if (access?.SamplerHandle is not { } sampler)
+                continue;
+
+            foreach (var operand in sampler.Operands)
+            {
+                var word = ScalarValueEquivalence.ResolveInvariantPhi(_plan.Memory, operand) ?? operand;
+                if (word.Kind == ScalarValueKind.ResourceTableWord && word.Payload < (ulong)_plan.TableReads.Count)
+                    word = _plan.TableReads[(int)word.Payload].Value;
+                if (word.Kind != ScalarValueKind.ScalarAddressWord || word.MemoryIndex < 0 || word.MemoryIndex >= _plan.Memory.Count ||
+                    !word.Operands[1].IsConstant || !_graph.Equivalent(word.Operands[0], heapHandle))
+                    continue;
+
+                var offset = (ulong)word.Operands[1].ConstantU32 + _plan.Memory[word.MemoryIndex].Offset;
+                if (offset > tableOffset)
+                    bound = (uint)Math.Min(bound, (offset - tableOffset) >> (int)DenseIndirectImageShift);
+            }
+        }
+
+        return bound;
     }
 
     private uint DenseKeyBound(ScalarValue key)

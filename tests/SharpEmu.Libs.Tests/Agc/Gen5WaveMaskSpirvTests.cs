@@ -55,19 +55,19 @@ public sealed class Gen5WaveMaskSpirvTests
     {
         var laneBitConstIds = new HashSet<uint>();
 
-        // Pass 1: collect 64-bit OpConstant result-ids whose value is 1.
+        // Pass 1: collect OpConstant result-ids whose integer value is 1.
         foreach (var (op, wordCount, offset) in EnumerateInstructions(spirv))
         {
-            // OpConstant = 43; a 64-bit constant occupies 5 words
-            // (opcode, resultType, resultId, valueLow, valueHigh).
-            if (op != 43 || wordCount != 5)
+            // OpConstant = 43; a 32-bit constant occupies 4 words and a 64-bit one
+            // 5 (opcode, resultType, resultId, valueLow[, valueHigh]).
+            if (op != 43 || wordCount is not (4 or 5))
             {
                 continue;
             }
 
             var resultId = ReadWord(spirv, offset + 8);
             var low = ReadWord(spirv, offset + 12);
-            var high = ReadWord(spirv, offset + 16);
+            var high = wordCount == 5 ? ReadWord(spirv, offset + 16) : 0u;
             if (low == 1 && high == 0)
             {
                 laneBitConstIds.Add(resultId);

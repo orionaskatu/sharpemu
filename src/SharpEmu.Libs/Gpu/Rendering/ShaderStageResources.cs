@@ -51,8 +51,14 @@ public class ShaderProgramInfo
     public int VertexOffsetScalarRegister { get; init; } = NoScalarRegister;
     public int InstanceOffsetScalarRegister { get; init; } = NoScalarRegister;
     public bool UsesDeviceAddresses { get; init; }
+
+    // The dword every invocation stores when the whole program is 'index, v_mov constant, one
+    // buffer store, end' (AGC's constant fill kernels); null for any other program.
+    public uint? ConstantStoreValue { get; init; }
     public bool HasBitwiseExclusiveOr { get; init; }
     public Pipelines.ConstantFill? ConstantFill { get; init; }
+    public Pipelines.BoundedFill? BoundedFill { get; init; }
+    public Pipelines.BoundedCopy? BoundedCopy { get; init; }
     public BufferResourceInfo[] Buffers { get; init; } = [];
     public ImageResourceInfo[] Images { get; init; } = [];
     public int SamplerCount { get; init; }
@@ -189,6 +195,7 @@ public sealed class ComputeInputInfo
 // The four buffer resource words as the guest writes them.
 public readonly record struct BufferDescriptorWords(uint Word0, uint Word1, uint Word2, uint Word3)
 {
+    public const uint Format32UInt = 20;
     public const uint Format32x4UInt = 75;
 
     public static BufferDescriptorWords From(ReadOnlySpan<uint> words) => new(words[0], words[1], words[2], words[3]);

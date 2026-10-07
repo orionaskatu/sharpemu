@@ -169,10 +169,7 @@ public static partial class Gen5SpirvTranslator
                     break;
                 }
                 case "VCvtU32F32":
-                    result = _module.AddInstruction(
-                        SpirvOp.ConvertFToU,
-                        _uintType,
-                        GetFloatSource(instruction, 0));
+                    result = ConvertFloatToUnsignedSaturated(GetFloatSource(instruction, 0));
                     break;
                 case "VCvtU16F16":
                 {
@@ -207,9 +204,7 @@ public static partial class Gen5SpirvTranslator
                         source = Ext(8, _floatType, source);
                     }
 
-                    result = Bitcast(
-                        _uintType,
-                        _module.AddInstruction(SpirvOp.ConvertFToS, _intType, source));
+                    result = ConvertFloatToSignedSaturated(source);
                     break;
                 }
                 case "VCvtF32I32":
@@ -2783,7 +2778,10 @@ public static partial class Gen5SpirvTranslator
                     var (baseLow, baseHigh) = LoadShaderBase();
                     var next = IAdd64(
                         Pair64(baseLow, baseHigh),
-                        ULong(unchecked(_request.Program.InstructionAddressOffset(instruction.Pc) +
+                        ULong(unchecked((_request.Program.InstructionAddressOffsets is { } addressOffsets &&
+                            addressOffsets.TryGetValue(instruction.Pc, out var rebasedOffset)
+                                ? rebasedOffset
+                                : instruction.ProgramOffset) +
                             (ulong)(instruction.Words.Count * sizeof(uint)))));
                     StoreS(destination, Narrow(next));
                     StoreS(destination + 1, Narrow(ShiftRightLogical64(next, ULong(32))));
@@ -4700,14 +4698,15 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(operation, _floatType, left, right));
         }
 
+        // v_min_f32 and v_max_f32 return the other operand when one is NaN. GLSL FMin and FMax
+        // leave that undefined, and Metal's fast math returns the NaN.
         private uint EmitFloatExtBinary(
             Gen5ShaderInstruction instruction,
             uint operation) =>
             EmitFloatResult(
                 instruction,
-                Ext(
+                NanIgnoringMinMax(
                     operation,
-                    _floatType,
                     GetFloatSource(instruction, 0),
                     GetFloatSource(instruction, 1)));
 
@@ -4728,14 +4727,62 @@ public static partial class Gen5SpirvTranslator
             Gen5ShaderInstruction instruction,
             uint operation)
         {
-            var first = Ext(
+            var first = NanIgnoringMinMax(
                 operation,
-                _floatType,
                 GetFloatSource(instruction, 0),
                 GetFloatSource(instruction, 1));
             return EmitFloatResult(
                 instruction,
-                Ext(operation, _floatType, first, GetFloatSource(instruction, 2)));
+                NanIgnoringMinMax(operation, first, GetFloatSource(instruction, 2)));
+        }
+
+        private uint NanIgnoringMinMax(uint operation, uint left, uint right)
+        {
+            var result = Ext(operation, _floatType, left, right);
+            result = _module.AddInstruction(SpirvOp.Select, _floatType, IsNanBits(right), left, result);
+            return _module.AddInstruction(SpirvOp.Select, _floatType, IsNanBits(left), right, result);
+        }
+
+        // NaN tested on the bits, which fast math cannot assume away.
+        private uint IsNanBits(uint value) =>
+            _module.AddInstruction(
+                SpirvOp.UGreaterThan,
+                _boolType,
+                BitwiseAnd(Bitcast(_uintType, value), UInt(0x7FFF_FFFF)),
+                UInt(0x7F80_0000));
+
+        // v_cvt_u32_f32 and v_cvt_i32_f32 saturate and convert NaN to zero; SPIR-V leaves
+        // out-of-range conversions undefined.
+        private uint ConvertFloatToUnsignedSaturated(uint value)
+        {
+            var bits = Bitcast(_uintType, value);
+            var converted = _module.AddInstruction(SpirvOp.ConvertFToU, _uintType, value);
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x4F80_0000)),
+                UInt(uint.MaxValue),
+                converted);
+            // Negative values, including negative NaN, have the sign bit set.
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x8000_0000)),
+                UInt(0),
+                converted);
+            return _module.AddInstruction(SpirvOp.Select, _uintType, IsNanBits(value), UInt(0), converted);
+        }
+
+        private uint ConvertFloatToSignedSaturated(uint value)
+        {
+            var bits = Bitcast(_uintType, value);
+            var magnitude = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
+            var converted = Bitcast(_uintType, _module.AddInstruction(SpirvOp.ConvertFToS, _intType, value));
+            var negative = _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, bits, UInt(0x8000_0000));
+            converted = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, magnitude, UInt(0x4F00_0000)),
+                _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(0x8000_0000), UInt(0x7FFF_FFFF)),
+                converted);
+            return _module.AddInstruction(SpirvOp.Select, _uintType, IsNanBits(value), UInt(0), converted);
         }
 
         private uint EmitIntegerBinary(
@@ -5408,20 +5455,5 @@ public static partial class Gen5SpirvTranslator
 
         private static bool TryDecodeInlineConstant(uint encoded, out uint value) =>
             Gen5InlineConstants.TryDecode(encoded, out value);
-            // Ported from upstream #1013 for the #1019 min/max fixes.
-        private uint NanIgnoringMinMax(uint operation, uint left, uint right)
-        {
-            var result = Ext(operation, _floatType, left, right);
-            result = _module.AddInstruction(SpirvOp.Select, _floatType, IsNanBits(right), left, result);
-            return _module.AddInstruction(SpirvOp.Select, _floatType, IsNanBits(left), right, result);
-        }
-
-        // NaN tested on the bits, which fast math cannot assume away.
-        private uint IsNanBits(uint value) =>
-            _module.AddInstruction(
-                SpirvOp.UGreaterThan,
-                _boolType,
-                BitwiseAnd(Bitcast(_uintType, value), UInt(0x7FFF_FFFF)),
-                UInt(0x7F80_0000));
     }
 }

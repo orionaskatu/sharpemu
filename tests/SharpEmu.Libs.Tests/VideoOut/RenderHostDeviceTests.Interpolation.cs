@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE.Host;
+using SharpEmu.Libs.Gpu.GpuCommands;
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Gpu.Vulkan;
@@ -33,6 +34,45 @@ public sealed unsafe partial class RenderHostDeviceTests
     public void InterpolationPhases_DrawUsesBarycentricRegisters()
     {
         VerifyInterpolationDraw(2, false, interpolate: true, expected: 96);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RectangleList_PreservesInterpolationAndProvokingVertexOutsideTheInputTriangle(bool flat)
+    {
+        if (!Ready()) return;
+        if (!_vulkan.SupportsFillRectangle || !_vulkan.SupportsFragmentShaderBarycentric)
+        {
+            Assert.False(GatePrerequisites.DeviceRequired, "The required device lacks rectangle fill or fragment barycentrics.");
+            return;
+        }
+
+        using var presenter = new PresenterUnderTest(_vulkan);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var target = harness.MapBacked(0x10000, ReadWrite);
+        var vertices = harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Color(target, Size, Size);
+        harness.Write(vertices, Triangle(-1, -1, 1, -1, -1, 1));
+        var provider = new FixedProgramProvider((IShaderPipelineHost)presenter.Instance, vertices,
+            interpolationShader: CompileInterpolationFragment(2, flat, !flat));
+        var banks = Banks(words);
+        banks.UserConfig.PrimitiveType = 7;
+        banks.Context.ShaderInterface.GeometryOutputPrimitiveType = 3;
+        var executor = new RenderExecutor(presenter.RenderHost, provider);
+        presenter.Run(() => executor.DrawAuto(1, banks, Draw()));
+        presenter.Run(() => presenter.InvokeMethod("FlushBatchedGuestCommands"));
+        harness.Finish();
+        var pixels = harness.ReadImageBytes(TargetImage(presenter, words));
+        // This corner lies outside the input triangle. The smooth value continues its
+        // plane across the rectangle; flat input still comes from original vertex zero.
+        var actual = Pixel(pixels, Size - 2, Size - 2);
+        var expected = flat ? 64 : 126;
+        Assert.InRange((int)(actual & 255), expected - 1, expected + 1);
+        Assert.Equal(255u, actual >> 24);
+        harness.Shutdown();
+        _vulkan.AssertNoValidationMessages();
     }
 
     [Fact]

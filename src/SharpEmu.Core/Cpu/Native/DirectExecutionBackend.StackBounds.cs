@@ -9,10 +9,23 @@ public sealed partial class DirectExecutionBackend
 {
     private const int HostStackStateBytes = 3 * sizeof(ulong);
 
-    private static unsafe bool TryGetGuestStackBounds(ulong stackPointer, out ulong bottom, out ulong top)
+    internal static unsafe bool TryGetGuestStackBounds(ulong stackPointer, out ulong bottom, out ulong top)
     {
+        if (OperatingSystem.IsWindows() &&
+            QueryVirtualMemoryInformation(-1, (void*)stackPointer, 0, out var allocation,
+                (nuint)sizeof(StackMemoryRegionInformation), null) != 0 &&
+            ((allocation.Flags & 1) == 0 || allocation.CommitSize == allocation.RegionSize) &&
+            allocation.RegionSize != 0 && allocation.RegionSize <= ulong.MaxValue - allocation.AllocationBase &&
+            stackPointer >= allocation.AllocationBase && stackPointer - allocation.AllocationBase < allocation.RegionSize)
+        {
+            bottom = allocation.AllocationBase;
+            top = bottom + allocation.RegionSize;
+            return true;
+        }
+
         bottom = top = 0;
-        if (VirtualQuery((void*)stackPointer, out var region, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+        var queried = VirtualQuery((void*)stackPointer, out var region, (nuint)sizeof(MEMORY_BASIC_INFORMATION64));
+        if (queried == 0 ||
             region.State != 0x1000 || region.RegionSize == 0 || region.RegionSize > ulong.MaxValue - region.BaseAddress)
         {
             return false;
@@ -31,6 +44,36 @@ public sealed partial class DirectExecutionBackend
         EmitByte(code, ref offset, (byte)(0x04 | ((register & 7) << 3)));
         EmitByte(code, ref offset, 0x25);
         EmitUInt32(code, ref offset, field);
+    }
+
+    // Fiber switches replace the guest stack without passing through a guest-entry stub, so the
+    // context-transfer stub keeps the Windows TEB bounds in sync from the target state in R11
+    // (stack top at +160, bottom at +168). Only Windows keeps stack bounds at gs:[8]/gs:[16]: on
+    // macOS gs addresses the pthread TSD, where those slots hold errno's address and another key.
+    // Writing a fiber's bounds there nulled errno, and the next failed libc call on the thread
+    // crashed reading it (Demon's Souls, about 10 s into boot).
+    private static unsafe void EmitFiberStackBounds(byte* code, ref int offset)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        ReadOnlySpan<byte> loadTop = [0x4D, 0x8B, 0x93, 160, 0, 0, 0];     // mov r10, [r11+160]
+        foreach (var value in loadTop) EmitByte(code, ref offset, value);
+        EmitStackBound(code, ref offset, 10, 8, store: true);
+        ReadOnlySpan<byte> loadBottom = [0x4D, 0x8B, 0x93, 168, 0, 0, 0];  // mov r10, [r11+168]
+        foreach (var value in loadBottom) EmitByte(code, ref offset, value);
+        EmitStackBound(code, ref offset, 10, 16, store: true);
+    }
+
+    // Test hook: the bytes the fiber stack-bounds sync emits on this host.
+    internal static unsafe byte[] EmitFiberStackBoundsForTest()
+    {
+        var buffer = new byte[64];
+        var offset = 0;
+        fixed (byte* code = buffer)
+        {
+            EmitFiberStackBounds(code, ref offset);
+        }
+
+        return buffer[..offset];
     }
 
     // R10 points to the entry state. R11 is scratch; RAX remains unchanged.
@@ -146,4 +189,18 @@ public sealed partial class DirectExecutionBackend
 
     [DllImport("kernel32.dll", ExactSpelling = true)]
     private static extern void GetCurrentThreadStackLimits(out ulong lowLimit, out ulong highLimit);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StackMemoryRegionInformation
+    {
+        public ulong AllocationBase;
+        public uint AllocationProtect;
+        public uint Flags;
+        public ulong RegionSize;
+        public ulong CommitSize;
+    }
+
+    [DllImport("api-ms-win-core-memory-l1-1-4.dll", ExactSpelling = true)]
+    private static extern unsafe int QueryVirtualMemoryInformation(nint process, void* address, int informationClass,
+        out StackMemoryRegionInformation information, nuint informationSize, nuint* returnSize);
 }

@@ -30,6 +30,9 @@ public sealed class GuestGpuMemory : IDisposable
     private readonly PageGuard _pages;
     private readonly ReaderWriterLockSlim _spansLock = new();
     private readonly SpanSet _spans = new();
+    private long _spanVersion;
+
+    public long SpanVersion => Interlocked.Read(ref _spanVersion);
     private sealed record GpuAttachment(IGpuQueueRelay? Gpu, IGpuTickScheduler? Scheduler);
 
     private readonly object _attachGate = new();
@@ -51,10 +54,8 @@ public sealed class GuestGpuMemory : IDisposable
 
     public PageGuard Pages => _pages;
 
-    private long _mappingVersion;
-
     // Changes whenever a span is mapped or unmapped.
-    public long MappingVersion => Volatile.Read(ref _mappingVersion);
+    public long MappingVersion => SpanVersion;
 
     // Stores arrive once the host GPU is ready; null stores cannot perform cache recovery.
     public void AttachStores(IGuestBufferStore? buffers, IGuestImageStore? images)
@@ -206,6 +207,26 @@ public sealed class GuestGpuMemory : IDisposable
         }
     }
 
+    // Whether any GPU-registered span intersects the range. Memory outside every span holds no GPU
+    // cache entries and no tracked pages, so mapping changes there need nothing from the GPU worker.
+    public bool OverlapsRegistered(ulong address, ulong size)
+    {
+        if (!new GuestSpan(address, size).IsValid)
+        {
+            return false;
+        }
+
+        _spansLock.EnterReadLock();
+        try
+        {
+            return _spans.Overlaps(address, size);
+        }
+        finally
+        {
+            _spansLock.ExitReadLock();
+        }
+    }
+
     // The host mapping takes the guest protection here; the views themselves are mapped read-write.
     public void Register(ulong address, ulong size, GuestPageProtection protection)
     {
@@ -216,7 +237,7 @@ public sealed class GuestGpuMemory : IDisposable
         try
         {
             _spans.Add(address, size);
-            Interlocked.Increment(ref _mappingVersion);
+            Interlocked.Increment(ref _spanVersion);
         }
         finally
         {
@@ -289,7 +310,7 @@ public sealed class GuestGpuMemory : IDisposable
                 try
                 {
                     _spans.Remove(address, size);
-                    Interlocked.Increment(ref _mappingVersion);
+                    Interlocked.Increment(ref _spanVersion);
                 }
                 finally
                 {

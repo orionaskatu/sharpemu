@@ -203,8 +203,8 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
     private const uint Format16Float = 13;
     private const uint Format8x4Snorm = 57;
     private const uint Format8x4Sint = 61;
-    private const uint Format10x3x2Uint = 48;
-    private const uint Format11x2x10Float = 43;
+    private const uint Format2x10x3Uint = 48;
+    private const uint Format10x11x2Float = 43;
     private const uint BoundDescriptor = (Format32x4Float << 12) | IdentitySwizzle;
     private const float Half = 0.5f;
 
@@ -250,8 +250,8 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
         yield return [Format8x4Unorm, BoundDescriptor, 7u, (uint)MemoryOffset, Floats(1f, Half, 0f, -1f), Bytes(0xFF, 0x80, 0x00, 0x00)];
         yield return [Format8x4Snorm, BoundDescriptor, 7u, (uint)MemoryOffset, Floats(1f, -1f, Half, -Half), Bytes(0x7F, 0x81, 0x40, 0xC0)];
         yield return [Format8x4Sint, BoundDescriptor, 7u, (uint)MemoryOffset, Words(unchecked((uint)-1), 127, unchecked((uint)-128), 200), Bytes(0xFF, 0x7F, 0x80, 0x7F)];
-        yield return [Format10x3x2Uint, BoundDescriptor, 7u, (uint)MemoryOffset, Words(1, 2, 3, 1), Bytes(0x01, 0x08, 0x30, 0x40)];
-        yield return [Format11x2x10Float, BoundDescriptor, 7u, (uint)MemoryOffset, Floats(1f, 2f, Half, 0), Bytes(0xC0, 0x03, 0x20, 0x70)];
+        yield return [Format2x10x3Uint, BoundDescriptor, 7u, (uint)MemoryOffset, Words(1, 2, 3, 1), Bytes(0x09, 0x30, 0x40, 0x00)];
+        yield return [Format10x11x2Float, BoundDescriptor, 7u, (uint)MemoryOffset, Floats(1f, 2f, Half, 0), Bytes(0xE0, 0x01, 0x10, 0x70)];
         yield return [Format32x4Float, (Format8x4Unorm << 12) | IdentitySwizzle, 7u, (uint)MemoryOffset, Words(0xABCD1200, 0xABCD1201, 0xABCD1202, 0xABCD1203), Bytes(0x00, 0x12, 0xCD, 0xAB, 0x01, 0x12, 0xCD, 0xAB, 0x02, 0x12, 0xCD, 0xAB, 0x03, 0x12, 0xCD, 0xAB)];
         yield return [Format32x4Float, 0u, 7u, (uint)MemoryOffset, Words(1, 2, 3, 4), null!];
         // An element that crosses the end of the binding is not written at all.

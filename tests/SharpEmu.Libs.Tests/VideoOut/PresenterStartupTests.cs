@@ -30,6 +30,10 @@ public sealed class PresenterStartupTests
             Set("_presenterStartupFailure", null);
             Set("_activePresenter", null);
             Set("_thread", Thread.CurrentThread);
+            Set("_shaderPrewarmDecided", true);
+            Set("_shaderPrewarmRunning", false);
+            Set("_shaderPrewarmReleased", false);
+            Set("_shaderPrewarmHoldReported", 0);
         }
 
         private static FieldInfo Field(string name) => PresenterType.GetField(name, BindingFlags.Static | BindingFlags.NonPublic)!;
@@ -95,6 +99,45 @@ public sealed class PresenterStartupTests
             Assert.Equal(SliceResult.Completed, queue.ProcessOne());
             Assert.Equal(SliceResult.Completed, queue.ProcessOne());
             Assert.Equal(new[] { "begin 0 1", "begin 0 2" }, runner.Host.Calls.Where(call => call.StartsWith("begin ", StringComparison.Ordinal)));
+        }
+        finally
+        {
+            if (thread.IsAlive)
+            {
+                VulkanVideoPresenter.RequestClose();
+                Assert.True(thread.Join(5000));
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ASubmissionWaitsUntilTheShaderPrewarmIsDecidedAndDone(bool undecided)
+    {
+        var runner = new StreamRunner();
+        var queue = new CommandStreamQueue(runner.Host);
+        Assert.True(runner.Host.Memory.TryWrite(StreamRunner.CommandAddress, new byte[] { 0, 16, 0, 192, 0, 0, 0, 0 }));
+        using var state = new StartupState();
+        state.Set(undecided ? "_shaderPrewarmDecided" : "_shaderPrewarmRunning", !undecided);
+        state.Publish(queue);
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { VulkanVideoPresenter.SubmitCommandStream(runner.Host.Memory, 0, StreamRunner.CommandAddress, 2, 1, null); }
+            catch (Exception exception) { failure = exception; }
+        });
+        thread.Start();
+        try
+        {
+            Assert.True(SpinWait.SpinUntil(() => (thread.ThreadState & ThreadState.WaitSleepJoin) != 0, 5000));
+            Assert.False(thread.Join(200));
+            Assert.Equal(0, queue.PendingSubmissionCount);
+            state.Set("_shaderPrewarmDecided", true);
+            state.Set("_shaderPrewarmRunning", false);
+            Assert.True(thread.Join(5000));
+            Assert.Null(failure);
+            Assert.Equal(1, queue.PendingSubmissionCount);
         }
         finally
         {

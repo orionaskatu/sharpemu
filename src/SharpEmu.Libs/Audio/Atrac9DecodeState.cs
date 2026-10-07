@@ -28,6 +28,8 @@ internal readonly record struct Atrac9StreamInfo(
     int FrameSamples,
     int BytesPerFrame);
 
+internal readonly record struct Atrac9Gapless(uint TotalSamples, ushort SkipSamples, ushort SkippedSamples);
+
 internal sealed class Atrac9DecodeState
 {
     internal const int ResultNotInitialized = 0x00000001;
@@ -67,10 +69,34 @@ internal sealed class Atrac9DecodeState
     private int _containerHeaderLength;
     private int _compressedLength;
     private ulong _totalDecodedSamples;
-    private ulong _totalSampleLimit;
-    private ulong _skippedSamples;
-    private ushort _skipSamples;
     private bool _decodeErrorLogged;
+    private Atrac9Gapless _gaplessInit;
+    private Atrac9Gapless _gapless;
+
+    public Atrac9Gapless Gapless
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _gapless;
+            }
+        }
+    }
+
+    public void SetGapless(uint totalSamples, ushort skipSamples, bool reset)
+    {
+        lock (_gate)
+        {
+            _gaplessInit = new Atrac9Gapless(totalSamples, skipSamples, 0);
+            if (reset || _gapless == default)
+            {
+                _gapless = _gaplessInit;
+            }
+        }
+    }
+
+    private bool HasSampleLimit => _gaplessInit.TotalSamples is not 0 and not uint.MaxValue;
 
     public Atrac9Config? Config
     {
@@ -121,9 +147,13 @@ internal sealed class Atrac9DecodeState
             _planarPcm = CreatePcmBuffer(info.Channels, info.FrameSamples * info.FramesPerSuperframe);
             _compressedLength = 0;
             _totalDecodedSamples = 0;
-            _totalSampleLimit = totalSamples;
-            _skipSamples = skipSamples;
-            _skippedSamples = 0;
+            if (totalSamples != 0 || skipSamples != 0)
+            {
+                // The initialize job's sideband carries the gapless window.
+                _gaplessInit = new Atrac9Gapless(totalSamples, skipSamples, 0);
+            }
+
+            _gapless = _gaplessInit;
 
             try
             {
@@ -167,8 +197,8 @@ internal sealed class Atrac9DecodeState
             }
             _compressedLength = 0;
             _totalDecodedSamples = 0;
-            _skippedSamples = 0;
             _containerHeaderLength = 0;
+            _gapless = _gaplessInit;
             if (_compressed is not null)
             {
                 Array.Clear(_compressed);
@@ -207,7 +237,7 @@ internal sealed class Atrac9DecodeState
             }
 
             var bytesPerSample = GetBytesPerSample(encoding);
-            var outputBytesPerSuperframe = checked(info.FrameSamples * info.FramesPerSuperframe * channels * bytesPerSample);
+            var superframeSamples = info.FrameSamples * info.FramesPerSuperframe;
             var consumed = 0;
             var written = 0;
             uint frames = 0;
@@ -216,6 +246,11 @@ internal sealed class Atrac9DecodeState
             while (_compressedLength == info.SuperframeBytes ||
                    consumed < input.Length)
             {
+                if (HasSampleLimit && _gapless.TotalSamples == 0)
+                {
+                    break;
+                }
+
                 // Titles that stream whole .at9 files hand AJM the RIFF/WAVE
                 // container rather than a pointer into its `data` chunk, so the
                 // stream has to be advanced past the header before the first
@@ -256,13 +291,26 @@ internal sealed class Atrac9DecodeState
                     break;
                 }
 
-                if (output.Length - written < outputBytesPerSuperframe)
+                var skip = Math.Min(superframeSamples, (int)_gapless.SkipSamples);
+                var samples = superframeSamples - skip;
+                if (HasSampleLimit)
+                {
+                    samples = (int)Math.Min((uint)samples, _gapless.TotalSamples);
+                }
+
+                var outputBytes = checked(samples * channels * bytesPerSample);
+                if (output.Length - written < outputBytes)
                 {
                     status |= ResultNotEnoughRoom;
                     break;
                 }
 
-                var decoded = TryDecodeSuperframeNoLock(channels, encoding, output.Slice(written, outputBytesPerSuperframe));
+                var decoded = TryDecodeSuperframeNoLock(
+                    channels,
+                    encoding,
+                    output.Slice(written, outputBytes),
+                    skip,
+                    samples);
                 if (!decoded)
                 {
                     if (!_decodeErrorLogged)
@@ -274,37 +322,23 @@ internal sealed class Atrac9DecodeState
                             "playing_silence");
                         _decodeErrorLogged = true;
                     }
-                    output.Slice(written, outputBytesPerSuperframe).Clear();
+                    output.Slice(written, outputBytes).Clear();
                     lock (DecoderInitGate)
                     {
                         InitializeDecodersNoLock();
                     }
                 }
 
-                var fullSamples = info.FrameSamples * info.FramesPerSuperframe;
-                var dropSamples = _skippedSamples < _skipSamples
-                    ? Math.Min((ulong)fullSamples, _skipSamples - _skippedSamples)
-                    : 0;
-                _skippedSamples += dropSamples;
-                var availableSamples = fullSamples - (int)dropSamples;
-                var writableSamples = _totalSampleLimit == 0
-                    ? availableSamples
-                    : (int)Math.Min((ulong)availableSamples, _totalSampleLimit > _totalDecodedSamples
-                        ? _totalSampleLimit - _totalDecodedSamples
-                        : 0);
-                var sampleBytes = checked(channels * bytesPerSample);
-                if (dropSamples != 0 && writableSamples != 0)
-                {
-                    output.Slice(written + checked((int)dropSamples) * sampleBytes, writableSamples * sampleBytes)
-                        .CopyTo(output.Slice(written, writableSamples * sampleBytes));
-                }
-
-                written += writableSamples * sampleBytes;
+                _gapless = new Atrac9Gapless(
+                    HasSampleLimit ? _gapless.TotalSamples - (uint)samples : _gapless.TotalSamples,
+                    (ushort)(_gapless.SkipSamples - skip),
+                    (ushort)Math.Min(ushort.MaxValue, _gapless.SkippedSamples + superframeSamples - samples));
+                written += outputBytes;
                 _compressedLength = 0;
-                _totalDecodedSamples += unchecked((uint)writableSamples);
+                _totalDecodedSamples += unchecked((uint)samples);
                 frames += unchecked((uint)info.FramesPerSuperframe);
 
-                if (!multipleFrames || (_totalSampleLimit != 0 && _totalDecodedSamples >= _totalSampleLimit))
+                if (!multipleFrames)
                 {
                     break;
                 }
@@ -434,12 +468,13 @@ internal sealed class Atrac9DecodeState
     private static void WriteInterleaved(
         short[][] source,
         Span<byte> destination,
+        int firstSample,
         int samples,
         int channels,
         Atrac9PcmEncoding encoding)
     {
         var offset = 0;
-        for (var sample = 0; sample < samples; sample++)
+        for (var sample = firstSample; sample < firstSample + samples; sample++)
         {
             for (var channel = 0; channel < channels; channel++)
             {
@@ -499,7 +534,12 @@ internal sealed class Atrac9DecodeState
         }
     }
 
-    private bool TryDecodeSuperframeNoLock(int requestedChannels, Atrac9PcmEncoding encoding, Span<byte> output)
+    private bool TryDecodeSuperframeNoLock(
+        int requestedChannels,
+        Atrac9PcmEncoding encoding,
+        Span<byte> output,
+        int firstSample,
+        int samples)
     {
         if (_info is not { } info || _planarPcm is null || _compressed is null)
         {
@@ -528,7 +568,8 @@ internal sealed class Atrac9DecodeState
             WriteInterleaved(
                 _planarPcm,
                 output,
-                info.FrameSamples * info.FramesPerSuperframe,
+                firstSample,
+                samples,
                 requestedChannels,
                 encoding);
             return true;
@@ -689,9 +730,6 @@ internal sealed class Atrac9DecodeState
         _containerHeaderLength = 0;
         _compressedLength = 0;
         _totalDecodedSamples = 0;
-        _totalSampleLimit = 0;
-        _skippedSamples = 0;
-        _skipSamples = 0;
         _decodeErrorLogged = false;
     }
 

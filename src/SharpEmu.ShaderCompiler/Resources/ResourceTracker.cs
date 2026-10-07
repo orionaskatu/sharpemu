@@ -246,8 +246,13 @@ public sealed partial class ResourceTracker
         return new DescriptorSource { Dwords = dwords };
     }
 
-    private static uint PossibleBits(ScalarValue value)
+    private uint PossibleBits(ScalarValue value)
     {
+        if (value.Kind == ScalarValueKind.Phi)
+        {
+            var invariant = _graph.ResolveInvariantPhi(value);
+            return invariant is null ? uint.MaxValue : PossibleBits(invariant);
+        }
         if (value.IsConstant)
         {
             return value.Type == ScalarValueType.U32 ? value.ConstantU32 : uint.MaxValue;
@@ -255,6 +260,8 @@ public sealed partial class ResourceTracker
 
         if (value.Kind != ScalarValueKind.Operation)
         {
+            if (value.Kind == ScalarValueKind.Select)
+                return PossibleBits(value.Operands[1]) | PossibleBits(value.Operands[2]);
             return uint.MaxValue;
         }
 

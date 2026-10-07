@@ -38,6 +38,21 @@ public sealed unsafe partial class GuestImageCache
         return metadata;
     }
 
+    public bool OverlapsDccMetadata(ulong address, ulong size)
+    {
+        using var held = _lock.Hold();
+        foreach (var (start, metadata) in _surfaceMetadata)
+        {
+            if (metadata.Kind == SurfaceMetadataKind.Dcc && metadata.Size != 0 &&
+                address < start + metadata.Size && start < address + size)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // A broad clear applies to CMask, FMask and HTile; DCC needs a validated fill value.
     public bool ClearMetadata(ulong address)
     {

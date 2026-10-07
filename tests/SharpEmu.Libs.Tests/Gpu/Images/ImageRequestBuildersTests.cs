@@ -73,6 +73,24 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(ImageRole.Texture, comparison.Request.Role);
     }
 
+    [Theory]
+    [InlineData(GuestImageType.Color2D, 1u, true)]
+    [InlineData(GuestImageType.Color3D, 32u, false)]
+    [InlineData(GuestImageType.Color2DArray, 4u, false)]
+    public void CompressedTexture_CarriesDccMetadataOnlyForSingleLayer2D(GuestImageType type, uint layers, bool expected)
+    {
+        const ulong metadata = 0x1_2000_0000;
+        var words = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32, type, GuestTileMode.RenderTarget, layers: layers);
+        words[6] |= (1u << 21) | (uint)(((metadata >> 8) & 0xFF) << 24);
+        words[7] = (uint)(metadata >> 16);
+        var shape = Sampled2D with { Volume = type == GuestImageType.Color3D, Arrayed = type == GuestImageType.Color2DArray };
+
+        var description = ImageRequestBuilders.Texture(words, shape).Request.Description;
+
+        Assert.Equal(expected ? MetadataKind.Dcc : MetadataKind.None, description.Metadata.Kind);
+        Assert.Equal(expected ? metadata : 0UL, description.Metadata.Range.Address);
+    }
+
     private readonly HeadlessVulkan? _vulkan;
 
     public ImageRequestBuildersTests(HeadlessVulkanFixture fixture) => _vulkan = fixture.Vulkan;
@@ -343,6 +361,38 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(value.StencilSize, value.Request.Description.Stencil.Size);
         Assert.Equal(ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit, value.Request.View.Aspect);
         Assert.False(value.StencilClearEnabled);
+    }
+
+    [Fact]
+    public void DepthTarget_StencilIsCompressedOnlyWithHtileBacking()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        const ulong stencilBase = Base + 0x80000;
+        const ulong htileBase = Base + 0x100000;
+        var words = RegisterWords.Depth(Base, 64, 64, stencilBase: stencilBase) with
+        {
+            ZInfo = (uint)GuestDepthFormat.Z32Float | (1u << 29),
+            StencilInfo = 0x00100981,
+            HtileBase = htileBase,
+        };
+
+        var resolution = ImageRequestBuilders.DepthTarget(words, _vulkan.DeviceInfo);
+
+        Assert.NotNull(resolution);
+        var value = resolution.Value;
+        Assert.True(value.HasStencil);
+        Assert.True(value.HasHtile);
+        Assert.Equal(MetadataKind.Htile, value.Request.Description.Metadata.Kind);
+        Assert.Equal(htileBase, value.Request.Description.Metadata.Range.Address);
+        Assert.True(value.Request.Description.Metadata.StencilCompressed);
+
+        var missingHtile = words with { ZInfo = (uint)GuestDepthFormat.Z32Float, HtileBase = 0 };
+        var uncompressed = ImageRequestBuilders.DepthTarget(missingHtile, _vulkan.DeviceInfo);
+
+        Assert.NotNull(uncompressed);
+        Assert.True(uncompressed.Value.HasStencil);
+        Assert.False(uncompressed.Value.HasHtile);
+        Assert.False(uncompressed.Value.Request.Description.Metadata.StencilCompressed);
     }
 
     [Fact]

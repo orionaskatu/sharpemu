@@ -68,6 +68,7 @@ public sealed class GpuCommandInterpreterLabelTests
     [InlineData(0x04u, 5u, 0x00u, 0u, EndOfPipeWriteKind.Write64)]
     [InlineData(0x14u, 0u, 0x38u, 0u, EndOfPipeWriteKind.WriteBack64)]
     [InlineData(0x2Fu, 0u, 0x00u, 0u, EndOfPipeWriteKind.Write64)]
+    [InlineData(0x2Fu, 0u, 0x00u, 2u, EndOfPipeWriteKind.Interrupt64)]
     [InlineData(0x04u, 5u, 0x3Bu, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
     [InlineData(0x28u, 0u, 0x38u, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
     public void EndOfPipeWrite64_AcceptedCombinations(uint eventType, uint eventIndex, uint cacheAction, uint interruptSelector, EndOfPipeWriteKind expected)
@@ -81,7 +82,7 @@ public sealed class GpuCommandInterpreterLabelTests
     }
 
     [Theory]
-    [InlineData(0x2Fu, 0u, 0x00u, 2u)]
+    [InlineData(0x2Fu, 5u, 0x00u, 2u)]
     [InlineData(0x04u, 0u, 0x00u, 0u)]
     [InlineData(0x2Fu, 6u, 0x38u, 2u)]
     public void EndOfPipeWrite64_RejectedCombinations(uint eventType, uint eventIndex, uint cacheAction, uint interruptSelector)
@@ -217,6 +218,31 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 3, 0, Label, 0, 0));
         Assert.NotEqual(0UL, runner.Host.ReadQword(Label));
         Assert.Equal(EndOfPipeWriteKind.ClockWrite, runner.Host.EndOfPipeWrites[^1].Kind);
+    }
+
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    public void ReleaseMemory_ComputeDoneWrites64BitsAndDefersTheInterrupt(bool wrapped, int queueId)
+    {
+        var runner = new StreamRunner(queueId);
+        const ulong value = 0x1122_3344_5566_7788;
+        const uint contextId = 9;
+
+        runner.Run(wrapped
+            ? ReleaseMemoryWrapped(0x2F, 0, 2, 2, Label, value, contextId)
+            : ReleaseMemoryNative(0x2F, 6, 0, 0, 2, 2, Label, value, contextId));
+
+        Assert.Equal(value, runner.Host.ReadQword(Label));
+        var write = Assert.Single(runner.Host.EndOfPipeWrites);
+        Assert.Equal(EndOfPipeWriteKind.Interrupt64, write.Kind);
+        Assert.Equal(Label, write.Destination);
+        Assert.Equal(value, write.Value);
+        Assert.Equal(contextId, write.ContextId);
+        Assert.Equal(runner.Interpreter.InterruptEventId, write.EventId);
+        Assert.Equal(new[] { "barrier", "eop Interrupt64" }, runner.Host.Calls);
     }
 
     [Fact]

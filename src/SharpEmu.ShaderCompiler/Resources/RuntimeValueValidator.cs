@@ -36,7 +36,7 @@ public sealed class RuntimeValueValidator
     public static bool IsUniformOperation(ScalarOperation operation) => operation switch
     {
         ScalarOperation.ConvertU32F32 or ScalarOperation.ConvertF32U32 or
-        ScalarOperation.Construct64 or ScalarOperation.Extract64 or
+        ScalarOperation.Construct64 or ScalarOperation.Extract64 or ScalarOperation.QuadMask32 or
         ScalarOperation.BitFieldInsert or ScalarOperation.BitFieldUExtract or ScalarOperation.BitFieldSExtract or
         ScalarOperation.IAdd32 or ScalarOperation.IAdd64 or ScalarOperation.AddCarry32 or
         ScalarOperation.ISub32 or ScalarOperation.ISub64 or ScalarOperation.IMul32 or ScalarOperation.IMul64 or
@@ -49,6 +49,15 @@ public sealed class RuntimeValueValidator
         ScalarOperation.LogicalOr or ScalarOperation.LogicalAnd or ScalarOperation.LogicalXor or ScalarOperation.LogicalNot or
         ScalarOperation.FLessThanEqual or ScalarOperation.FGreaterThanEqual or ScalarOperation.FIsNan or
         ScalarOperation.FMul or ScalarOperation.FTrunc => true,
+        // Every other pure scalar function ScalarOperationSemantics evaluates is as uniform as the
+        // ones above; a descriptor built through them was rejected although the host can compute it.
+        ScalarOperation.UMax32 or ScalarOperation.IAbs32 or ScalarOperation.SMulHi32 or ScalarOperation.UMulHi32 or
+        ScalarOperation.SLessThan32 or ScalarOperation.SLessThanEqual32 or ScalarOperation.SGreaterThan32 or ScalarOperation.SGreaterThanEqual32 or
+        ScalarOperation.ULessThanEqual32 or ScalarOperation.UGreaterThanEqual32 or ScalarOperation.IEqual64 or ScalarOperation.INotEqual64 or
+        ScalarOperation.BitCount32 or ScalarOperation.BitReverse32 or ScalarOperation.FindLowestBit32 or ScalarOperation.FindHighestBit32 or
+        ScalarOperation.QuadMask32 or ScalarOperation.ConvertF32S32 or ScalarOperation.ConvertS32F32 or
+        ScalarOperation.FAdd or ScalarOperation.FSub or ScalarOperation.FMin or ScalarOperation.FMax or
+        ScalarOperation.FEqual or ScalarOperation.FNotEqual or ScalarOperation.FLessThan or ScalarOperation.FGreaterThan => true,
         _ => false,
     };
 

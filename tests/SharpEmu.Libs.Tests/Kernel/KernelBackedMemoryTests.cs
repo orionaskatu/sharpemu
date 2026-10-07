@@ -108,7 +108,10 @@ public sealed class KernelBackedMemoryTests
             });
             memory.AttachGpuQueue(relay, null);
             var reserved = test.Reserve(0x10000, replaceMapping ? address : 0);
-            Assert.Equal(1, relay.DispatchCount);
+            // Replacing a GPU-registered mapping goes through the GPU queue so the pending read
+            // finishes first. A kernel-placed reservation lands in free address space the GPU
+            // cannot be reading, so it does not wait for the queue.
+            Assert.Equal(replaceMapping ? 1 : 0, relay.DispatchCount);
             if (replaceMapping)
                 Assert.Equal(address, reserved);
             else

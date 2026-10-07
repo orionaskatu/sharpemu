@@ -207,7 +207,10 @@ internal static class GuestRedZonePatcher
 
                 functionCount++;
                 instructionCount += decoded.Count;
-                var usesRedZone = protectRedZone && decoded.Any(static entry => UsesRedZone(entry.Instruction));
+                var frameDelta = protectRedZone ? ComputeFramePointerDelta(decoded) : -1;
+                var usesRedZone = protectRedZone &&
+                    (decoded.Any(static entry => UsesRedZone(entry.Instruction)) ||
+                     decoded.Any(entry => UsesFramePointerRedZone(entry.Instruction, frameDelta)));
 
                 if (!usesRedZone && !splitVectorStores && !rewriteSha)
                 {
@@ -349,6 +352,41 @@ internal static class GuestRedZonePatcher
     /// behaviour can be pinned on the byte sequences that occur in real guest
     /// code rather than on a mocked decode.
     /// </summary>
+    // Test hook: the forward span a site at siteAddress gets, as the patcher builds it.
+    internal static bool TryBuildForwardSpan(
+        byte[] code,
+        ulong baseAddress,
+        ulong siteAddress,
+        out int spanLength,
+        out int coreStart,
+        out int coreCount)
+    {
+        spanLength = 0;
+        coreStart = 0;
+        coreCount = 0;
+        var decoded = DecodeFunction(code, baseAddress, baseAddress, baseAddress + (ulong)code.Length);
+        var siteIndex = -1;
+        for (var index = 0; index < decoded.Count; index++)
+        {
+            if (decoded[index].Instruction.IP == siteAddress)
+            {
+                siteIndex = index;
+                break;
+            }
+        }
+
+        if (siteIndex < 0 ||
+            !TryBuildPatchSpan(decoded, siteIndex, CollectBranchTargets(decoded), out var site, out _))
+        {
+            return false;
+        }
+
+        spanLength = site.ByteLength;
+        coreStart = site.CoreStart;
+        coreCount = site.CoreCount;
+        return true;
+    }
+
     internal static bool TryBuildEnclosingSpan(
         byte[] code,
         ulong baseAddress,
@@ -417,8 +455,13 @@ internal static class GuestRedZonePatcher
 
         if (coreStart < 0)
         {
-            coreCount = 0;
-            return false;
+            // Nothing in the span touches guest memory: it is a SHA or vector-store rewrite over
+            // register-only instructions. The span builder already refused anything that touches
+            // RSP, so the whole span can run inside the shift. Refusing it here left every SHA
+            // instruction unrewritten, trapping on each execution on hosts without SHA.
+            coreStart = 0;
+            coreCount = instructions.Count;
+            return true;
         }
 
         for (var index = coreStart; index <= coreEnd; index++)
@@ -590,6 +633,84 @@ internal static class GuestRedZonePatcher
 
         var displacement = unchecked((long)instruction.MemoryDisplacement64);
         return displacement < 0 && displacement >= -GuestRedZoneBytes;
+    }
+
+    // Clang spills into the red zone through the frame pointer as often as through
+    // RSP: with a standard 'push rbp; mov rbp, rsp' frame plus N callee-saved
+    // pushes, RSP sits at RBP-N, so every [rbp-d] with d > N is below RSP and a
+    // host exception frame would overwrite it. Matching only RSP-relative use left
+    // those functions unprotected.
+    internal static bool UsesFramePointerRedZone(in Instruction instruction, int frameDelta)
+    {
+        if (frameDelta < 0 || !HasMemoryOperand(instruction) || instruction.MemoryBase != Register.RBP)
+        {
+            return false;
+        }
+
+        var displacement = unchecked((long)instruction.MemoryDisplacement64);
+        return displacement < -frameDelta && displacement >= -(frameDelta + (long)GuestRedZoneBytes);
+    }
+
+    // Distance from the frame pointer down to RSP for a standard prologue, or -1
+    // when the function does not establish one. Only the leading pushes and the
+    // first 'sub rsp, imm' count, which under-estimates frames that grow later:
+    // under-estimating only widens the guarded window, so it stays conservative.
+    private static int ComputeFramePointerDelta(List<DecodedInstruction> decoded)
+    {
+        if (decoded.Count < 2)
+        {
+            return -1;
+        }
+
+        var push = decoded[0].Instruction;
+        if (push.Mnemonic != Mnemonic.Push ||
+            push.OpCount != 1 ||
+            push.GetOpKind(0) != OpKind.Register ||
+            push.GetOpRegister(0) != Register.RBP)
+        {
+            return -1;
+        }
+
+        var move = decoded[1].Instruction;
+        if (move.Mnemonic != Mnemonic.Mov ||
+            move.OpCount != 2 ||
+            move.GetOpKind(0) != OpKind.Register ||
+            move.GetOpRegister(0) != Register.RBP ||
+            move.GetOpKind(1) != OpKind.Register ||
+            move.GetOpRegister(1) != Register.RSP)
+        {
+            return -1;
+        }
+
+        var delta = 0;
+        for (var index = 2; index < decoded.Count; index++)
+        {
+            var instruction = decoded[index].Instruction;
+            if (instruction.Mnemonic == Mnemonic.Push &&
+                instruction.OpCount == 1 &&
+                instruction.GetOpKind(0) == OpKind.Register)
+            {
+                delta += 8;
+                continue;
+            }
+
+            if (instruction.Mnemonic == Mnemonic.Sub &&
+                instruction.OpCount == 2 &&
+                instruction.GetOpKind(0) == OpKind.Register &&
+                instruction.GetOpRegister(0) == Register.RSP &&
+                instruction.GetOpKind(1) is OpKind.Immediate8 or OpKind.Immediate8to64 or OpKind.Immediate32to64 or OpKind.Immediate32)
+            {
+                var immediate = (long)instruction.GetImmediate(1);
+                if (immediate > 0 && immediate < int.MaxValue - delta)
+                {
+                    delta += (int)immediate;
+                }
+            }
+
+            break;
+        }
+
+        return delta;
     }
 
     private static bool UsesStackMemory(in Instruction instruction)

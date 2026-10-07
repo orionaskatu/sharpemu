@@ -3,8 +3,9 @@
 
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
+using System.Text;
 using SharpEmu.HLE;
+using SkiaSharp;
 
 namespace SharpEmu.Libs.Font;
 
@@ -18,8 +19,38 @@ public static class FontExports
     private static readonly Stack<ulong> FreeGlyphs = new();
     private static ulong _librarySelectionAddress;
     private static ulong _rendererSelectionAddress;
-    private static readonly ConcurrentDictionary<ulong, float> FontHeights = new();
-    private static readonly Lazy<byte[]?> BitmapFont = new(LoadBitmapFont);
+    private static readonly ConcurrentDictionary<ulong, (float Width, float Height)> FontScales = new();
+    private static readonly ConcurrentDictionary<ulong, FontFace> FontFaces = new();
+    private static readonly Lazy<FontFace> DefaultFont = new(() => new(SKTypeface.FromFamilyName(null)));
+
+    [SysAbiExport(
+        Nid = "oaJ1BpN2FQk",
+        ExportName = "sceFontTextSourceInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceFont")]
+    public static int TextSourceInit(CpuContext ctx)
+    {
+        var sourceAddress = ctx[CpuRegister.Rdi];
+        var textAddress = ctx[CpuRegister.Rsi];
+        var textSize = (uint)ctx[CpuRegister.Rdx];
+        if (sourceAddress == 0 || textAddress > ulong.MaxValue - textSize)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        Span<byte> source = stackalloc byte[0x60];
+        source.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x08..], textAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x10..], textAddress == 0 ? 0 : textAddress + textSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x18..], textAddress);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x20..], ctx[CpuRegister.Rcx]);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x28..], ctx[CpuRegister.R8]);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x38..], 0x10);
+        BinaryPrimitives.WriteUInt64LittleEndian(source[0x40..], textSize);
+        return ctx.Memory.TryWrite(sourceAddress, source)
+            ? SetSuccess(ctx)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
 
     [SysAbiExport(
         Nid = "whrS4oksXc4",
@@ -156,13 +187,14 @@ public static class FontExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        // Baseline, line advance, decoration extent: scaled to the font's
-        // current pixel height, matching the ascent convention (height * 0.75)
-        // used by glyph metrics and the rasterizer. A font never given a
-        // scale falls back to the default height of 16, reproducing the
-        // original fixed geometry.
-        var fontHeight = GetFontHeight(ctx[CpuRegister.Rdi]);
-        var values = new[] { fontHeight * 0.75f, (float)fontHeight, 0.0f };
+        var fontHandle = ctx[CpuRegister.Rdi];
+        var scale = GetFontScale(fontHandle);
+        float[] values = [scale.Height * 0.75f, scale.Height, 0];
+        if (FontFaces.TryGetValue(fontHandle, out var face))
+        {
+            var metrics = face.GetMetrics(scale.Width, scale.Height);
+            values = [-metrics.Ascent, metrics.Descent - metrics.Ascent + metrics.Leading, 0];
+        }
         for (var index = 0; index < values.Length; index++)
         {
             if (!TryWriteUInt32(
@@ -199,8 +231,8 @@ public static class FontExports
         // interpreted for vertical writing (e.g. CJK text rendered top-to-bottom).
         // Scaled to the font's current pixel height; the default height of 16
         // reproduces the original fixed geometry.
-        var fontHeight = GetFontHeight(ctx[CpuRegister.Rdi]);
-        var values = new[] { fontHeight * 0.5f, (float)fontHeight, 0.0f };
+        var scale = GetFontScale(ctx[CpuRegister.Rdi]);
+        var values = new[] { scale.Width * 0.5f, scale.Width, 0.0f };
         for (var index = 0; index < values.Length; index++)
         {
             if (!TryWriteUInt32(
@@ -220,16 +252,64 @@ public static class FontExports
         ExportName = "sceFontOpenFontSet",
         Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int OpenFontSet(CpuContext ctx) =>
-        CreateOpaqueHandle(ctx, ctx[CpuRegister.R8], 0x100, magic: 0x0F02);
+    public static int OpenFontSet(CpuContext ctx)
+    {
+        var fontSet = (uint)ctx[CpuRegister.Rsi];
+        var bold = (fontSet & 0xf) >= 7;
+        var italic = ((fontSet >> 20) & 0xf) == 1;
+        var style = bold ? (italic ? SKFontStyle.BoldItalic : SKFontStyle.Bold) :
+            (italic ? SKFontStyle.Italic : SKFontStyle.Normal);
+        return OpenFace(ctx, new(SKTypeface.FromFamilyName(null, style)));
+    }
 
     [SysAbiExport(
         Nid = "KXUpebrFk1U",
         ExportName = "sceFontOpenFontMemory",
         Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int OpenFontMemory(CpuContext ctx) =>
-        CreateOpaqueHandle(ctx, ctx[CpuRegister.R8], 0x100, magic: 0x0F02);
+    public static int OpenFontMemory(CpuContext ctx)
+    {
+        var address = ctx[CpuRegister.Rsi];
+        var size = (uint)ctx[CpuRegister.Rdx];
+        if (address == 0 || size is < 12 or > 64 * 1024 * 1024 || ctx[CpuRegister.R8] == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+        if (!ctx.Memory.CanRead(address, size))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        var bytes = new byte[(int)size];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        uint index = 0;
+        if (ctx[CpuRegister.Rcx] != 0 && !ctx.TryReadUInt32(ctx[CpuRegister.Rcx] + 8, out index))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        if (index > int.MaxValue)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+        using var data = SKData.CreateCopy(bytes);
+        var typeface = SKTypeface.FromData(data, (int)index);
+        return typeface is null
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT)
+            : OpenFace(ctx, new(typeface));
+    }
+
+    private static int OpenFace(CpuContext ctx, FontFace face)
+    {
+        var result = CreateOpaqueHandle(ctx, ctx[CpuRegister.R8], 0x100, magic: 0x0F02);
+        if (result == 0 && ctx.TryReadUInt64(ctx[CpuRegister.R8], out var handle))
+        {
+            FontFaces[handle] = face;
+            FontScales.TryRemove(handle, out _);
+        }
+        return result;
+    }
 
     [SysAbiExport(
         Nid = "JzCH3SCFnAU",
@@ -248,6 +328,8 @@ public static class FontExports
 
         if (setupHandle != 0)
         {
+            if (FontFaces.TryGetValue(sourceHandle, out var face)) FontFaces[setupHandle] = face;
+            FontScales[setupHandle] = GetFontScale(sourceHandle);
             return ctx.TryWriteUInt64(outputAddress, setupHandle)
                 ? SetSuccess(ctx)
                 : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -268,6 +350,8 @@ public static class FontExports
         }
 
         _ = TryWriteUInt16(ctx, handle, 0x0F02);
+        if (FontFaces.TryGetValue(sourceHandle, out var sourceFace)) FontFaces[handle] = sourceFace;
+        FontScales[handle] = GetFontScale(sourceHandle);
         return ctx.TryWriteUInt64(outputAddress, handle)
             ? SetSuccess(ctx)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -307,7 +391,9 @@ public static class FontExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        return WriteGlyphMetrics(ctx, metricsAddress, GetFontHeight(ctx[CpuRegister.Rdi]))
+        var code = (uint)ctx[CpuRegister.Rsi];
+        if (!IsValidCode(code)) return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        return WriteGlyphMetrics(ctx, metricsAddress, GetGlyph(ctx[CpuRegister.Rdi], code), GetFontScale(ctx[CpuRegister.Rdi]).Height)
             ? SetSuccess(ctx)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -466,15 +552,14 @@ public static class FontExports
         var surfaceAddress = ctx[CpuRegister.Rdx];
         var metricsAddress = ctx[CpuRegister.Rcx];
         var resultAddress = ctx[CpuRegister.R8];
-        var height = GetFontHeight(ctx[CpuRegister.Rdi]);
-        var width = Math.Clamp((height + 1) / 2, 4, 128);
-        var rows = BitmapFont.Value;
-        if (rows is null)
-        {
-            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
-        }
+        var font = ctx[CpuRegister.Rdi];
+        var code = (uint)ctx[CpuRegister.Rsi];
+        if (!IsValidCode(code)) return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        var glyph = GetGlyph(font, code);
+        var width = glyph.Width;
+        var height = glyph.Height;
 
-        if (metricsAddress != 0 && !WriteGlyphMetrics(ctx, metricsAddress, height))
+        if (metricsAddress != 0 && !WriteGlyphMetrics(ctx, metricsAddress, glyph, GetFontScale(font).Height))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -483,8 +568,8 @@ public static class FontExports
         ctx.GetXmmRegister(1, out var yBits, out _);
         var x = BitConverter.UInt32BitsToSingle((uint)xBits);
         var y = BitConverter.UInt32BitsToSingle((uint)yBits);
-        var left = float.IsFinite(x) ? Math.Max((int)x, 0) : 0;
-        var top = float.IsFinite(y) ? Math.Max((int)(y - height * 0.75f), 0) : 0;
+        var left = float.IsFinite(x) ? (int)MathF.Floor(x + glyph.BearingX) : 0;
+        var top = float.IsFinite(y) ? (int)MathF.Floor(y - glyph.BearingY) : 0;
 
         ulong buffer = 0;
         uint pitch = 0;
@@ -501,13 +586,14 @@ public static class FontExports
                 BinaryPrimitives.WriteUInt32LittleEndian(result[16..], pitch);
                 result[20] = (byte)pixelSize;
             }
-            BinaryPrimitives.WriteUInt32LittleEndian(result[24..], (uint)left);
-            BinaryPrimitives.WriteUInt32LittleEndian(result[28..], (uint)top);
-            BinaryPrimitives.WriteUInt32LittleEndian(result[32..], (uint)width);
-            BinaryPrimitives.WriteUInt32LittleEndian(result[36..], (uint)height);
-            BinaryPrimitives.WriteSingleLittleEndian(result[44..], height * 0.75f);
-            BinaryPrimitives.WriteSingleLittleEndian(result[48..], width);
-            BinaryPrimitives.WriteSingleLittleEndian(result[52..], width);
+            BinaryPrimitives.WriteUInt32LittleEndian(result[24..], (uint)Math.Max(left, 0));
+            BinaryPrimitives.WriteUInt32LittleEndian(result[28..], (uint)Math.Max(top, 0));
+            BinaryPrimitives.WriteUInt32LittleEndian(result[32..], (uint)Math.Max(width + Math.Min(left, 0), 0));
+            BinaryPrimitives.WriteUInt32LittleEndian(result[36..], (uint)Math.Max(height + Math.Min(top, 0), 0));
+            BinaryPrimitives.WriteSingleLittleEndian(result[40..], glyph.BearingX);
+            BinaryPrimitives.WriteSingleLittleEndian(result[44..], glyph.BearingY);
+            BinaryPrimitives.WriteSingleLittleEndian(result[48..], glyph.Advance);
+            BinaryPrimitives.WriteSingleLittleEndian(result[52..], glyph.Advance);
             BinaryPrimitives.WriteUInt32LittleEndian(result[56..], (uint)width);
             BinaryPrimitives.WriteUInt32LittleEndian(result[60..], (uint)height);
             if (!ctx.Memory.TryWrite(resultAddress, result))
@@ -516,7 +602,7 @@ public static class FontExports
             }
         }
 
-        if (surfaceAddress != 0 && !DrawGlyph(ctx, surfaceAddress, (uint)ctx[CpuRegister.Rsi], left, top, width, height, rows))
+        if (surfaceAddress != 0 && !DrawGlyph(ctx, surfaceAddress, left, top, width, height, glyph.Coverage))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -526,23 +612,34 @@ public static class FontExports
 
     private static int SetFontHeight(CpuContext ctx)
     {
+        ctx.GetXmmRegister(0, out var widthBits, out _);
         ctx.GetXmmRegister(1, out var heightBits, out _);
+        var width = BitConverter.UInt32BitsToSingle((uint)widthBits);
         var height = BitConverter.UInt32BitsToSingle((uint)heightBits);
         if (float.IsFinite(height) && height > 1)
         {
-            FontHeights[ctx[CpuRegister.Rdi]] = Math.Clamp((int)(height + 0.5f), 8, 128);
+            FontScales[ctx[CpuRegister.Rdi]] = (
+                float.IsFinite(width) && width > 1 ? Math.Clamp(width, 8, 128) : Math.Clamp(height, 8, 128),
+                Math.Clamp(height, 8, 128));
         }
         return SetSuccess(ctx);
     }
 
-    private static int GetFontHeight(ulong font) =>
-        FontHeights.TryGetValue(font, out var height) ? (int)height : 16;
+    private static (float Width, float Height) GetFontScale(ulong font) =>
+        FontScales.TryGetValue(font, out var scale) ? scale : (16, 16);
 
-    private static bool WriteGlyphMetrics(CpuContext ctx, ulong address, int height)
+    private static bool IsValidCode(uint code) => (code & 0xffff0000) == 0x80000000 || Rune.IsValid((int)code);
+
+    private static FontGlyph GetGlyph(ulong font, uint code)
     {
-        var width = Math.Clamp((height + 1) / 2, 4, 128);
+        var scale = GetFontScale(font);
+        return (FontFaces.TryGetValue(font, out var face) ? face : DefaultFont.Value).GetGlyph(code, scale.Width, scale.Height);
+    }
+
+    private static bool WriteGlyphMetrics(CpuContext ctx, ulong address, FontGlyph glyph, float height)
+    {
         Span<byte> metrics = stackalloc byte[32];
-        float[] values = [width, height, 0, height * 0.75f, width, 0, 0, height];
+        float[] values = [glyph.Width, glyph.Height, glyph.BearingX, glyph.BearingY, glyph.Advance, 0, 0, height];
         for (var index = 0; index < values.Length; index++)
         {
             BinaryPrimitives.WriteSingleLittleEndian(metrics[(index * 4)..], values[index]);
@@ -550,8 +647,8 @@ public static class FontExports
         return ctx.Memory.TryWrite(address, metrics);
     }
 
-    internal static bool DrawGlyph(CpuContext ctx, ulong surface, uint code, int left, int top,
-        int glyphWidth, int glyphHeight, byte[] font)
+    internal static bool DrawGlyph(CpuContext ctx, ulong surface, int left, int top,
+        int glyphWidth, int glyphHeight, byte[] coverage)
     {
         if (!ctx.TryReadUInt64(surface, out var buffer) ||
             !ctx.TryReadUInt32(surface + 8, out var pitch) ||
@@ -571,7 +668,6 @@ public static class FontExports
             return true;
         }
 
-        code = code < 256 ? code : (uint)'?';
         var x0 = Math.Max(left, (int)Math.Min(sx0, width));
         var y0 = Math.Max(top, (int)Math.Min(sy0, height));
         var x1 = Math.Min(left + glyphWidth, (int)Math.Min(sx1, width));
@@ -591,11 +687,12 @@ public static class FontExports
             }
             for (var xx = x0; xx < x1; xx++)
             {
-                var sourceY = (yy - top) * 16 / glyphHeight;
-                var sourceX = (xx - left) * 8 / glyphWidth;
-                if ((font[code * 16 + sourceY] & (0x80 >> sourceX)) != 0)
+                var alpha = coverage[(yy - top) * glyphWidth + xx - left];
+                if (alpha != 0)
                 {
-                    line.AsSpan((xx - x0) * (int)pixelSize, (int)pixelSize).Fill(0xff);
+                    var pixel = line.AsSpan((xx - x0) * (int)pixelSize, (int)pixelSize);
+                    for (var component = 0; component < pixel.Length; component++)
+                        pixel[component] = (byte)(alpha + (pixel[component] * (255 - alpha) + 127) / 255);
                 }
             }
             if (!ctx.Memory.TryWrite(address, line))
@@ -606,25 +703,17 @@ public static class FontExports
         return true;
     }
 
-    private static byte[]? LoadBitmapFont()
-    {
-        var library = Path.Combine(AppContext.BaseDirectory, "plugins", "avutil-59.dll");
-        if (!NativeLibrary.TryLoad(library, out var handle) ||
-            !NativeLibrary.TryGetExport(handle, "avpriv_vga16_font", out var data))
-        {
-            return null;
-        }
-        var font = new byte[4096];
-        Marshal.Copy(data, font, 0, font.Length);
-        return font;
-    }
-
     [SysAbiExport(
         Nid = "vzHs3C8lWJk",
         ExportName = "sceFontCloseFont",
         Target = Generation.Gen5,
         LibraryName = "libSceFont")]
-    public static int CloseFont(CpuContext ctx) => SetSuccess(ctx);
+    public static int CloseFont(CpuContext ctx)
+    {
+        FontFaces.TryRemove(ctx[CpuRegister.Rdi], out _);
+        FontScales.TryRemove(ctx[CpuRegister.Rdi], out _);
+        return SetSuccess(ctx);
+    }
 
     [SysAbiExport(
         Nid = "1QjhKxrsOB8",

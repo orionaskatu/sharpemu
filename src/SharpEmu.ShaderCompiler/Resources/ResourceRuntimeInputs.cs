@@ -38,9 +38,14 @@ public sealed record ResourceRuntimeInputs
     // few milliseconds may then be reused instead of read again.
     public bool AllowTransientTableReuse { get; init; }
 
+    public ResidentGuestBytesReader? ReadResidentMemory { get; init; }
+
+    public bool ReadsClean { get; init; }
+
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => this with
     {
         ReadMemory = reader,
+        ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
     };
 }
 

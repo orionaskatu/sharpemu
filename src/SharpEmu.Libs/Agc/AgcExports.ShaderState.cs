@@ -1,10 +1,12 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.ShaderCompiler;
 
@@ -352,7 +354,17 @@ public static partial class AgcExports
         ExportName = "sceAgcFuseShaderHalves",
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
-    public static int FuseShaderHalves(CpuContext ctx)
+    public static int FuseShaderHalves(CpuContext ctx) => FuseShaderHalvesCore(ctx, legacy: false);
+    #pragma warning restore SHEM004
+
+    [SysAbiExport(
+        Nid = "nApJjpKNBl4",
+        ExportName = "sceAgcFuseShaderHalves",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int FuseShaderHalvesLegacy(CpuContext ctx) => FuseShaderHalvesCore(ctx, legacy: true);
+
+    private static int FuseShaderHalvesCore(CpuContext ctx, bool legacy)
     {
         var fusedAddress = ctx[CpuRegister.Rdi];
         var frontAddress = ctx[CpuRegister.Rsi];
@@ -404,6 +416,12 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        ulong userDataAddress = 0;
+        if (legacy && !TryReadUInt64(ctx, frontAddress + ShaderUserDataOffset, out userDataAddress))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
         Span<byte> header = stackalloc byte[ShaderStructBytes];
         if (!ctx.Memory.TryRead(backAddress, header) ||
             !ctx.Memory.TryWrite(fusedAddress, header))
@@ -425,13 +443,13 @@ public static partial class AgcExports
         }
 
         if (!TryWriteByte(ctx, fusedAddress + ShaderTypeOffset, isGeometryPair ? GsShaderType : HsShaderType) ||
-            !ctx.TryWriteUInt64(fusedAddress + ShaderUserDataOffset, 0) ||
+            !ctx.TryWriteUInt64(fusedAddress + ShaderUserDataOffset, userDataAddress) ||
             !ctx.TryWriteUInt64(fusedAddress + ShaderShRegistersOffset, fusedRegistersAddress))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        if (isGeometryPair)
+        if (isGeometryPair || legacy)
         {
             if (!TryReadUInt64(ctx, frontAddress + ShaderShRegistersOffset, out var frontRegistersAddress) ||
                 !TryReadByte(ctx, frontAddress + ShaderNumShRegistersOffset, out var frontRegisterCount))
@@ -439,17 +457,19 @@ public static partial class AgcExports
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
-            // Both halves share one user-data block, so the fused USER_SGPR count is
-            // the larger of the two.
-            if (!MergeFusedUserScalarCount(ctx, frontRegistersAddress, frontRegisterCount, fusedRegistersAddress, registerCount))
+            var merged = legacy
+                ? MergeLegacyFusedShaderRegisters(ctx, frontRegistersAddress, frontRegisterCount, fusedRegistersAddress, registerCount, isGeometryPair)
+                : MergeFusedUserScalarCount(ctx, frontRegistersAddress, frontRegisterCount, fusedRegistersAddress, registerCount);
+            if (!merged)
             {
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
+            var checksumOffset = isGeometryPair ? SpiShaderPgmChksumGs : ShaderRegisterOffset.SpiShaderPgmChksumHs;
             for (var occurrence = 0; occurrence < 2; occurrence++)
             {
-                if (!TryFindShaderRegister(ctx, fusedRegistersAddress, registerCount, SpiShaderPgmChksumGs, occurrence, out var fusedEntry) ||
-                    !TryFindShaderRegister(ctx, frontRegistersAddress, frontRegisterCount, SpiShaderPgmChksumGs, occurrence, out var frontEntry))
+                if (!TryFindShaderRegister(ctx, fusedRegistersAddress, registerCount, checksumOffset, occurrence, out var fusedEntry) ||
+                    !TryFindShaderRegister(ctx, frontRegistersAddress, frontRegisterCount, checksumOffset, occurrence, out var frontEntry))
                 {
                     continue;
                 }
@@ -487,7 +507,6 @@ public static partial class AgcExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
-    #pragma warning restore SHEM004
 
     [SysAbiExport(
         Nid = "D9sr1xGUriE",
@@ -587,9 +606,15 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
+        Span<byte> registers = stackalloc byte[InterpolantRegisterCount * InterpolantRegisterPairSize];
+        for (var i = 0; i < InterpolantRegisterCount; i++)
+        {
+            SetInterpolantRegister(registers, i, (uint)i);
+        }
+
         if (inputSemanticsCount == 0)
         {
-            if (!TryWriteIdentityInterpolantRegisters(ctx, registersAddress, 0))
+            if (!ctx.Memory.TryWrite(registersAddress, registers))
             {
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
@@ -617,82 +642,74 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        for (uint inputIndex = 0; inputIndex < inputSemanticsCount; inputIndex++)
+        Span<byte> inputWords = stackalloc byte[(int)inputSemanticsCount * sizeof(uint)];
+        var outputBytes = outputSemanticsCount * sizeof(uint);
+        var rentedOutputWords = outputBytes > 1024 ? ArrayPool<byte>.Shared.Rent(outputBytes) : null;
+        try
         {
-            if (!TryReadUInt32(
-                    ctx,
-                    inputSemanticsAddress + (inputIndex * sizeof(uint)),
-                    out var source))
+            var outputWords = rentedOutputWords is null ? stackalloc byte[outputBytes] : rentedOutputWords.AsSpan(0, outputBytes);
+            if (!ctx.Memory.TryRead(inputSemanticsAddress, inputWords) ||
+                (outputBytes != 0 && !ctx.Memory.TryRead(outputSemanticsAddress, outputWords)))
             {
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
-            var hasMask = false;
-            var mask = 0u;
-            for (uint outputIndex = 0; outputIndex < outputSemanticsCount; outputIndex++)
+            for (var inputIndex = 0; inputIndex < (int)inputSemanticsCount; inputIndex++)
             {
-                if (!TryReadUInt32(
-                        ctx,
-                        outputSemanticsAddress + (outputIndex * sizeof(uint)),
-                        out var candidate))
-                {
-                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-                }
+                var source = BinaryPrimitives.ReadUInt32LittleEndian(inputWords[(inputIndex * sizeof(uint))..]);
+                var hasMask = TryFindOutputSemantic(outputWords, source, out var mask);
 
-                if ((byte)candidate == (byte)source)
+                var mode = (source >> 20) & 0x3u;
+                uint flags;
+                if (mode == 0)
                 {
-                    hasMask = true;
-                    mask = candidate;
-                    break;
-                }
-            }
-
-            var mode = (source >> 20) & 0x3u;
-            uint flags;
-            if (mode == 0)
-            {
-                flags = (((source >> 24) & 0x1u) | (hasMask ? 0u : 1u)) << 5;
-                flags = ApplyInterpolantTwoBitField(flags, source >> 28, 8);
-            }
-            else
-            {
-                flags = ((source << 4) & 0x0300_0000u) + 0x0008_0000u;
-                if (mode == 2)
-                {
-                    flags &= 0xFFEF_FFDFu;
-                    flags |= hasMask ? ((~(mask & source) >> 16) & 0x20u) : 0x20u;
-                    flags = ApplyInterpolantTwoBitField(flags, source >> 30, 8);
-                    flags = ApplyInterpolantTwoBitField(flags, source >> 30, 21);
+                    flags = (((source >> 24) & 0x1u) | (hasMask ? 0u : 1u)) << 5;
+                    flags = ApplyInterpolantTwoBitField(flags, source >> 28, 8);
                 }
                 else
                 {
-                    if (hasMask)
+                    flags = ((source << 4) & 0x0300_0000u) + 0x0008_0000u;
+                    if (mode == 2)
                     {
-                        var masked = mask & source;
-                        flags = (flags & 0xFFFF_FFDFu) | ((masked >> 15) & 0x20u);
-                        flags ^= 0x20u;
-                        flags = (flags & 0xFFEF_FFFFu) | ((~masked >> 1) & 0x0010_0000u);
+                        flags &= 0xFFEF_FFDFu;
+                        flags |= hasMask ? ((~(mask & source) >> 16) & 0x20u) : 0x20u;
+                        flags = ApplyInterpolantTwoBitField(flags, source >> 30, 8);
+                        flags = ApplyInterpolantTwoBitField(flags, source >> 30, 21);
                     }
                     else
                     {
-                        flags |= 0x0010_0020u;
+                        if (hasMask)
+                        {
+                            var masked = mask & source;
+                            flags = (flags & 0xFFFF_FFDFu) | ((masked >> 15) & 0x20u);
+                            flags ^= 0x20u;
+                            flags = (flags & 0xFFEF_FFFFu) | ((~masked >> 1) & 0x0010_0000u);
+                        }
+                        else
+                        {
+                            flags |= 0x0010_0020u;
+                        }
+
+                        flags = ApplyInterpolantTwoBitField(flags, source >> 28, 8);
+                        flags = ApplyInterpolantTwoBitField(flags, source >> 30, 21);
                     }
-
-                    flags = ApplyInterpolantTwoBitField(flags, source >> 28, 8);
-                    flags = ApplyInterpolantTwoBitField(flags, source >> 30, 21);
                 }
-            }
 
-            flags = hasMask
-                ? ApplyInterpolantFinalMask(flags, source, mask)
-                : flags & 0xFFFF_FBE0u;
-            if (!TryWriteInterpolantRegister(ctx, registersAddress, inputIndex, flags))
+                flags = hasMask
+                    ? ApplyInterpolantFinalMask(flags, source, mask)
+                    : flags & 0xFFFF_FBE0u;
+                SetInterpolantRegister(registers, inputIndex, flags);
+            }
+        }
+        finally
+        {
+            if (rentedOutputWords is not null)
             {
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                ArrayPool<byte>.Shared.Return(rentedOutputWords);
             }
         }
 
-        if (!TryWriteIdentityInterpolantRegisters(ctx, registersAddress, inputSemanticsCount))
+        if (!ctx.Memory.TryWrite(registersAddress, registers))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -808,9 +825,17 @@ public static partial class AgcExports
             }
         }
 
+        // The 32 (register, value) pairs are built here and written with one guest write; titles
+        // call this per draw, and 64 separate 4-byte writes each paid the guest write path.
+        Span<byte> registers = stackalloc byte[InterpolantRegisterCount * InterpolantRegisterPairSize];
+        for (var i = 0; i < InterpolantRegisterCount; i++)
+        {
+            SetInterpolantRegister(registers, i, (uint)i);
+        }
+
         if (inputSemanticsCount == 0 || inputSemanticsAddress == 0)
         {
-            if (!TryWriteIdentityInterpolantRegisters(ctx, registersAddress, 0))
+            if (!ctx.Memory.TryWrite(registersAddress, registers))
             {
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
@@ -834,53 +859,48 @@ public static partial class AgcExports
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        inputSemanticsCount = Math.Min(inputSemanticsCount, 32u);
-        for (uint psIndex = 0; psIndex < inputSemanticsCount; psIndex++)
+        inputSemanticsCount = Math.Min(inputSemanticsCount, (uint)InterpolantRegisterCount);
+        Span<byte> psWords = stackalloc byte[(int)inputSemanticsCount * sizeof(uint)];
+        if (!ctx.Memory.TryRead(inputSemanticsAddress, psWords))
         {
-            if (!TryReadUInt32(
-                    ctx,
-                    inputSemanticsAddress + (psIndex * sizeof(uint)),
-                    out var psWord))
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var gsBytes = (outputSemanticsAddress != 0 ? outputSemanticsCount : 0) * sizeof(uint);
+        var rentedGsWords = gsBytes > 1024 ? ArrayPool<byte>.Shared.Rent(gsBytes) : null;
+        try
+        {
+            var gsWords = rentedGsWords is null ? stackalloc byte[gsBytes] : rentedGsWords.AsSpan(0, gsBytes);
+            if (gsBytes != 0 && !ctx.Memory.TryRead(outputSemanticsAddress, gsWords))
             {
                 return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
             }
 
-            var psSemantic = psWord & 0xFFu;
-            uint? gsWord = null;
-            if (outputSemanticsAddress != 0)
+            for (var psIndex = 0; psIndex < (int)inputSemanticsCount; psIndex++)
             {
-                for (uint gsIndex = 0; gsIndex < outputSemanticsCount; gsIndex++)
-                {
-                    if (!TryReadUInt32(
-                            ctx,
-                            outputSemanticsAddress + (gsIndex * sizeof(uint)),
-                            out var candidate))
-                    {
-                        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
-                    }
+                var psWord = BinaryPrimitives.ReadUInt32LittleEndian(psWords[(psIndex * sizeof(uint))..]);
+                uint? gsWord = TryFindOutputSemantic(gsWords, psWord, out var candidate) ? candidate : null;
 
-                    if ((candidate & 0xFFu) == psSemantic)
-                    {
-                        gsWord = candidate;
-                        break;
-                    }
-                }
+                var value = (psWord & 0x0030_0000u) != 0
+                    ? CreateInterpolantF16Value(psWord, gsWord)
+                    : CreateInterpolantNonF16Value(psWord, gsWord.HasValue);
+                SetInterpolantRegister(
+                    registers,
+                    psIndex,
+                    gsWord is { } matched
+                        ? CreateInterpolantMappingValue(value, psWord, matched)
+                        : CreateInterpolantDefaultParamValue(value, psWord));
             }
-
-            var value = (psWord & 0x0030_0000u) != 0
-                ? CreateInterpolantF16Value(psWord, gsWord)
-                : CreateInterpolantNonF16Value(psWord, gsWord.HasValue);
-            value = gsWord is { } matched
-                ? CreateInterpolantMappingValue(value, psWord, matched)
-                : CreateInterpolantDefaultParamValue(value, psWord);
-
-            if (!TryWriteInterpolantRegister(ctx, registersAddress, psIndex, value))
+        }
+        finally
+        {
+            if (rentedGsWords is not null)
             {
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+                ArrayPool<byte>.Shared.Return(rentedGsWords);
             }
         }
 
-        if (!TryWriteIdentityInterpolantRegisters(ctx, registersAddress, inputSemanticsCount))
+        if (!ctx.Memory.TryWrite(registersAddress, registers))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -959,31 +979,31 @@ public static partial class AgcExports
         return value;
     }
 
-    private static bool TryWriteInterpolantRegister(
-        CpuContext ctx,
-        ulong registersAddress,
-        uint index,
-        uint value)
-    {
-        var destination = registersAddress + (index * 8);
-        return TryWriteUInt32(ctx, destination, SpiPsInputCntl0 + index) &&
-               TryWriteUInt32(ctx, destination + sizeof(uint), value);
-    }
+    private const int InterpolantRegisterCount = 32;
+    private const int InterpolantRegisterPairSize = 2 * sizeof(uint);
 
-    private static bool TryWriteIdentityInterpolantRegisters(
-        CpuContext ctx,
-        ulong registersAddress,
-        uint firstIndex)
+    // The output (GS/VS export) semantic word whose semantic id (low byte) matches an input's.
+    private static bool TryFindOutputSemantic(ReadOnlySpan<byte> outputWords, uint inputWord, out uint outputWord)
     {
-        for (uint i = firstIndex; i < 32u; i++)
+        for (var offset = 0; offset + sizeof(uint) <= outputWords.Length; offset += sizeof(uint))
         {
-            if (!TryWriteInterpolantRegister(ctx, registersAddress, i, i))
+            outputWord = BinaryPrimitives.ReadUInt32LittleEndian(outputWords[offset..]);
+            if ((byte)outputWord == (byte)inputWord)
             {
-                return false;
+                return true;
             }
         }
 
-        return true;
+        outputWord = 0;
+        return false;
+    }
+
+    // Slot i is the pair (SPI_PS_INPUT_CNTL_0 + i, value).
+    private static void SetInterpolantRegister(Span<byte> registers, int index, uint value)
+    {
+        var pair = registers[(index * InterpolantRegisterPairSize)..];
+        BinaryPrimitives.WriteUInt32LittleEndian(pair, SpiPsInputCntl0 + (uint)index);
+        BinaryPrimitives.WriteUInt32LittleEndian(pair[sizeof(uint)..], value);
     }
 
     private static OrbisGen2Result PatchShaderProgramRegisters(CpuContext context, ulong headerAddress, ulong codeAddress)
@@ -1259,6 +1279,46 @@ public static partial class AgcExports
         var count = Math.Max(UserScalarCount(front), UserScalarCount(fused));
         var merged = (fused & ~((0x1Fu << 1) | (1u << 27))) | ((count & 0x1Fu) << 1) | ((count >> 5) << 27);
         return merged == fused || TryWriteUInt32(ctx, fusedEntry + sizeof(uint), merged);
+    }
+
+    private static bool MergeLegacyFusedShaderRegisters(
+        CpuContext ctx, ulong frontRegisters, int frontCount, ulong fusedRegisters, int fusedCount, bool geometry)
+    {
+        var rsrc1Offset = geometry ? SpiShaderPgmRsrc1Gs : SpiShaderPgmRsrc1Hs;
+        var rsrc2Offset = geometry ? SpiShaderPgmRsrc2Gs : ShaderRegisterOffset.SpiShaderPgmRsrc2Hs;
+        if (!TryFindShaderRegister(ctx, frontRegisters, frontCount, rsrc1Offset, 0, out var frontEntry1) ||
+            !TryFindShaderRegister(ctx, frontRegisters, frontCount, rsrc2Offset, 0, out var frontEntry2) ||
+            !TryFindShaderRegister(ctx, fusedRegisters, fusedCount, rsrc1Offset, 0, out var fusedEntry1) ||
+            !TryFindShaderRegister(ctx, fusedRegisters, fusedCount, rsrc2Offset, 0, out var fusedEntry2))
+        {
+            return true;
+        }
+
+        if (!TryReadUInt32(ctx, frontEntry1 + sizeof(uint), out var front1) ||
+            !TryReadUInt32(ctx, frontEntry2 + sizeof(uint), out var front2) ||
+            !TryReadUInt32(ctx, fusedEntry1 + sizeof(uint), out var fused1) ||
+            !TryReadUInt32(ctx, fusedEntry2 + sizeof(uint), out var fused2))
+        {
+            return false;
+        }
+
+        // The older export takes maximum allocations, but user SGPRs and the
+        // ES component flag belong to the front half, not the back half.
+        fused1 = MergeMaxField(fused1, front1, 0, 0x3Fu);
+        fused1 = MergeMaxField(fused1, front1, geometry ? 29 : 28, 3u);
+        fused2 = MergeMaxField(fused2, front2, 28, 0xFu);
+        if (geometry)
+        {
+            fused2 = MergeMaxField(fused2, front2, 16, 3u);
+            fused2 = (fused2 & ~0x0004_0000u) | (front2 & 0x0004_0000u);
+        }
+
+        fused2 = (fused2 & ~0x0800_003Eu) | (front2 & 0x0800_003Eu);
+        return TryWriteUInt32(ctx, fusedEntry1 + sizeof(uint), fused1) &&
+               TryWriteUInt32(ctx, fusedEntry2 + sizeof(uint), fused2);
+
+        static uint MergeMaxField(uint destination, uint source, int shift, uint mask) =>
+            (destination & ~(mask << shift)) | (Math.Max((destination >> shift) & mask, (source >> shift) & mask) << shift);
     }
 
     private static bool TryFindShaderRegister(

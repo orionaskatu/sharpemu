@@ -9,6 +9,8 @@ public enum CommandSubmissionKind
     Compute,
     // A video-out export flip queued behind the graphics submissions before it.
     FlipPreparation,
+    // A suspend point queued behind the graphics submissions of the frame it ends.
+    FrameBoundary,
 }
 
 public enum SubmissionProgress
@@ -103,6 +105,8 @@ public sealed class CommandSubmission
 
     // The submitter's own sequence number, kept for diagnostics and the translation state.
     public ulong SubmissionId { get; }
+
+    internal ulong AdmissionOrdinal { get; set; }
 
     // Snapshots captured at submit time; the processor never reads them.
     public object? GeometrySnapshots { get; }

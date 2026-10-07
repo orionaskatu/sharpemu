@@ -49,6 +49,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ---
 
+> [!IMPORTANT]
+> **Official channels:** Only **sharpemu.app** and the links listed in this GitHub repository are affiliated with SharpEmu. Any other websites, accounts, or donation pages are unofficial and unauthorized.
+
 > [!NOTE]  
 > SharpEmu supports Windows x64, Linux x64, and macOS x64. Apple Silicon Macs
 > can run the macOS x64 build through Rosetta 2, and Windows on ARM devices
@@ -69,17 +72,17 @@ Our goal is **not** to emulate PS4 games, as there is already an excellent emula
 
 ## Games Tested
 
-|               Demons Souls Remake                   |                     Tomb Raider V Remastered                        |
+|               Demon's Souls Remake                   |                     ASTRO BOT                        |
 | :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![DeS screenshot](./.github/images/demons-souls.jpg) | ![Tomb Raider V](./.github/images/tomb-raider-v-remastered.jpg) |
+| ![DeS screenshot](./.github/images/demons-souls.jpg) | ![Astro Bot](./.github/images/astro-bot.jpg) |
 
-|                  Hades                    |                 Dead Cells                    |
+|                  ASTRO's PLAYROOM                    |                 Dead Cells                    |
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Hades](./.github/images/hades.jpg) | ![Dead Cells](./.github/images/dead-cells.jpg) |
+| ![Astro's Playroom](./.github/images/astros-playroom.jpg) | ![Dead Cells](./.github/images/dead-cells.jpg) |
 
-|                  PAC-MAN World Re-PAC                    |                 Astro Bot                    |
+|                  God of War: Sons of Sparta                    |                 Tomb Raider V Remastered                    |
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Pac-Man](./.github/images/pac-man-world-re-pac.jpg) | ![Astro Bot](./.github/images/astro-bot.jpg) |
+| ![GoW SOS](./.github/images/gow-sos.jpg) | ![Tomb Raider V](./.github/images/tomb-raider-v-remastered.jpg) |
 
 ## Status
 

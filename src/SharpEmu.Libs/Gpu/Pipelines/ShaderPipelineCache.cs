@@ -183,6 +183,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             pixelOutputs = ResolveBoundTargets(context, targetExportMapping, depthBound ? pixelProgram.PixelColorExportMasks : null,
                 out var outputModes, out var outputMappings);
             pixelInfo = PixelStageInputResolver.Resolve(_context, pixelSource.Registered, shaderInterface, outputModes, outputMappings, inputCount);
+            // SPI_PS_INPUT_CNTL can map an input to any parameter export, beyond the input count;
+            // the vertex program must declare every location the pixel program reads.
+            attributeCount = Math.Max(attributeCount, ReadVertexOutputCount(pixelProgram, pixelInfo));
         }
 
         ShaderProgram vertexProgram;
@@ -274,6 +277,32 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         return VertexInputResolver.ResolveVertexInputs(_context, source.Registered, source.UserData,
             shaderInterface.VertexOutputControl, clipSpace);
+    }
+
+    // One past the highest parameter location the pixel program reads, resolved as its translator does.
+    private static uint ReadVertexOutputCount(Gen5ShaderProgram pixelProgram, PixelInputInfo info)
+    {
+        var attributes = pixelProgram.Instructions
+            .Select(static instruction => instruction.Control)
+            .OfType<Gen5InterpolationControl>()
+            .Select(static control => control.Attribute)
+            .Distinct()
+            .Order()
+            .ToArray();
+        if (attributes.Length == 0)
+        {
+            return 0;
+        }
+
+        var controls = new uint[32];
+        for (var index = 0u; index < (uint)controls.Length; index++)
+        {
+            controls[index] = index < info.InputCount && index < (uint)info.InterpolatorSettings.Length
+                ? info.InterpolatorSettings[index]
+                : index;
+        }
+
+        return Gen5PixelInputMapping.ResolveLocations(controls, attributes).Max() + 1;
     }
 
     private static uint InterpolatedAttributeCount(Gen5ShaderProgram program)
@@ -589,7 +618,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
                 RenderTrace.Write(
-                    $"PipelineCache output slot={color.Slot} guestMask=0x{context.RenderTargetMaskForSlot(color.Slot):X} " +
+                    $"PipelineCache output slot={color.Slot} export={exportTarget} " +
+                    $"guestMask=0x{context.RenderTargetMaskForSlot(color.Slot):X} " +
                     $"exported={(exported ? 1 : 0)} shaderMask=0x{pixelStage?.PixelColorExportMasks ?? 0:X8} " +
                     $"mapping=0x{color.Resolution.ExportMapping.Packed:X2} hostMask=0x{colorMask:X} format={(int)format}");
             }
@@ -732,6 +762,39 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             _computePipelines.Add(key, created);
             ShaderCacheCounters.CountComputePipeline();
             return created;
+        }
+    }
+
+    public bool TryCreateComputePipeline(ComputeInputInfo input, ShaderProgram program, out PipelineHandle handle)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
+        handle = default;
+        if (!program.IsValid)
+        {
+            throw SubmissionScheduler.Fatal("The dispatch has no compute program.");
+        }
+
+        var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
+        var key = new ComputePipelineKey(program.Id);
+        lock (_gate)
+        {
+            if (_computePipelines.TryGetValue(key, out var cached))
+            {
+                handle = cached;
+                return true;
+            }
+
+            if (!_host.TryCreateComputePipeline(
+                    new ComputePipelineDescription { Input = input, Program = program, Stage = stage },
+                    out var created))
+            {
+                return false;
+            }
+
+            _computePipelines.Add(key, created);
+            ShaderCacheCounters.CountComputePipeline();
+            handle = created;
+            return true;
         }
     }
 }

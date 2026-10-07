@@ -5,6 +5,7 @@ namespace SharpEmu.Libs.VideoOut;
 
 using System.Diagnostics;
 using SharpEmu.HLE.GpuMemory;
+using System.Diagnostics;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Pipelines;
@@ -48,6 +49,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public GraphicsPipelineDescription? Description;
             public Pipeline StripVariant;
             public Pipeline ListVariant;
+            public Pipeline RectangleVariant;
             public ulong ProfileVertexHash;
             public ulong ProfilePixelHash;
             public ulong ProfileComputeHash;
@@ -56,6 +58,9 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
+        private readonly Dictionary<ulong, int> _shaderModuleSpirvBytes = new();
+        private readonly Dictionary<ulong, string> _shaderModuleCacheIdentities = new();
+        private long _pipelineCreationMilliseconds;
         private KhrPushDescriptor _pushDescriptorApi = null!;
         private uint _maxPushDescriptors;
         private uint _maxPerStageSampledImages = uint.MaxValue;
@@ -104,17 +109,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
         bool IShaderPipelineHost.ExecGuardElisionEnabled => _physicalDeviceVendorId != NvidiaVendorId;
         bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
+        bool IShaderPipelineHost.ClipDistanceEnabled => _supportsShaderClipDistance;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
 
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
-
-        // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
-        private bool DbgShaderRead(ulong address) // TEMP
-        {
-            _bufferCache.DbgFault(address, "shader-read");
-            return true;
-        }
 
         private readonly record struct PageHistory(ulong Contents, int Streak, int SinceConfirm);
         private readonly Dictionary<ulong, PageHistory> _pageHistory = new();
@@ -122,74 +121,80 @@ internal static unsafe partial class VulkanVideoPresenter
         private const int SpeculationStreak = 4;
         private const int SpeculationInterval = 8;
 
+        // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
-            var speculated = false;
-            // Resource planning can inspect a dynamic descriptor before the draw has
-            // supplied a valid guest address.  Do not pass an invalid range to the
-            // page tracker: it treats that as an emulator invariant violation and
-            // terminates the process.  A failed read lets the materializer reject or
-            // specialize the source normally.
-            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            var synchronized = false;
+            if (IsCleanReadPage(address, sizeof(uint)))
             {
-                return false;
-            }
-
-            // Only the bytes a buffer write covered can differ from guest memory: a GPU write
-            // elsewhere on the page does not make this word stale, so it needs no download.
-            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && _bufferCache.MayHaveGpuDirtyPages(address, 4) && DbgShaderRead(address))
-            {
-                // A page the GPU keeps rewriting with the same contents costs a full GPU wait per read. One
-                // that held its contents across several waits is read as last synchronized, and a real
-                // read confirms it every few uses, so a change shows up within a few draws.
-                if (SpeculateReads && _pageHistory.TryGetValue(address >> 7, out var history) &&
-                    history.Streak >= SpeculationStreak && history.SinceConfirm < SpeculationInterval)
+                if (TryGetAliasPointer(address, sizeof(uint), out var alias))
                 {
-                    _pageHistory[address >> 7] = history with { SinceConfirm = history.SinceConfirm + 1 };
-                    speculated = true;
-                    _dbgSpecSkips++; // TEMP
+                    word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
+                    return true;
                 }
-
-                if (!speculated)
-                {
-                var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
-                var synchronized = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                    SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
-                if (Diagnostics.DbgReadbackStats.Enabled) // TEMP
-                    Diagnostics.DbgReadbackStats.Record(address, System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds);
-                if (!synchronized)
+            }
+            else
+            {
+                // Resource planning can inspect a dynamic descriptor before the draw has
+                // supplied a valid guest address.  Do not pass an invalid range to the
+                // page tracker: it treats that as an emulator invariant violation and
+                // terminates the process.  A failed read lets the materializer reject or
+                // specialize the source normally.
+                if (!_guestMemory.CanRead(address, sizeof(uint)))
                 {
                     return false;
                 }
 
-                if (SpeculateReads)
+                if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
                 {
-                    var pageBytes = new byte[128];
-                    if (_guestMemory.TryRead(address & ~0x7Ful, pageBytes))
+                    if (Diagnostics.GpuReadTrace.Enabled)
                     {
-                        var contents = System.IO.Hashing.XxHash3.HashToUInt64(pageBytes);
-                        _pageHistory[address >> 7] = _pageHistory.TryGetValue(address >> 7, out var previous) && previous.Contents == contents
-                            ? new PageHistory(contents, previous.Streak + 1, 0)
-                            : new PageHistory(contents, 0, 0);
-                        if (_pageHistory.Count > 16384)
+                        Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
+                    }
+
+                    // Opt-in experiment (SHARPEMU_SPECULATE_READS=1): a page the GPU keeps rewriting with the
+                    // same contents costs a full GPU wait per read. One that held its contents across several
+                    // waits is read as last synchronized, and a real read confirms it every few uses, so a
+                    // change shows up within a few draws.
+                    if (SpeculateReads && _pageHistory.TryGetValue(address >> 7, out var history) &&
+                        history.Streak >= SpeculationStreak && history.SinceConfirm < SpeculationInterval)
+                    {
+                        _pageHistory[address >> 7] = history with { SinceConfirm = history.SinceConfirm + 1 };
+                    }
+                    else
+                    {
+                        var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
+                        if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                                SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
                         {
-                            _pageHistory.Clear();
+                            return false;
+                        }
+
+                        if (Diagnostics.DbgReadbackStats.Enabled) // TEMP
+                            Diagnostics.DbgReadbackStats.Record(address, System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds);
+                        synchronized = true;
+                        if (SpeculateReads)
+                        {
+                            var pageBytes = new byte[128];
+                            if (_guestMemory.TryRead(address & ~0x7Ful, pageBytes))
+                            {
+                                var contents = System.IO.Hashing.XxHash3.HashToUInt64(pageBytes);
+                                _pageHistory[address >> 7] = _pageHistory.TryGetValue(address >> 7, out var previous) && previous.Contents == contents
+                                    ? new PageHistory(contents, previous.Streak + 1, 0)
+                                    : new PageHistory(contents, 0, 0);
+                                if (_pageHistory.Count > 16384)
+                                {
+                                    _pageHistory.Clear();
+                                }
+                            }
                         }
                     }
                 }
-
-                if (_dbgStability) // TEMP: how often do the GPU-written words that cost a wait change?
+                else
                 {
-                    var dbgBytes = new byte[4];
-                    if (_guestMemory.TryRead(address, dbgBytes))
-                    {
-                        DbgStability(address, BitConverter.ToUInt32(dbgBytes), System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds);
-                        if (_pageHistory.TryGetValue(address >> 7, out var dbgHistory) && address == 0x50CDB59C38UL)
-                            Console.Error.WriteLine($"[DBG][STAB] line history streak={dbgHistory.Streak} since={dbgHistory.SinceConfirm} contents=0x{dbgHistory.Contents:X}");
-                    }
-                }
+                    NoteCleanReadPage(address, sizeof(uint));
                 }
             }
 
@@ -200,40 +205,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
-            if (DbgVerifyGpuReads && _bufferCache.DbgReadGpuWord(address, out var gpuWord, out var gpuBase, out _)) // TEMP
+            if (Diagnostics.GpuReadTrace.Enabled && synchronized)
             {
-                _dbgVerified++;
-                if (gpuWord != word)
-                {
-                    if (_dbgMismatch++ < 200 || _dbgMismatch % 1000 == 0)
-                        Console.Error.WriteLine($"[DBG][STALE] addr=0x{address:X} cpu=0x{word:X} gpu=0x{gpuWord:X} buffer=0x{gpuBase:X} dirtyBytes={_bufferCache.HasGpuDirtyBytes(address, 4)} cpuDirty={_bufferCache.HasCpuDirtyPages(address, 4)} n={_dbgMismatch}/{_dbgVerified}");
-                    if (DbgUseGpuReads) word = gpuWord;
-                }
+                Diagnostics.GpuReadTrace.RecordValue(address, word);
             }
-            if ((address & ~0xFFFul) == 0x500CDB6000ul && (_dbgSrCount++ % 64) == 0) // TEMP
-                Console.Error.WriteLine($"[DBG][SRVAL] n={_dbgSrCount} addr=0x{address:X} value=0x{word:X} stack={(_dbgSrCount < 300 ? Environment.StackTrace.Replace(Environment.NewLine, " | ") : "")}");
+
             return true;
         }
-        private static long _dbgSpecSkips; // TEMP
-        private static readonly bool _dbgStability = Environment.GetEnvironmentVariable("SHARPEMU_DBG_STABILITY") == "1"; // TEMP
-        private static readonly Dictionary<ulong, (uint Last, int Reads, int Changes, double Ms)> _dbgStab = new();
-        private static long _dbgStabLast = Environment.TickCount64;
-        private static void DbgStability(ulong address, uint value, double ms)
-        {
-            _dbgStab.TryGetValue(address, out var e);
-            _dbgStab[address] = (value, e.Reads + 1, e.Changes + (e.Reads > 0 && e.Last != value ? 1 : 0), e.Ms + ms);
-            if (Environment.TickCount64 - _dbgStabLast < 20000) return;
-            _dbgStabLast = Environment.TickCount64;
-            Console.Error.WriteLine($"[DBG][STAB] speculated_skips={_dbgSpecSkips} addresses={_dbgStab.Count} reads={_dbgStab.Values.Sum(v => v.Reads)} changes={_dbgStab.Values.Sum(v => v.Changes)} ms={_dbgStab.Values.Sum(v => v.Ms):F0}");
-            foreach (var (k, v) in _dbgStab.OrderByDescending(x => x.Value.Ms).Take(14))
-                Console.Error.WriteLine($"[DBG][STAB]   0x{k:X} reads={v.Reads} changes={v.Changes} ms={v.Ms:F0} last=0x{v.Last:X8}");
-            _dbgStab.Clear();
-        }
-
-        private static int _dbgSrCount; // TEMP
-        private static readonly bool DbgVerifyGpuReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_VERIFY_GPU_READS") == "1"; // TEMP
-        private static readonly bool DbgUseGpuReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_USE_GPU_READS") == "1"; // TEMP
-        private static long _dbgVerified, _dbgMismatch; // TEMP
 
         private static readonly bool DbgNoTablePatches = Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_TABLE_PATCHES") == "1"; // TEMP
 
@@ -286,18 +264,100 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
-            if (!_guestMemory.CanRead(address, size))
+            if (clean || !IsCleanReadPage(address, size))
             {
-                return false;
+                if (!_guestMemory.CanRead(address, size) ||
+                    _bufferCache.HasGpuDirtyBytes(address, size) ||
+                    (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+                {
+                    return false;
+                }
+
+                NoteCleanReadPage(address, size);
             }
 
-            if (_bufferCache.HasGpuDirtyBytes(address, size) ||
-                (clean && _imageCache.HasGpuModifiedImageBytes(address, size)))
+            if (TryGetAliasPointer(address, size, out var alias))
             {
-                return false;
+                new ReadOnlySpan<byte>(alias, destination.Length).CopyTo(destination);
+                return true;
             }
 
             return _guestMemory.TryRead(address, destination);
+        }
+
+        private const ulong CleanReadPageBytes = 0x1000;
+        private const int CleanReadPageSlots = 64;
+        private CleanReadPages? _cleanReadPages;
+        private bool _backingAliasAccess;
+
+        private sealed class CleanReadPages
+        {
+            public readonly ulong[] Tags = new ulong[CleanReadPageSlots];
+            public readonly long[] Versions = new long[CleanReadPageSlots];
+            public readonly ulong[] Aliases = new ulong[CleanReadPageSlots];
+            public readonly object?[] Snapshots = new object?[CleanReadPageSlots];
+        }
+
+        private bool TryGetAliasPointer(ulong address, ulong size, out byte* pointer)
+        {
+            pointer = null;
+            if (!_backingAliasAccess || _cleanReadPages is not { } pages ||
+                !TryGetCleanReadPage(address, size, out var page, out var slot) || pages.Tags[slot] != page + 1 ||
+                _guestBacking.BackingAliasSnapshot is not { } snapshot)
+            {
+                return false;
+            }
+
+            if (pages.Aliases[slot] == 0 || !ReferenceEquals(pages.Snapshots[slot], snapshot))
+            {
+                if (!_guestBacking.TryResolveBackingAlias(page, CleanReadPageBytes, out var resolved) || resolved == 0)
+                {
+                    return false;
+                }
+
+                pages.Aliases[slot] = resolved;
+                pages.Snapshots[slot] = snapshot;
+            }
+
+            pointer = (byte*)(pages.Aliases[slot] + (address - page));
+            return true;
+        }
+
+        private static bool TryGetCleanReadPage(ulong address, ulong size, out ulong page, out int slot)
+        {
+            page = address & ~(CleanReadPageBytes - 1);
+            slot = (int)((page / CleanReadPageBytes) & (CleanReadPageSlots - 1));
+            return size != 0 && address + size > address && ((address + size - 1) & ~(CleanReadPageBytes - 1)) == page;
+        }
+
+        private bool IsCleanReadPage(ulong address, ulong size) =>
+            _cleanReadPages is { } pages &&
+            TryGetCleanReadPage(address, size, out var page, out var slot) &&
+            pages.Tags[slot] == page + 1 &&
+            pages.Versions[slot] == _bufferCache.GpuModifiedVersion;
+
+        private void NoteCleanReadPage(ulong address, ulong size)
+        {
+            if (!TryGetCleanReadPage(address, size, out var page, out var slot))
+            {
+                return;
+            }
+
+            var version = _bufferCache.GpuModifiedVersion;
+            if (!_guestMemory.CanRead(page, CleanReadPageBytes) || _bufferCache.HasGpuDirtyBytes(page, CleanReadPageBytes))
+            {
+                return;
+            }
+
+            var pages = _cleanReadPages ??= new CleanReadPages();
+            if (pages.Tags[slot] != page + 1)
+            {
+                pages.Tags[slot] = page + 1;
+                pages.Aliases[slot] = 0;
+                pages.Snapshots[slot] = null;
+            }
+
+            pages.Versions[slot] = version;
         }
 
         bool IRenderHost.TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
@@ -309,7 +369,36 @@ internal static unsafe partial class VulkanVideoPresenter
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
             _shaderModules.Add(programId, module);
+            _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
+            var identity = VulkanPipelineCacheStorage.CompiledShaderIdentity(shader.Payload);
+            _shaderModuleCacheIdentities[module.Handle] = identity;
+            if (stage == ShaderStage.Compute)
+            {
+                NoteRuntimeComputeModule(identity);
+            }
+
             return module.Handle;
+        }
+
+        // The Metal shader compiler can spend seconds on one translated program and the
+        // command stream cannot advance while it does, so a slow creation is reported with
+        // the SPIR-V size that produced it.
+        private const long SlowPipelineCreationMilliseconds = 250;
+
+        private int SpirvBytesOf(ulong moduleHandle) =>
+            _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+
+        private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
+        {
+            Interlocked.Add(ref _pipelineCreationMilliseconds, elapsedMilliseconds);
+            if (elapsedMilliseconds < SlowPipelineCreationMilliseconds)
+            {
+                return;
+            }
+
+            Console.Error.WriteLine(
+                $"[GPU][WARN] Slow pipeline creation: kind={kind} {stages} spirv_bytes={spirv} " +
+                $"ms={elapsedMilliseconds} total_s={Interlocked.Read(ref _pipelineCreationMilliseconds) / 1000.0:F1}");
         }
 
         private void CreateBarycentricPipeline()
@@ -483,9 +572,14 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // One layout binding per descriptor binding of the stage, at the stage's native binding numbers.
-        private static void CollectLayoutBindings(List<DescriptorSetLayoutBinding> bindings, ShaderProgramInfo program, ShaderStage stage)
+        private static void CollectLayoutBindings(List<DescriptorSetLayoutBinding> bindings, ShaderProgramInfo program, ShaderStage stage) =>
+            CollectLayoutBindings(
+                bindings,
+                program.Bindings ?? throw SubmissionScheduler.Fatal($"The program has no binding layout: hash=0x{program.Hash:X16}."),
+                stage);
+
+        private static void CollectLayoutBindings(List<DescriptorSetLayoutBinding> bindings, BindingLayout layout, ShaderStage stage)
         {
-            var layout = program.Bindings ?? throw SubmissionScheduler.Fatal($"The program has no binding layout: hash=0x{program.Hash:X16}.");
             foreach (var binding in layout.Descriptors)
             {
                 if (layout.UsesBindlessImages && ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None)
@@ -503,14 +597,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private void EnsureBindlessImageHeap(params ShaderProgramInfo?[] programs)
-        {
-            if (_bindlessImageHeap is not null)
-            {
-                return;
-            }
+        private void EnsureBindlessImageHeap(params ShaderProgramInfo?[] programs) =>
+            EnsureBindlessImageHeap(programs.Any(program => program?.Bindings?.UsesBindlessImages == true));
 
-            if (!programs.Any(program => program?.Bindings?.UsesBindlessImages == true))
+        private void EnsureBindlessImageHeap(bool needed)
+        {
+            if (_bindlessImageHeap is not null || !needed)
             {
                 return;
             }
@@ -630,7 +722,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 ProfileVertexHash = description.VertexStage.Hash,
                 ProfilePixelHash = description.PixelStage?.Hash ?? 0,
             };
-            // A rectangle list draws through a strip or list variant chosen by its vertex count.
+            // Rectangle draws bind a native fill or compatibility variant at draw time.
             if (!entry.RectangleList)
             {
                 entry.Pipeline = CreateRenderPipeline(description, description.StaticParameters.Topology, entry.Layout);
@@ -764,7 +856,8 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // One graphics pipeline for dynamic rendering: the attachment formats travel in the create info.
-        private Pipeline CreateRenderPipeline(GraphicsPipelineDescription description, PrimitiveTopology topology, PipelineLayout layout)
+        private Pipeline CreateRenderPipeline(GraphicsPipelineDescription description, PrimitiveTopology topology, PipelineLayout layout,
+            PolygonMode polygonMode = PolygonMode.Fill)
         {
             var parameters = description.StaticParameters;
             var rendering = description.Rendering;
@@ -889,7 +982,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         SType = StructureType.PipelineRasterizationStateCreateInfo,
                         PNext = _supportsDepthClipEnable ? &depthClip : null,
-                        PolygonMode = PolygonMode.Fill,
+                        PolygonMode = polygonMode,
                         CullMode = cullMode,
                         FrontFace = parameters.FrontFaceClockwise ? FrontFace.Clockwise : FrontFace.CounterClockwise,
                         LineWidth = 1,
@@ -973,16 +1066,20 @@ internal static unsafe partial class VulkanVideoPresenter
                         PDynamicState = &dynamicState,
                         Layout = layout,
                     };
-                    var createStart = Stopwatch.GetTimestamp();
-                    Check(_vk.CreateGraphicsPipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out var pipeline),
-                        $"vkCreateGraphicsPipelines(rendering) vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
-                    var createMilliseconds = Stopwatch.GetElapsedTime(createStart).TotalMilliseconds;
-                    if (createMilliseconds >= SlowPipelineMilliseconds)
-                    {
-                        Console.Error.WriteLine(
-                            $"[PERF] vkCreateGraphicsPipelines ms={createMilliseconds:F1} " +
-                            $"vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}");
-                    }
+                    var graphicsStart = Stopwatch.GetTimestamp();
+                    var cache = GetGuestPipelineCache(GraphicsCacheKey(description.VertexStage.Hash,
+                        description.PixelStage?.Hash ?? 0, vertexModule.Handle, pixelModule.Handle));
+                    Check(_vk.CreateGraphicsPipelines(_device, cache, 1, &pipelineInfo, null, out var pipeline),
+                        $"vkCreateGraphicsPipelines(rendering vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16})");
+                    ReportPipelineCreation(
+                        (long)Stopwatch.GetElapsedTime(graphicsStart).TotalMilliseconds,
+                        "graphics",
+                        $"vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16}",
+                        string.Join(
+                            '/',
+                            Enumerable
+                                .Range(0, (int)stageCount)
+                                .Select(index => SpirvBytesOf(shaderStages[index].Module.Handle))));
                     MarkPipelineCacheDirty();
                     Interlocked.Increment(ref _perfPipelineCreations);
                     SetDebugName(
@@ -1035,14 +1132,14 @@ internal static unsafe partial class VulkanVideoPresenter
                     Stage = stageInfo,
                     Layout = layout,
                 };
-                var createStart = Stopwatch.GetTimestamp();
-                Check(_vk.CreateComputePipelines(_device, _pipelineCache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
-                var createMilliseconds = Stopwatch.GetElapsedTime(createStart).TotalMilliseconds;
-                if (createMilliseconds >= SlowPipelineMilliseconds)
-                {
-                    Console.Error.WriteLine(
-                        $"[PERF] vkCreateComputePipelines ms={createMilliseconds:F1} cs=0x{description.Stage.Hash:X16}");
-                }
+                var computeStart = Stopwatch.GetTimestamp();
+                var cache = GetGuestPipelineCache(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
+                Check(_vk.CreateComputePipelines(_device, cache, 1, &pipelineInfo, null, out pipeline), $"vkCreateComputePipelines(rendering) hash=0x{description.Stage.Hash:X16}");
+                ReportPipelineCreation(
+                    (long)Stopwatch.GetElapsedTime(computeStart).TotalMilliseconds,
+                    "compute",
+                    $"cs=0x{description.Stage.Hash:X16}",
+                    SpirvBytesOf(computeModule.Handle).ToString());
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");
@@ -1065,11 +1162,206 @@ internal static unsafe partial class VulkanVideoPresenter
             return RegisterPipeline(entry);
         }
 
+        // One compute pipeline whose vkCreateComputePipelines call runs on a worker
+        // thread. Everything the command stream owns (descriptor and pipeline layout,
+        // the module handle) is prepared before the task starts. The worker loads
+        // its optional driver-cache shard and creates the native pipeline.
+        private sealed class PendingComputePipeline
+        {
+            public required DescriptorSetLayout SetLayout;
+            public required PipelineLayout Layout;
+            public required DescriptorSetDemand Demand;
+            public required bool UsesPushDescriptors;
+            public required bool UsesBindlessImages;
+            public required bool RequiresSubgroup32;
+            public required ulong Hash;
+            public required int SpirvBytes;
+            public Task<Pipeline> Compile = Task.FromResult(default(Pipeline));
+            public long StartTimestamp;
+            public long CompileMilliseconds;
+        }
+
+        private readonly Dictionary<ulong, PendingComputePipeline> _pendingComputePipelines = new();
+        private static readonly SemaphoreSlim _computeCompileSlots =
+            new(Math.Max(2, Environment.ProcessorCount / 2));
+
+        // A host shader compiler can spend tens of seconds on one large translated
+        // program. Running the compile on a worker thread keeps it out of the pipeline
+        // cache's lock, so other queues can still create their own pipelines meanwhile;
+        // SHARPEMU_ASYNC_COMPUTE_PIPELINES=0 compiles inline instead.
+        private static readonly bool _asyncComputePipelines =
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_COMPUTE_PIPELINES"),
+                "0",
+                StringComparison.Ordinal);
+
+        public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
+        {
+            if (!_asyncComputePipelines)
+            {
+                handle = CreateComputePipeline(description);
+                return true;
+            }
+
+            handle = default;
+            var key = description.Program.Id;
+            if (_pendingComputePipelines.TryGetValue(key, out var pending))
+            {
+                if (!pending.Compile.IsCompleted)
+                {
+                    return false;
+                }
+
+                _pendingComputePipelines.Remove(key);
+                var compiled = pending.Compile.GetAwaiter().GetResult();
+                ReportPipelineCreation(
+                    Interlocked.Read(ref pending.CompileMilliseconds),
+                    "compute-async",
+                    $"cs=0x{pending.Hash:X16} waited_ms={(long)Stopwatch.GetElapsedTime(pending.StartTimestamp).TotalMilliseconds}",
+                    pending.SpirvBytes.ToString());
+                MarkPipelineCacheDirty();
+                Interlocked.Increment(ref _perfPipelineCreations);
+                SetDebugName(ObjectType.Pipeline, compiled.Handle, $"SharpEmu compute cs=0x{pending.Hash:X16}");
+                handle = RegisterPipeline(new RenderPipelineEntry
+                {
+                    Pipeline = compiled,
+                    Layout = pending.Layout,
+                    SetLayout = pending.SetLayout,
+                    Demand = pending.Demand,
+                    UsesPushDescriptors = pending.UsesPushDescriptors,
+                    UsesBindlessImages = pending.UsesBindlessImages,
+                    ProfileComputeHash = pending.Hash,
+                });
+                return true;
+            }
+
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineSetup);
+            EnsureBindlessImageHeap(description.Stage);
+            var bindings = new List<DescriptorSetLayoutBinding>();
+            CollectLayoutBindings(bindings, description.Stage, ShaderStage.Compute);
+            var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
+            var layout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, description.Stage.Bindings!.UsesBindlessImages);
+            var computeModule = new ShaderModule(description.Program.Module);
+            if (computeModule.Handle == 0)
+            {
+                throw SubmissionScheduler.Fatal($"The compute pipeline has no module: hash=0x{description.Stage.Hash:X16}.");
+            }
+
+            var device = _device;
+            var cacheSource = GetGuestPipelineCacheSource(ComputeCacheKey(description.Stage.Hash, computeModule.Handle));
+            var vk = _vk;
+            var started = new PendingComputePipeline
+            {
+                SetLayout = setLayout,
+                Layout = layout,
+                Demand = demand,
+                UsesPushDescriptors = usesPushDescriptors,
+                UsesBindlessImages = description.Stage.Bindings!.UsesBindlessImages,
+                RequiresSubgroup32 = RequiresComputeSubgroup32(description.Input),
+                Hash = description.Stage.Hash,
+                SpirvBytes = SpirvBytesOf(computeModule.Handle),
+                StartTimestamp = Stopwatch.GetTimestamp(),
+            };
+            started.Compile = Task.Factory.StartNew(
+                () =>
+                {
+                    // Each compile blocks its thread inside the Metal compiler service,
+                    // so the number in flight is bounded instead of one thread per
+                    // program the frame happens to touch.
+                    _computeCompileSlots.Wait();
+                    var compileStart = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        // Importing a MoltenVK cache compiles its MSL libraries.
+                        // Keep that work inside the same bounded compiler slot.
+                        var cache = ResolveGuestPipelineCache(cacheSource);
+                        return CompileComputePipeline(vk, device, cache, computeModule, layout, started.RequiresSubgroup32);
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(
+                            ref started.CompileMilliseconds,
+                            (long)Stopwatch.GetElapsedTime(compileStart).TotalMilliseconds);
+                        _computeCompileSlots.Release();
+                    }
+                },
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+            _pendingComputePipelines.Add(key, started);
+            return false;
+        }
+
+        // vkCreateComputePipelines is the only call here; Vulkan synchronises host
+        // access to the pipeline cache internally, so several may run at once.
+        private static Pipeline CompileComputePipeline(
+            Vk vk,
+            Device device,
+            PipelineCache cache,
+            ShaderModule module,
+            PipelineLayout layout,
+            bool requireSubgroup32 = false)
+        {
+            var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
+            try
+            {
+                var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
+                {
+                    SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
+                    RequiredSubgroupSize = RdnaSubgroupSize,
+                };
+                var stageInfo = new PipelineShaderStageCreateInfo
+                {
+                    SType = StructureType.PipelineShaderStageCreateInfo,
+                    PNext = requireSubgroup32 ? &requiredSubgroupSize : null,
+                    Stage = ShaderStageFlags.ComputeBit,
+                    Module = module,
+                    PName = entryPoint,
+                };
+                var pipelineInfo = new ComputePipelineCreateInfo
+                {
+                    SType = StructureType.ComputePipelineCreateInfo,
+                    Stage = stageInfo,
+                    Layout = layout,
+                };
+                var result = vk.CreateComputePipelines(device, cache, 1, &pipelineInfo, null, out var pipeline);
+                if (result != Result.Success)
+                {
+                    throw SubmissionScheduler.Fatal($"vkCreateComputePipelines(async) failed: {result}.");
+                }
+
+                return pipeline;
+            }
+            finally
+            {
+                SilkMarshal.Free((nint)entryPoint);
+            }
+        }
+
+        private void DrainPendingComputePipelines()
+        {
+            foreach (var pending in _pendingComputePipelines.Values)
+            {
+                try
+                {
+                    var pipeline = pending.Compile.GetAwaiter().GetResult();
+                    if (pipeline.Handle != 0) _vk.DestroyPipeline(_device, pipeline, null);
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[LOADER][WARN] Pending compute pipeline failed during shutdown: {exception.Message}");
+                }
+                _vk.DestroyPipelineLayout(_device, pending.Layout, null);
+                _vk.DestroyDescriptorSetLayout(_device, pending.SetLayout, null);
+            }
+            _pendingComputePipelines.Clear();
+        }
+
         private void DestroyRenderPipelines()
         {
             foreach (var entry in _pipelineEntries.Values)
             {
-                foreach (var pipeline in new[] { entry.Pipeline, entry.StripVariant, entry.ListVariant })
+                foreach (var pipeline in new[] { entry.Pipeline, entry.StripVariant, entry.ListVariant, entry.RectangleVariant })
                 {
                     if (pipeline.Handle != 0)
                     {
@@ -1088,6 +1380,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _shaderModules.Clear();
+            _shaderModuleCacheIdentities.Clear();
         }
     }
 }

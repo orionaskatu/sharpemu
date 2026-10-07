@@ -26,16 +26,23 @@ public enum SliceResult
 // Submissions of every queue; one thread runs the slices, other threads enqueue and wait.
 public sealed class CommandStreamQueue
 {
+    private sealed record ControlBarrier(ulong CutoffOrdinal, Action Work, Action Cancel);
+
     public const int ComputeQueueCount = 56;
     public const int QueueCount = 1 + ComputeQueueCount;
     public const int AllBlockedRetryMilliseconds = 100;
+    // One boundary may run ahead; explicit zero keeps the synchronous diagnostic mode.
+    public static readonly int DefaultBoundariesInFlight =
+        Environment.GetEnvironmentVariable("SHARPEMU_SUSPEND_POINTS_IN_FLIGHT") == "0" ? 0 : 1;
 
     private readonly ICommandStreamHost _host;
     private readonly object _gate = new();
     private readonly LinkedList<CommandSubmission>[] _queues = new LinkedList<CommandSubmission>[QueueCount];
     private readonly GpuCommandInterpreter?[] _interpreters = new GpuCommandInterpreter?[QueueCount];
+    private readonly Queue<ControlBarrier> _controlBarriers = new();
     private int _nextQueue;
     private int _submissionCount;
+    private ulong _admissionOrdinal;
     private bool _accepting = true;
     private bool _stopping;
     private bool _processing;
@@ -43,12 +50,20 @@ public sealed class CommandStreamQueue
     private ulong _submitId;
     private ulong _lastCompletedGpuTick;
     private int _doneCount;
+    private int _pendingBoundaries;
     private IdleOutcome _outcome = IdleOutcome.Completed;
     private Thread? _processingThread;
 
-    public CommandStreamQueue(ICommandStreamHost host)
+    private readonly int _boundariesInFlight;
+
+    public CommandStreamQueue(ICommandStreamHost host) : this(host, DefaultBoundariesInFlight)
+    {
+    }
+
+    public CommandStreamQueue(ICommandStreamHost host, int boundariesInFlight)
     {
         _host = host;
+        _boundariesInFlight = Math.Max(0, boundariesInFlight);
         for (var index = 0; index < QueueCount; index++)
         {
             _queues[index] = new LinkedList<CommandSubmission>();
@@ -80,7 +95,7 @@ public sealed class CommandStreamQueue
         {
             lock (_gate)
             {
-                return _submissionCount != 0;
+                return _submissionCount != 0 || _controlBarriers.Count != 0;
             }
         }
     }
@@ -102,7 +117,7 @@ public sealed class CommandStreamQueue
         {
             lock (_gate)
             {
-                return SelectQueueLocked() >= 0;
+                return HasRunnableWorkLocked();
             }
         }
     }
@@ -308,26 +323,74 @@ public sealed class CommandStreamQueue
             submission.DbgEnqueuedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
+        submission.AdmissionOrdinal = ++_admissionOrdinal;
         _queues[submission.QueueId].AddLast(submission);
         _submissionCount++;
-        if (submission.Kind != CommandSubmissionKind.FlipPreparation)
+        if (submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
             SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.Enqueued, submission.QueueId,
                 submission.SubmissionId, submission.Address, submission.DwordCount, _submissionCount);
         Monitor.PulseAll(_gate);
     }
 
-    // Marks the frame boundary and drains all pending GPU work before returning.
+    public bool TryEnqueueControlBarrier(Action work, Action cancel)
+    {
+        ArgumentNullException.ThrowIfNull(work);
+        ArgumentNullException.ThrowIfNull(cancel);
+        lock (_gate)
+        {
+            if (!_accepting)
+            {
+                return false;
+            }
+
+            _controlBarriers.Enqueue(new ControlBarrier(_admissionOrdinal, work, cancel));
+            Monitor.PulseAll(_gate);
+            return true;
+        }
+    }
+
     public IdleOutcome Done()
     {
-        var outcome = _processingThread == Thread.CurrentThread ? IdleOutcome.Completed : WaitForIdle();
+        if (_processingThread == Thread.CurrentThread)
+        {
+            lock (_gate)
+            {
+                _graphicsDone = true;
+                _doneCount++;
+            }
+
+            return IdleOutcome.Completed;
+        }
 
         lock (_gate)
         {
-            _graphicsDone = true;
-            _doneCount++;
-        }
+            if (_outcome != IdleOutcome.Completed)
+            {
+                return _outcome;
+            }
 
-        return outcome;
+            _graphicsDone = true;
+            if (!_accepting)
+            {
+                // Shutdown: no slice will run a queued boundary, so drain as before.
+                while (_outcome == IdleOutcome.Completed && (_processing || _submissionCount != 0))
+                {
+                    Monitor.Wait(_gate);
+                }
+
+                _doneCount++;
+                return _outcome;
+            }
+
+            _pendingBoundaries++;
+            EnqueueLocked(new CommandSubmission(CommandSubmissionKind.FrameBoundary, 0, 0, 0, 0, null));
+            while (_outcome == IdleOutcome.Completed && _pendingBoundaries > _boundariesInFlight)
+            {
+                Monitor.Wait(_gate);
+            }
+
+            return _outcome;
+        }
     }
 
     // Returns once nothing is pending; a cancelled or failed queue reports that instead.
@@ -335,7 +398,8 @@ public sealed class CommandStreamQueue
     {
         lock (_gate)
         {
-            while (_outcome == IdleOutcome.Completed && (_processing || _submissionCount != 0))
+            while (_outcome == IdleOutcome.Completed &&
+                   (_processing || _submissionCount != 0 || _controlBarriers.Count != 0))
             {
                 Monitor.Wait(_gate);
             }
@@ -357,13 +421,13 @@ public sealed class CommandStreamQueue
     {
         lock (_gate)
         {
-            if (SelectQueueLocked() >= 0 || _stopping)
+            if (HasRunnableWorkLocked() || _stopping)
             {
-                return SelectQueueLocked() >= 0;
+                return HasRunnableWorkLocked();
             }
 
             Monitor.Wait(_gate, timeoutMilliseconds);
-            return SelectQueueLocked() >= 0;
+            return HasRunnableWorkLocked();
         }
     }
 
@@ -373,7 +437,7 @@ public sealed class CommandStreamQueue
         lock (_gate)
         {
             var deadline = Environment.TickCount64 + intervalMilliseconds;
-            while (SelectQueueLocked() < 0)
+            while (!HasRunnableWorkLocked())
             {
                 var remaining = deadline - Environment.TickCount64;
                 if (remaining <= 0)
@@ -391,10 +455,15 @@ public sealed class CommandStreamQueue
     // Publishes a failure: nothing runs any more and every waiter is released with Failed.
     public void Fail()
     {
+        Action[] cancellations;
         lock (_gate)
         {
             FailLocked();
+            cancellations = CancelControlBarriersLocked();
         }
+
+        foreach (var cancel in cancellations)
+            cancel();
     }
 
     private void FailLocked()
@@ -442,7 +511,8 @@ public sealed class CommandStreamQueue
     // Runs one slice of the next unblocked submission on the calling thread.
     public SliceResult ProcessOne()
     {
-        CommandSubmission submission;
+        CommandSubmission? submission = null;
+        ControlBarrier? control = null;
         lock (_gate)
         {
             if (_processing)
@@ -450,36 +520,74 @@ public sealed class CommandStreamQueue
                 throw _host.Fatal("The command stream queue is already processing a slice.");
             }
 
-            var selected = SelectQueueLocked();
-            if (selected < 0)
+            if (IsControlBarrierReadyLocked())
             {
-                return _submissionCount != 0 ? SliceResult.AllBlocked : SliceResult.NoWork;
+                control = _controlBarriers.Dequeue();
+            }
+            else
+            {
+                var selected = SelectQueueLocked();
+                if (selected < 0)
+                {
+                    return _submissionCount != 0 ? SliceResult.AllBlocked : SliceResult.NoWork;
+                }
+
+                var queue = _queues[selected];
+                submission = queue.First!.Value;
+                queue.RemoveFirst();
+                _submissionCount--;
+                _nextQueue = (selected + 1) % QueueCount;
             }
 
-            var queue = _queues[selected];
-            submission = queue.First!.Value;
-            queue.RemoveFirst();
-            _submissionCount--;
-            _nextQueue = (selected + 1) % QueueCount;
             _processing = true;
             _processingThread = Thread.CurrentThread;
-            if (!submission.Started && submission.Kind != CommandSubmissionKind.FlipPreparation)
+            if (submission is { Started: false } &&
+                submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
                 SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.ProcessingStarted, submission.QueueId,
                     submission.SubmissionId, submission.Address, submission.DwordCount, _submissionCount);
+        }
+
+        if (control is not null)
+        {
+            try
+            {
+                control.Work();
+            }
+            catch (Exception exception)
+            {
+                try
+                {
+                    Console.Error.WriteLine($"[GPU][ERROR] Command stream control barrier failed. {exception}");
+                }
+                catch (Exception)
+                {
+                }
+
+                Fail();
+                throw;
+            }
+
+            lock (_gate)
+            {
+                _processing = false;
+                Monitor.PulseAll(_gate);
+            }
+
+            return SliceResult.Completed;
         }
 
         bool complete;
         DbgCheckHash(submission); // TEMP
         try
         {
-            complete = RunSlice(submission);
+            complete = RunSlice(submission!);
         }
         catch (Exception exception)
         {
             try
             {
                 // Report the cause before another submitting thread observes the failed queue.
-                Console.Error.WriteLine($"[GPU][ERROR] Command stream slice failed: queue={submission.QueueId} address=0x{submission.Address:X16}. {exception}");
+                Console.Error.WriteLine($"[GPU][ERROR] Command stream slice failed: queue={submission!.QueueId} address=0x{submission.Address:X16}. {exception}");
             }
             catch (Exception)
             {
@@ -496,7 +604,7 @@ public sealed class CommandStreamQueue
             submission.DbgCompleted = true; // TEMP: reached (completed or blocked on a wait)
             if (!complete)
             {
-                submission.Blocked = true;
+                submission!.Blocked = true;
                 submission.BlockedSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 submission.BlockedPacketAddress = submission.Commands.CurrentPacketAddress;
                 _queues[submission.QueueId].AddFirst(submission);
@@ -505,6 +613,12 @@ public sealed class CommandStreamQueue
             }
             else
             {
+                if (submission.Kind == CommandSubmissionKind.FrameBoundary)
+                {
+                    _pendingBoundaries--;
+                    _doneCount++;
+                }
+
                 foreach (var queue in _queues)
                 {
                     if (queue.First is { } head)
@@ -533,6 +647,14 @@ public sealed class CommandStreamQueue
         {
             SlicesRun++;
             _host.PrepareCpuFlip(submission.FlipHandle, submission.FlipIndex, submission.FlipRequestId);
+            _host.Flush();
+            return true;
+        }
+
+        // A suspend point drains the graphics pipe: submit what the frame recorded.
+        if (submission.Kind == CommandSubmissionKind.FrameBoundary)
+        {
+            SlicesRun++;
             _host.Flush();
             return true;
         }
@@ -648,6 +770,14 @@ public sealed class CommandStreamQueue
                 if (queue.First is { } head && head.Value.Blocked)
                 {
                     _submissionCount -= queue.Count;
+                    foreach (var dropped in queue)
+                    {
+                        if (dropped.Kind == CommandSubmissionKind.FrameBoundary)
+                        {
+                            _pendingBoundaries--;
+                        }
+                    }
+
                     queue.Clear();
                     _outcome = IdleOutcome.Cancelled;
                 }
@@ -660,12 +790,17 @@ public sealed class CommandStreamQueue
     // Drops every submission without stopping admission; the presenter uses it after device loss.
     public void DiscardAll()
     {
+        Action[] cancellations;
         lock (_gate)
         {
             _outcome = IdleOutcome.Failed;
             DropAllLocked();
+            cancellations = CancelControlBarriersLocked();
             Monitor.PulseAll(_gate);
         }
+
+        foreach (var cancel in cancellations)
+            cancel();
     }
 
     // A diagnostic view of the blocked heads: their count, the oldest age and one sample.
@@ -732,6 +867,20 @@ public sealed class CommandStreamQueue
 
     private int SelectQueueLocked()
     {
+        if (_controlBarriers.TryPeek(out var control))
+        {
+            for (var offset = 0; offset < QueueCount; offset++)
+            {
+                var queueId = (_nextQueue + offset) % QueueCount;
+                if (_queues[queueId].First is { } head &&
+                    head.Value.AdmissionOrdinal <= control.CutoffOrdinal &&
+                    !head.Value.Blocked)
+                {
+                    return queueId;
+                }
+            }
+        }
+
         for (var offset = 0; offset < QueueCount; offset++)
         {
             var queueId = (_nextQueue + offset) % QueueCount;
@@ -744,6 +893,42 @@ public sealed class CommandStreamQueue
         return -1;
     }
 
+    private bool HasRunnableWorkLocked() => IsControlBarrierReadyLocked() || SelectQueueLocked() >= 0;
+
+    private bool IsControlBarrierReadyLocked()
+    {
+        if (!_controlBarriers.TryPeek(out var control))
+        {
+            return false;
+        }
+
+        foreach (var queue in _queues)
+        {
+            if (queue.First is { } head && head.Value.AdmissionOrdinal <= control.CutoffOrdinal)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private Action[] CancelControlBarriersLocked()
+    {
+        if (_controlBarriers.Count == 0)
+        {
+            return [];
+        }
+
+        var cancellations = new Action[_controlBarriers.Count];
+        for (var index = 0; index < cancellations.Length; index++)
+        {
+            cancellations[index] = _controlBarriers.Dequeue().Cancel;
+        }
+
+        return cancellations;
+    }
+
     private void DropAllLocked()
     {
         foreach (var queue in _queues)
@@ -752,5 +937,6 @@ public sealed class CommandStreamQueue
         }
 
         _submissionCount = 0;
+        _pendingBoundaries = 0;
     }
 }

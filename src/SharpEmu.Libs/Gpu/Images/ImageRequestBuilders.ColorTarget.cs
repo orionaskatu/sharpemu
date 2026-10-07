@@ -39,6 +39,8 @@ public readonly record struct TargetViewRange(uint BaseLayer, uint LayerCount, u
 
 public static partial class ImageRequestBuilders
 {
+    private static long _normalizedSliceRanges;
+
     public static uint SampleCount(uint encodedLog2) => encodedLog2 <= 3 ? 1u << (int)encodedLog2 : 0;
 
     // DCC clears use the target's packed clear word; the fixed-clear set is a format allow-list.
@@ -178,8 +180,12 @@ public static partial class ImageRequestBuilders
         if (volume && view.BaseLayer == 0 && view.LayerCount == depth + 1)
         {
             view = new TargetViewRange(0, depth, depth);
-            Console.Error.WriteLine(
-                $"[LOADER][INFO] normalized an exclusive 3D color-target slice range to depth={depth}");
+            var normalized = Interlocked.Increment(ref _normalizedSliceRanges);
+            if (normalized <= 8 || (normalized & (normalized - 1)) == 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] normalized an exclusive 3D color-target slice range to depth={depth} count={normalized}");
+            }
         }
         var tileMode = words.TileMode;
         var standard4 = tileMode == GuestTileMode.Standard4KB;

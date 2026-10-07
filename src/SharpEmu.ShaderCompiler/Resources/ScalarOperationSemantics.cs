@@ -9,6 +9,9 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // values use the low dword, F32 values are the bits of the low dword.
 public static class ScalarOperationSemantics
 {
+    internal static bool TryEvaluateFixed(ScalarOperation operation, ulong first, ulong second, ulong third, ulong fourth, out ulong result) =>
+        TryEvaluate(operation, [first, second, third, fourth], out result);
+
     public static bool TryEvaluate(ScalarOperation operation, ReadOnlySpan<ulong> operands, out ulong result)
     {
         result = 0;

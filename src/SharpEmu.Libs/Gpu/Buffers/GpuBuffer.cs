@@ -287,11 +287,33 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 1, &after, 0, null);
     }
 
+    private int _foreignReads;
+    private int _disposeDeferred;
+
+    public void RetainForeignRead() => Interlocked.Increment(ref _foreignReads);
+
+    public void ReleaseForeignRead()
+    {
+        if (Interlocked.Decrement(ref _foreignReads) == 0 && Interlocked.Exchange(ref _disposeDeferred, 0) != 0)
+        {
+            Dispose();
+        }
+    }
+
     public void Dispose()
     {
         if (_handle.Handle == 0)
         {
             return;
+        }
+
+        if (Volatile.Read(ref _foreignReads) != 0)
+        {
+            Volatile.Write(ref _disposeDeferred, 1);
+            if (Volatile.Read(ref _foreignReads) != 0 || Interlocked.Exchange(ref _disposeDeferred, 0) == 0)
+            {
+                return;
+            }
         }
 
         if (_deviceAddress != 0)

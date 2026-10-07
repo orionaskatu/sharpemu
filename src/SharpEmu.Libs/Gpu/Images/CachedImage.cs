@@ -460,10 +460,19 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public bool IsGpuModified => _gpuModified;
 
+    private static long _gpuWriteCounter;
+
+    // Orders GPU writes between images; bumped whenever an acquire lets the GPU write this image.
+    public long GpuWriteSequence { get; private set; }
+
+    // The write sequence of the mip tail block image last copied into this chain's tail mips.
+    public long MergedTailSequence;
+
     public void MarkGpuModified()
     {
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
+        GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
         _guestPieceHashes = null;
     }
 

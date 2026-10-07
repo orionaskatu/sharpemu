@@ -53,7 +53,7 @@ public static class Gen5Wave64HalfMaskAnalysis
 
     private static readonly HashSet<string> SccWriters = new(StringComparer.Ordinal)
     {
-        "SNotB32", "SAbsI32", "SWqmB32", "SBrevB32", "SBcnt1I32B32", "SBcnt1I32B64",
+        "SNotB32", "SAbsI32", "SWqmB32", "SBrevB32", "SBcnt1I32B32", "SBcnt1I32B64", "SQuadmaskB32", "SQuadmaskB64",
         "SAddU32", "SSubU32", "SAddI32", "SSubI32", "SAddcU32", "SSubbU32",
         "SAndB32", "SOrB32", "SXorB32", "SAndn2B32", "SOrn2B32", "SNandB32", "SNorB32", "SXnorB32",
         "SLshlB32", "SLshrB32", "SAshrI32", "SBfeU32", "SBfeI32", "SMinU32", "SMinI32", "SMaxU32", "SMaxI32",

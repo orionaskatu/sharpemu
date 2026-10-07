@@ -29,6 +29,10 @@ public sealed partial class ScalarValueGraph
         private readonly Dictionary<uint, int> _blockByPc = [];
         private RegisterState?[] _entry = [];
         private RegisterState?[] _exit = [];
+        private Gen5ShaderInstruction[][] _blockInstructions = [];
+        // Replaced entry and exit states. A large shader visits thousands of blocks, and
+        // allocating two register files per visit kept the collector stopping the renderer.
+        private readonly Stack<RegisterState> _spareStates = new();
         private bool _recording;
 
         public void Run()
@@ -37,15 +41,21 @@ public sealed partial class ScalarValueGraph
             var blockCount = controlFlow.Blocks.Count;
             _entry = new RegisterState?[blockCount];
             _exit = new RegisterState?[blockCount];
+            var blockInstructions = new List<Gen5ShaderInstruction>[blockCount];
+            foreach (var instruction in _program.Instructions)
+            {
+                var block = controlFlow.BlockOf(instruction.Pc);
+                if (block >= 0)
+                {
+                    _blockByPc[instruction.Pc] = block;
+                    (blockInstructions[block] ??= []).Add(instruction);
+                }
+            }
+
+            _blockInstructions = new Gen5ShaderInstruction[blockCount][];
             for (var block = 0; block < blockCount; block++)
             {
-                foreach (var instruction in _program.Instructions)
-                {
-                    if (instruction.Pc >= controlFlow.Blocks[block].StartPc && instruction.Pc < controlFlow.Blocks[block].EndPc)
-                    {
-                        _blockByPc[instruction.Pc] = block;
-                    }
-                }
+                _blockInstructions[block] = blockInstructions[block]?.ToArray() ?? [];
             }
 
             _graph.Accesses = new MemoryAccessBinding?[_graph.Memory.Count];
@@ -71,9 +81,19 @@ public sealed partial class ScalarValueGraph
                 }
 
                 var entry = MergePredecessors(block);
+                if (_entry[block] is { } staleEntry)
+                {
+                    _spareStates.Push(staleEntry);
+                }
+
                 _entry[block] = entry;
-                var exit = Transfer(block, entry.Clone());
+                var exit = Transfer(block, CopyState(entry));
                 var changed = _exit[block] is not { } previous || !previous.SameAs(exit);
+                if (_exit[block] is { } staleExit)
+                {
+                    _spareStates.Push(staleExit);
+                }
+
                 _exit[block] = exit;
                 if (!changed)
                 {
@@ -95,10 +115,26 @@ public sealed partial class ScalarValueGraph
             {
                 if (_entry[block] is { } entry)
                 {
-                    Transfer(block, entry.Clone());
+                    _spareStates.Push(Transfer(block, CopyState(entry)));
                 }
             }
         }
+
+        // A spare state is reset exactly as the constructor would, at the same point, so the
+        // undefined values it starts with (and the instructions they are charged to) match.
+        private RegisterState NewState()
+        {
+            if (!_spareStates.TryPop(out var state))
+            {
+                return new RegisterState(_graph);
+            }
+
+            state.Reset();
+            return state;
+        }
+
+        private RegisterState CopyState(RegisterState source) =>
+            _spareStates.TryPop(out var state) ? state.CopyFrom(source) : source.Clone();
 
         // Reverse postorder completes acyclic predecessors before their joins.
         // Loop back edges still use the convergence check in the worklist.
@@ -174,7 +210,7 @@ public sealed partial class ScalarValueGraph
                 }
             }
 
-            var merged = new RegisterState(_graph);
+            var merged = NewState();
             if (block == 0)
             {
                 // The entry block joins the initial registers with its back edges.
@@ -374,14 +410,8 @@ public sealed partial class ScalarValueGraph
 
         private RegisterState Transfer(int block, RegisterState state)
         {
-            var range = _graph.ControlFlow.Blocks[block];
-            foreach (var instruction in _program.Instructions)
+            foreach (var instruction in _blockInstructions[block])
             {
-                if (instruction.Pc < range.StartPc || instruction.Pc >= range.EndPc)
-                {
-                    continue;
-                }
-
                 Apply(instruction, state);
             }
 
@@ -492,8 +522,7 @@ public sealed partial class ScalarValueGraph
                 case "SGetpcB64":
                 {
                     var address = _graph.Operation(ScalarOperation.IAdd64, ScalarValueType.U64, _graph.ShaderBase(),
-                        _graph.Constant(unchecked(_program.InstructionAddressOffset(instruction.Pc) +
-                            (ulong)(instruction.Words.Count * sizeof(uint)))));
+                        _graph.Constant(unchecked(instruction.ProgramOffset + (ulong)(instruction.Words.Count * sizeof(uint)))));
                     state.WritePair(destinationRegister, Extract(address, 0), Extract(address, 1));
                     return;
                 }
@@ -567,12 +596,37 @@ public sealed partial class ScalarValueGraph
                 return;
             }
 
+            if (opcode is "SQuadmaskB32" or "SQuadmaskB64")
+            {
+                var wide = opcode == "SQuadmaskB64";
+                var (low, high) = ReadPair(instruction.Sources[0], state);
+                var result = _graph.Constant(0u);
+                for (uint quad = 0; quad < (wide ? 16u : 8u); quad++)
+                {
+                    var nibble = Binary(ScalarOperation.And32,
+                        Binary(ScalarOperation.ShiftRightLogical32, quad < 8 ? low : high, _graph.Constant((quad % 8) * 4)), _graph.Constant(15u));
+                    result = Binary(ScalarOperation.Or32, result,
+                        _graph.Select(NotZero(nibble), _graph.Constant(1u << (int)quad), _graph.Constant(0u)));
+                }
+                if (wide) state.WritePair(destinationRegister, result, _graph.Constant(0u));
+                else state.WriteScalar(destinationRegister, result);
+                state.Scc = NotZero(result);
+                return;
+            }
+
             if (opcode is "SBcnt1I32B64" or "SFF1I32B64" or "SWqmB64" or "SBfeI64")
             {
-                // Bit counting, lane scans and quad masks are not uniform descriptor values.
                 var (low, high) = ReadPair(instruction.Sources[0], state);
                 switch (opcode)
                 {
+                    case "SWqmB64":
+                    {
+                        var quadLow = Unary(ScalarOperation.QuadMask32, low);
+                        var quadHigh = Unary(ScalarOperation.QuadMask32, high);
+                        state.WritePair(destinationRegister, quadLow, quadHigh);
+                        state.Scc = NotZero(Binary(ScalarOperation.Or32, quadLow, quadHigh));
+                        break;
+                    }
                     case "SBcnt1I32B64":
                         state.WriteScalar(destinationRegister, Binary(ScalarOperation.IAdd32, Unary(ScalarOperation.BitCount32, low), Unary(ScalarOperation.BitCount32, high)));
                         state.Scc = Bool(ScalarOperation.INotEqual32, state.Scalars[destinationRegister], _graph.Constant(0u));
@@ -1803,10 +1857,17 @@ public sealed partial class ScalarValueGraph
             _graph = graph;
             Scalars = new ScalarValue[ScalarRegisterCount];
             Vectors = new ScalarValue[VectorRegisterCount];
-            var undefined = graph.Undefined(ScalarValueType.U32);
+            Reset();
+        }
+
+        public void Reset()
+        {
+            var undefined = _graph.Undefined(ScalarValueType.U32);
             Array.Fill(Scalars, undefined);
             Array.Fill(Vectors, undefined);
-            Exec = graph.Undefined(ScalarValueType.Bool);
+            Lanes.Clear();
+            ThreadBits.Clear();
+            Exec = _graph.Undefined(ScalarValueType.Bool);
             Vcc = Exec;
             Scc = Exec;
             CarryOut = Exec;
@@ -1903,26 +1964,29 @@ public sealed partial class ScalarValueGraph
             }
         }
 
-        public RegisterState Clone()
+        public RegisterState Clone() => new RegisterState(_graph).CopyFrom(this);
+
+        public RegisterState CopyFrom(RegisterState source)
         {
-            var clone = new RegisterState(_graph);
-            Array.Copy(Scalars, clone.Scalars, Scalars.Length);
-            Array.Copy(Vectors, clone.Vectors, Vectors.Length);
-            foreach (var (key, value) in Lanes)
+            Array.Copy(source.Scalars, Scalars, Scalars.Length);
+            Array.Copy(source.Vectors, Vectors, Vectors.Length);
+            Lanes.Clear();
+            foreach (var (key, value) in source.Lanes)
             {
-                clone.Lanes[key] = value;
+                Lanes[key] = value;
             }
 
-            foreach (var (key, value) in ThreadBits)
+            ThreadBits.Clear();
+            foreach (var (key, value) in source.ThreadBits)
             {
-                clone.ThreadBits[key] = value;
+                ThreadBits[key] = value;
             }
 
-            clone.Exec = Exec;
-            clone.Vcc = Vcc;
-            clone.Scc = Scc;
-            clone.CarryOut = CarryOut;
-            return clone;
+            Exec = source.Exec;
+            Vcc = source.Vcc;
+            Scc = source.Scc;
+            CarryOut = source.CarryOut;
+            return this;
         }
 
         public bool SameAs(RegisterState other)

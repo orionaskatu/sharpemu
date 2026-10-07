@@ -39,7 +39,9 @@ public static class KernelPthreadExtendedCompatExports
     private static readonly bool _strictRwlockWriterPreference =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_STRICT_RWLOCK_WRITER_PREFERENCE"), "1", StringComparison.Ordinal);
 
-    private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
+    // pthread-specific values live in GuestFastPath's native per-thread tables
+    // so the emitted pthread_getspecific stub and this managed path read exactly
+    // the same storage.
 
     internal static void GetThreadStartScheduling(
         CpuContext ctx,
@@ -546,23 +548,38 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+		ulong stackAddress = 0;
+		ulong stackSize = 0;
+		var hasStackBounds = false;
+		var scheduler = GuestThreadExecution.Scheduler;
+		if (scheduler is not null &&
+			scheduler.TryGetGuestThreadStackBounds(thread, out stackAddress, out stackSize) &&
+			IsValidStackBounds(stackAddress, stackSize))
+		{
+			hasStackBounds = true;
+		}
+		else
+		{
+			stackAddress = 0;
+			stackSize = 0;
+			if (thread == KernelPthreadState.GetCurrentThreadHandle() &&
+				TryInferNativeGuestStack(ctx[CpuRegister.Rsp], out stackAddress))
+			{
+				stackSize = NativeGuestStackSize;
+				hasStackBounds = true;
+			}
+		}
+
         lock (_stateGate)
         {
             var threadState = GetOrCreateThreadStateLocked(thread);
 
-			// The native executor maps guest pthread stacks itself, after the
-			// kernel-facing thread object has been created.  Report that live
-			// mapping when a thread asks for its own attributes.  IL2CPP's
-			// conservative collector uses these two fields to register the stack;
-			// returning the default null address lets it recycle objects that are
-			// still reachable only from guest registers/stack frames.
-			if (thread == KernelPthreadState.GetCurrentThreadHandle() &&
-				TryInferNativeGuestStack(ctx[CpuRegister.Rsp], out var stackAddress))
+			if (hasStackBounds)
 			{
 				threadState.Attributes = threadState.Attributes with
 				{
 					StackAddress = stackAddress,
-					StackSize = NativeGuestStackSize,
+					StackSize = stackSize,
 				};
 			}
             _attrStates[outAttrAddress] = threadState.Attributes;
@@ -571,6 +588,11 @@ public static class KernelPthreadExtendedCompatExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+	private static bool IsValidStackBounds(ulong stackAddress, ulong stackSize) =>
+		stackAddress != 0 &&
+		stackSize != 0 &&
+		stackAddress <= ulong.MaxValue - stackSize;
 
 	private static bool TryInferNativeGuestStack(ulong stackPointer, out ulong stackAddress)
 	{
@@ -1452,10 +1474,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        foreach (var values in _threadLocalSpecific.Values)
-        {
-            values.TryRemove(key, out _);
-        }
+        GuestFastPath.ClearKeyEverywhere(key);
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -1483,10 +1502,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        var values = _threadLocalSpecific.GetOrAdd(
-            currentThreadHandle,
-            static _ => new ConcurrentDictionary<int, ulong>());
-        values[key] = value;
+        GuestFastPath.SetSpecific(currentThreadHandle, key, value);
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1507,20 +1523,13 @@ public static class KernelPthreadExtendedCompatExports
     {
         var key = unchecked((int)ctx[CpuRegister.Rdi]);
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
-        ulong value = 0;
         if (!_tlsKeys.ContainsKey(key))
         {
             ctx[CpuRegister.Rax] = 0;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        if (_threadLocalSpecific.TryGetValue(currentThreadHandle, out var values) &&
-            values.TryGetValue(key, out var storedValue))
-        {
-            value = storedValue;
-        }
-
-        ctx[CpuRegister.Rax] = value;
+        ctx[CpuRegister.Rax] = GuestFastPath.GetSpecific(currentThreadHandle, key);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1551,7 +1560,7 @@ public static class KernelPthreadExtendedCompatExports
         }
 
         var threadHandle = KernelPthreadState.GetCurrentThreadHandle();
-        if (!_threadLocalSpecific.TryGetValue(threadHandle, out var values))
+        if (!GuestFastPath.HasThreadValues(threadHandle))
         {
             return;
         }
@@ -1559,7 +1568,7 @@ public static class KernelPthreadExtendedCompatExports
         for (var iteration = 0; iteration < PthreadDestructorIterations; iteration++)
         {
             var ranAny = false;
-            foreach (var entry in values)
+            foreach (var entry in GuestFastPath.SnapshotThreadValues(threadHandle))
             {
                 var value = entry.Value;
                 if (value == 0 ||
@@ -1571,7 +1580,7 @@ public static class KernelPthreadExtendedCompatExports
 
                 // Clear before invoking, per POSIX, so a destructor that
                 // re-sets the key is handled on the next iteration.
-                if (!values.TryUpdate(entry.Key, 0, value))
+                if (!GuestFastPath.TryClearSpecific(threadHandle, entry.Key, value))
                 {
                     continue;
                 }
@@ -1594,7 +1603,7 @@ public static class KernelPthreadExtendedCompatExports
             }
         }
 
-        _threadLocalSpecific.TryRemove(threadHandle, out _);
+        GuestFastPath.ReleaseThread(threadHandle);
     }
 
     private static int PthreadRwlockLockCore(CpuContext ctx, ulong rwlockAddress, bool write)

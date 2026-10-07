@@ -13,6 +13,48 @@ namespace SharpEmu.ShaderCompiler.Tests;
 
 public sealed class Gen5ScalarLaneTransferTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ConditionalMove64_PreservesOldPairWhenSccIsClear(bool scc)
+    {
+        const ulong address = 0x1000;
+        var memory = new TestCpuMemory(address, 0x100);
+        uint[] words =
+        [
+            scc ? 0xBE800380u : 0xBE800381u, // s_mov_b32 s0, 0 or 1
+            0xBE8203A1, // s_mov_b32 s2, 33
+            0xBE8303AC, // s_mov_b32 s3, 44
+            0xBE84038B, // s_mov_b32 s4, 11
+            0xBE850396, // s_mov_b32 s5, 22
+            0xBF008000, // s_cmp_eq_i32 s0, 0
+            0xBE840602, // s_cmov_b64 s[4:5], s[2:3]
+            0xBF810000,
+        ];
+        Span<byte> bytes = stackalloc byte[words.Length * sizeof(uint)];
+        for (var index = 0; index < words.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes[(index * sizeof(uint))..], words[index]);
+        }
+        Assert.True(memory.TryWrite(address, bytes));
+        Assert.True(Gen5ShaderTranslator.TryDecodeProgram(new CpuContext(memory, Generation.Gen5), address, out var program, out var error), error);
+        var move = program.Instructions[6];
+        Assert.Equal("SCselectB64", move.Opcode);
+        Assert.Equal([Gen5Operand.Scalar(2), Gen5Operand.Scalar(4)], move.Sources);
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(ResourceTestProgram.Request(program), out _, out error), error);
+
+        var instructions = program.Instructions.Take(7).ToList();
+        instructions.Add(ResourceTestProgram.ScalarLoad(28, 4, destination: 100));
+        instructions.Add(ResourceTestProgram.EndProgram(36));
+        var plan = ResourceTestProgram.Extract(new Gen5ShaderProgram(address, instructions), userDataCount: 0);
+        var evaluator = new RuntimeValueEvaluator(plan, ResourceTestProgram.Inputs([]));
+        var handle = plan.Accesses.Single()!.Handle!;
+        Assert.True(evaluator.Evaluate(handle.Operands[0], out var low));
+        Assert.True(evaluator.Evaluate(handle.Operands[1], out var high));
+        Assert.Equal(scc ? 33u : 11u, low);
+        Assert.Equal(scc ? 44u : 22u, high);
+    }
+
     [Fact]
     public void DecoderContinuesPastEndProgramForForwardBranchTarget()
     {
@@ -231,7 +273,7 @@ public sealed class Gen5ScalarLaneTransferTests
 
     [Theory]
     [InlineData(false, true)]
-    [InlineData(true, false)]
+    [InlineData(true, true)]
     public void OneLaneWaveKeepsSgprsSpilledToOtherLanes(bool subgroups, bool expectSlot)
     {
         // Astro Bot's skinning vertex shader saves EXEC this way and restores it before a

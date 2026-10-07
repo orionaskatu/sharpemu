@@ -1175,6 +1175,18 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    public object? BackingAliasSnapshot => _backedSpace?.AliasSnapshot;
+
+    public bool TryEnterBackingAliasAccess() => !_disposed && _backedSpace is { } backed && backed.TryEnterAliasAccess();
+
+    public void ExitBackingAliasAccess() => _backedSpace?.ExitAliasAccess();
+
+    public bool TryResolveBackingAlias(ulong address, ulong size, out ulong alias)
+    {
+        alias = 0;
+        return !_disposed && _backedSpace is { } backed && backed.TryResolveAlias(address, size, out alias);
+    }
+
     private bool HasBackingOwner() => !_disposed && _backedSpace != null;
 
     // A span may cross adjacent view records; the owner validates full coverage.

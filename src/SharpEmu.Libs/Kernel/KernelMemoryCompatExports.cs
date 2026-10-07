@@ -125,9 +125,7 @@ public static partial class KernelMemoryCompatExports
     // Mount components already found to exist without being reparse points. Titles resolve
     // every asset path at startup; re-reading each directory's attributes costs seconds.
     private static readonly ConcurrentDictionary<string, byte> _verifiedMountComponents = new(HostFsPath.Comparer);
-    private static readonly ConcurrentDictionary<string, byte> _verifiedMountDirectories = new(HostFsPath.Comparer);
     private static readonly ConcurrentDictionary<string, string> _fullMountRoots = new(StringComparer.Ordinal);
-    private static readonly ConcurrentDictionary<string, byte> _aprScannedDirectories = new(HostFsPath.Comparer);
     private static long _nextFileDescriptor = 2;
     private static string _applicationTitleId = "UNKNOWN";
 
@@ -235,6 +233,8 @@ public static partial class KernelMemoryCompatExports
             _guestMounts[normalizedMountPoint] = normalizedHostRoot;
         }
 
+        InvalidateResolvedGuestPaths();
+
         lock (_statCacheGate)
         {
             _negativeStatCache.RemoveWhere(path =>
@@ -252,10 +252,18 @@ public static partial class KernelMemoryCompatExports
             return false;
         }
 
+        bool removed;
         lock (_guestMountGate)
         {
-            return _guestMounts.Remove(normalizedMountPoint);
+            removed = _guestMounts.Remove(normalizedMountPoint);
         }
+
+        if (removed)
+        {
+            InvalidateResolvedGuestPaths();
+        }
+
+        return removed;
     }
 
     internal static bool TryAllocateHleData(
@@ -1985,6 +1993,48 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Signature: (SceKernelAprFileId id, uint64_t* size). Callers size their read buffer from the
+    // answer and may pass an uninitialized slot, so the size must always be written on success.
+    [SysAbiExport(
+        Nid = "WvEu7yl3Ivg",
+        ExportName = "sceKernelAprGetFileSize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelAprGetFileSize(CpuContext ctx)
+    {
+        var fileId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var sizeAddress = ctx[CpuRegister.Rsi];
+        if (sizeAddress == 0)
+        {
+            KernelRuntimeCompatExports.TrySetErrno(ctx, Einval);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!AmprFileRegistry.TryGetHostPath(fileId, out var hostPath))
+        {
+            LogIoTrace("apr_get_file_size", $"id=0x{fileId:X8}", "result=id_not_registered");
+            KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (!TryGetAprFileSize(hostPath, out var size))
+        {
+            LogIoTrace("apr_get_file_size", hostPath, $"id=0x{fileId:X8} result=not_found");
+            KernelRuntimeCompatExports.TrySetErrno(ctx, 2);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        if (!TryWriteUInt64Compat(ctx, sizeAddress, size))
+        {
+            KernelRuntimeCompatExports.TrySetErrno(ctx, Efault);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        LogIoTrace("apr_get_file_size", hostPath, $"id=0x{fileId:X8} size={size}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "kBwCPsYX-m4",
         ExportName = "sceKernelFstat",
@@ -3150,9 +3200,14 @@ public static partial class KernelMemoryCompatExports
 
     private static int MapDirectMemoryCore(CpuContext ctx, ulong inOutAddressPointer, ulong length,
         int protection, ulong flags, ulong directMemoryStart, ulong alignment)
-        => RunMappingTransaction(() => MapDirectMemoryTransaction(ctx, inOutAddressPointer, length,
-            protection, flags, directMemoryStart, alignment),
-            MapNeedsGpuDrain(ctx, inOutAddressPointer, length, flags));
+        => RunMappingTransaction(
+            () => MapDirectMemoryTransaction(ctx, inOutAddressPointer, length, protection, flags, directMemoryStart, alignment),
+            () => IsNewMappingOutsideGpuMemory(ctx, inOutAddressPointer, length, flags));
+
+    // A kernel-placed mapping lands in free space; a fixed one must target untouched space.
+    private static bool IsNewMappingOutsideGpuMemory(CpuContext ctx, ulong inOutAddressPointer, ulong length, ulong flags) =>
+        (flags & OrbisKernelMapFixed) == 0 ||
+        (ctx.TryReadUInt64(inOutAddressPointer, out var requested) && IsUntouchedByGpu(requested, length));
 
     private static int MapDirectMemoryTransaction(CpuContext ctx, ulong inOutAddressPointer, ulong length,
         int protection, ulong flags, ulong directMemoryStart, ulong alignment)
@@ -3227,8 +3282,9 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int KernelMapNamedFlexibleMemory(CpuContext ctx)
-        => RunMappingTransaction(() => MapFlexibleMemoryCore(ctx),
-            MapNeedsGpuDrain(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], ctx[CpuRegister.Rcx]));
+        => RunMappingTransaction(
+            () => MapFlexibleMemoryCore(ctx),
+            () => IsNewMappingOutsideGpuMemory(ctx, ctx[CpuRegister.Rdi], ctx[CpuRegister.Rsi], ctx[CpuRegister.Rcx]));
 
     private static int MapFlexibleMemoryCore(CpuContext ctx)
     {
@@ -4733,6 +4789,38 @@ public static partial class KernelMemoryCompatExports
         return FileMode.Open;
     }
 
+    // Resolution is pure text work plus a per-component reparse-point check, but a
+    // resource streamer resolves the same paths hundreds of thousands of times through
+    // sceKernelAprResolveFilepathsToIdsAndFileSizes. Memoize the mapping and drop it
+    // whenever the mount table changes, which is the only input that can change an
+    // already-computed answer.
+    // Each entry records the mount-root configuration it was computed under, so a
+    // host configuration change cannot serve a stale answer.
+    private static readonly ConcurrentDictionary<string, (string Root, string Path)> _resolvedGuestPaths =
+        new(StringComparer.Ordinal);
+    private const int ResolvedGuestPathCacheLimit = 1 << 20;
+    // ConcurrentDictionary.Count takes every bucket lock, which on a path resolved by
+    // a dozen guest threads at once costs far more than the resolution it guards.
+    private static int _resolvedGuestPathCount;
+
+    internal static void InvalidateResolvedGuestPaths()
+    {
+        _resolvedGuestPaths.Clear();
+        Interlocked.Exchange(ref _resolvedGuestPathCount, 0);
+    }
+
+    // Every mount root a built-in branch can use. Resolution depends on nothing else
+    // that changes at runtime (the mount table clears the cache itself), so a memoized
+    // answer stays valid exactly as long as this token does.
+    private static string RootConfigurationToken() =>
+        string.Concat(
+            Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_HOSTAPP_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_DEVLOG_APP_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_TEMP0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_DOWNLOAD0_DIR"), "|",
+            Environment.GetEnvironmentVariable("SHARPEMU_SAVEDATA_DIR"));
+
     public static string ResolveGuestPath(string guestPath)
     {
         if (string.IsNullOrWhiteSpace(guestPath))
@@ -4740,6 +4828,28 @@ public static partial class KernelMemoryCompatExports
             return guestPath;
         }
 
+        var roots = RootConfigurationToken();
+        if (_resolvedGuestPaths.TryGetValue(guestPath, out var memoized) &&
+            string.Equals(memoized.Root, roots, StringComparison.Ordinal))
+        {
+            return memoized.Path;
+        }
+
+        var resolved = ResolveGuestPathUncached(guestPath);
+        // Only a successful resolution is memoized: a denial is a containment
+        // decision about the host filesystem's current shape, so it stays live.
+        if (!string.IsNullOrEmpty(resolved) &&
+            Volatile.Read(ref _resolvedGuestPathCount) < ResolvedGuestPathCacheLimit &&
+            _resolvedGuestPaths.TryAdd(guestPath, (roots, resolved)))
+        {
+            Interlocked.Increment(ref _resolvedGuestPathCount);
+        }
+
+        return resolved;
+    }
+
+    private static string ResolveGuestPathUncached(string guestPath)
+    {
         if (TryResolveRegisteredGuestMount(guestPath, out var mountedPath, out var mountPrefixMatched))
         {
             return mountedPath;
@@ -5106,43 +5216,36 @@ public static partial class KernelMemoryCompatExports
                      Path.DirectorySeparatorChar,
                      StringSplitOptions.RemoveEmptyEntries))
         {
-            var parent = current;
             current = Path.Combine(current, segment);
+            // Each component is checked once with its own lstat. Listing the parent instead
+            // stats every entry of that directory (.NET fills attributes per entry), so a game
+            // image with large directories paid for files it never opens: Demon's Souls spent
+            // ~9 s of its load in those stats.
             if (_verifiedMountComponents.ContainsKey(current))
             {
                 continue;
             }
 
-            // One listing returns every entry's attributes: verify the whole parent directory
-            // at once. Reparse points stay unverified and are rejected below.
-            if (_verifiedMountDirectories.TryAdd(parent, 0))
-            {
-                try
-                {
-                    foreach (var entry in new DirectoryInfo(parent).EnumerateFileSystemInfos())
-                    {
-                        if ((entry.Attributes & FileAttributes.ReparsePoint) == 0)
-                        {
-                            _verifiedMountComponents.TryAdd(entry.FullName, 0);
-                        }
-                    }
-                }
-                catch (Exception ex) when (
-                    ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
-                {
-                }
-
-                if (_verifiedMountComponents.ContainsKey(current))
-                {
-                    continue;
-                }
-            }
-
             try
             {
-                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                // One lstat answers both questions a resolved asset path asks: whether the
+                // component is a link, and (for the file itself) its size for APR resolution.
+                var component = new FileInfo(current);
+                var attributes = component.Attributes;
+                if ((int)attributes == -1)
+                {
+                    // Component does not exist yet (create path); nothing to follow.
+                    break;
+                }
+
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
                 {
                     return true;
+                }
+
+                if ((attributes & FileAttributes.Directory) == 0)
+                {
+                    _aprFileSizeCache.TryAdd(current, component.Length < 0 ? 0UL : unchecked((ulong)component.Length));
                 }
 
                 _verifiedMountComponents.TryAdd(current, 0);
@@ -5785,7 +5888,31 @@ public static partial class KernelMemoryCompatExports
         return TryWriteCompat(ctx, address, bytes);
     }
 
+    // One transaction for the whole batch: every entry would otherwise hand the GPU worker
+    // its own mapping change and wait for the GPU to drain before it could run.
     private static int KernelBatchMapCore(CpuContext ctx, int flags)
+        => RunMappingTransaction(() => KernelBatchMapTransaction(ctx, flags), () => BatchOnlyAddsOutsideGpuMemory(ctx, flags));
+
+    // Only map operations, each placing memory where the GPU has never looked.
+    private static bool BatchOnlyAddsOutsideGpuMemory(CpuContext ctx, int flags)
+    {
+        var entriesAddress = ctx[CpuRegister.Rdi];
+        var entryCount = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (entryCount <= 0 || entryCount > 4096)
+            return false;
+        for (var index = 0; index < entryCount; index++)
+        {
+            var entryAddress = entriesAddress + (ulong)(index * OrbisKernelBatchMapEntrySize);
+            if (!TryReadBatchMapEntry(ctx, entryAddress, out var entry) ||
+                entry.Operation is not (OrbisKernelMapOpMapDirect or OrbisKernelMapOpMapFlexible) ||
+                !IsNewMappingOutsideGpuMemory(ctx, entryAddress + OrbisKernelBatchMapEntryStartOffset, entry.Length, unchecked((uint)flags)))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static int KernelBatchMapTransaction(CpuContext ctx, int flags)
     {
         var entriesAddress = ctx[CpuRegister.Rdi];
         var entryCount = unchecked((int)ctx[CpuRegister.Rsi]);
@@ -6866,6 +6993,19 @@ public static partial class KernelMemoryCompatExports
         return TryWriteHostPathStat(ctx, statAddress, hostPath, isDirectory);
     }
 
+    // /app0 is the read-only game image, so a path that is not in it now will not
+    // appear later. Remembering the absent ones turns a repeated pair of host stats
+    // on the (slow, external) game volume into a dictionary probe; Demon's Souls
+    // resolves tens of thousands of paths per boot and misses are the common case.
+    private static readonly ConcurrentDictionary<string, byte> _aprMissingImagePaths = new(HostFsPath.Comparer);
+
+    private static bool IsUnderApp0(string cachePath)
+    {
+        var app0Root = ResolveApp0Root();
+        return !string.IsNullOrWhiteSpace(app0Root) &&
+            cachePath.StartsWith(Path.TrimEndingDirectorySeparator(app0Root) + Path.DirectorySeparatorChar, HostFsPath.Comparison);
+    }
+
     private static bool TryGetAprFileSize(string hostPath, out ulong size)
     {
         size = 0;
@@ -6885,25 +7025,9 @@ public static partial class KernelMemoryCompatExports
             return true;
         }
 
-        // One directory listing returns every file's size; titles resolve whole asset
-        // directories at startup, so this replaces one host query per file.
-        if (Path.GetDirectoryName(cachePath) is { } directory && _aprScannedDirectories.TryAdd(directory, 0))
+        if (_aprMissingImagePaths.ContainsKey(cachePath))
         {
-            try
-            {
-                foreach (var file in new DirectoryInfo(directory).EnumerateFiles())
-                {
-                    _aprFileSizeCache.TryAdd(file.FullName, file.Length < 0 ? 0UL : unchecked((ulong)file.Length));
-                }
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.Security.SecurityException)
-            {
-            }
-
-            if (_aprFileSizeCache.TryGetValue(cachePath, out size))
-            {
-                return true;
-            }
+            return false;
         }
 
         try
@@ -6919,6 +7043,11 @@ public static partial class KernelMemoryCompatExports
 
             if (!new DirectoryInfo(cachePath).Exists)
             {
+                if (IsUnderApp0(cachePath))
+                {
+                    _aprMissingImagePaths.TryAdd(cachePath, 0);
+                }
+
                 return false;
             }
 

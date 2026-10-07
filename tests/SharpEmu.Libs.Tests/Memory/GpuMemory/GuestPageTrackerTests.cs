@@ -153,6 +153,25 @@ public sealed class GuestPageTrackerTests : IDisposable
         Release(address, Page * 2);
     }
 
+    [NativePageProtectionFact]
+    public void LockFreeCpuDirtyQueryAgreesWithTheLockedQuery()
+    {
+        var address = Allocate(2);
+        Assert.True(_tracker.MayHaveCpuDirtyPages(address, Page * 2));
+
+        _tracker.ForEachUploadRange(address, Page * 2, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+        Assert.False(_tracker.HasCpuDirtyPages(address, Page * 2));
+        Assert.False(_tracker.MayHaveCpuDirtyPages(address, Page * 2));
+
+        _tracker.MarkCpuDirtyPages(address + Page + 16, 32);
+        Assert.False(_tracker.MayHaveCpuDirtyPages(address, Page));
+        Assert.True(_tracker.MayHaveCpuDirtyPages(address, Page * 2));
+        Assert.True(_tracker.MayHaveCpuDirtyPages(address + Page + 64, 4));
+
+        _tracker.UntrackMemory(address, Page * 2);
+        Release(address, Page * 2);
+    }
+
     // The lock-free block summary must agree with the precise page masks through every
     // CPU-dirty transition: upload, explicit mark, write-fault invalidation and GPU writes.
     [NativePageProtectionFact]
@@ -217,6 +236,32 @@ public sealed class GuestPageTrackerTests : IDisposable
         Assert.Empty(Runs(address, Region * 3));
         _tracker.UntrackMemory(address, Region * 3);
         Release(address, Region * 3);
+    }
+
+    [NativePageProtectionFact]
+    public void PossiblyCpuDirtyRangesCrossSummaryWords()
+    {
+        var address = AllocateAligned(Region * 2, Region * 64);
+        List<(ulong Address, ulong Size)> Runs(ulong start, ulong size)
+        {
+            var runs = new List<(ulong Address, ulong Size)>();
+            _tracker.ForEachPossiblyCpuDirtyRange(start, size, (runAddress, runSize) => runs.Add((runAddress, runSize)));
+            return runs;
+        }
+
+        _tracker.ForEachUploadRange(address, Region * 2, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+        Assert.Equal([(address - Region * 2 + Page, Region * 2 - Page)], Runs(address - Region * 2 + Page, Region * 4 - Page * 2));
+
+        _tracker.MarkCpuDirtyPages(address + Region + Page, 8);
+        Assert.Equal([(address - Region * 2, Region * 2), (address + Region, Region - Page)], Runs(address - Region * 2, Region * 4 - Page));
+        Assert.Equal([(address + Region, Region)], Runs(address, Region * 2));
+        Assert.Equal([(address + Region, Region * 64)], Runs(address, Region * 65));
+
+        _tracker.ForEachUploadRange(address, Region * 2, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+        Assert.Empty(Runs(address, Region * 2));
+        Assert.Equal([(address + Region * 2, Region * 63)], Runs(address, Region * 65));
+        _tracker.UntrackMemory(address, Region * 2);
+        Release(address, Region * 2);
     }
 
     [NativePageProtectionFact]

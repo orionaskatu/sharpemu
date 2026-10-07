@@ -623,7 +623,40 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
 
         Interlocked.Increment(ref _activeAccesses);
-        var snapshot = Volatile.Read(ref _snapshot);
+        if (TryFindAlias(Volatile.Read(ref _snapshot), address, size, out target))
+        {
+            return true;
+        }
+
+        Interlocked.Decrement(ref _activeAccesses);
+        return false;
+    }
+
+    public object AliasSnapshot => Volatile.Read(ref _snapshot);
+
+    public bool TryEnterAliasAccess()
+    {
+        Interlocked.Increment(ref _activeAccesses);
+        if (!Volatile.Read(ref _disposed) && _backing != null)
+        {
+            return true;
+        }
+
+        Interlocked.Decrement(ref _activeAccesses);
+        return false;
+    }
+
+    public void ExitAliasAccess() => Interlocked.Decrement(ref _activeAccesses);
+
+    public bool TryResolveAlias(ulong address, ulong size, out ulong target)
+    {
+        target = 0;
+        return size != 0 && ulong.MaxValue - address >= size && TryFindAlias(Volatile.Read(ref _snapshot), address, size, out target);
+    }
+
+    private bool TryFindAlias(ViewRecord[] snapshot, ulong address, ulong size, out ulong target)
+    {
+        target = 0;
         var low = 0;
         var high = snapshot.Length - 1;
         var found = -1;
@@ -655,7 +688,6 @@ public sealed unsafe class SharedBackingViews : IDisposable
             }
         }
 
-        Interlocked.Decrement(ref _activeAccesses);
         return false;
     }
 

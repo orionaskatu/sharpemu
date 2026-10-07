@@ -24,6 +24,9 @@ public sealed class CommandStreamQueueTests
     private static uint[] WaitEqual(ulong address, uint reference) =>
         StreamRunner.Packet(PacketOpcode.WaitRegisterMemory, 0x13u, StreamRunner.Low(address), StreamRunner.High(address), reference, 0xFFFF_FFFFu, 0);
 
+    private static uint[] WriteLabel(ulong address, uint value) =>
+        StreamRunner.Packet(PacketOpcode.WriteData, 0x00000500u, StreamRunner.Low(address), StreamRunner.High(address), value);
+
     private static (RecordingCommandStreamHost Host, CommandStreamQueue Queue) NewQueue()
     {
         var host = new RecordingCommandStreamHost();
@@ -149,6 +152,83 @@ public sealed class CommandStreamQueueTests
         }
 
         Assert.Equal(new[] { "begin 0 1", "begin 1 3", "begin 0 2" }, host.Calls.Where(call => call.StartsWith("begin", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void ControlBarrier_RunsBetweenTheAcceptedSliceAndLaterAdmissions()
+    {
+        var (host, queue) = NewQueue();
+        Enqueue(host, queue, Graphics, 1, CreateInstanceCountPacket(1));
+        var cancelled = false;
+        host.PendingCommands.Enqueue(() =>
+        {
+            Assert.True(queue.TryEnqueueControlBarrier(
+                () => host.Calls.Add("mapping_change"),
+                () => cancelled = true));
+            Enqueue(host, queue, Graphics + 0x100, 2, CreateInstanceCountPacket(2));
+        });
+
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.DoesNotContain("mapping_change", host.Calls);
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+
+        var first = host.Calls.IndexOf("begin 0 1");
+        var barrier = host.Calls.IndexOf("mapping_change");
+        var second = host.Calls.IndexOf("begin 0 2");
+        Assert.True(first >= 0 && barrier > first && second > barrier, string.Join(", ", host.Calls));
+        Assert.False(cancelled);
+    }
+
+    [Fact]
+    public void ControlBarrier_PreservesCrossQueueProgressWhileAnOlderHeadIsBlocked()
+    {
+        var (host, queue) = NewQueue();
+        host.WriteDword(Label, 0);
+        Enqueue(host, queue, Graphics, 1, WaitEqual(Label, 1));
+        Assert.Equal(SliceResult.BlockedWithoutProgress, queue.ProcessOne());
+        Assert.True(queue.TryEnqueueControlBarrier(() => host.Calls.Add("mapping_change"), () => { }));
+        EnqueueCompute(host, queue, 0x20, Compute, 2, CreateInstanceCountPacket(2));
+
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.DoesNotContain("mapping_change", host.Calls);
+        host.WriteDword(Label, 1);
+        queue.RetryBlocked();
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+
+        var compute = host.Calls.IndexOf("begin 1 2");
+        var retriedGraphics = host.Calls.FindLastIndex(call => call == "begin 0 1");
+        var barrier = host.Calls.IndexOf("mapping_change");
+        Assert.True(compute >= 0 && retriedGraphics > compute && barrier > retriedGraphics, string.Join(", ", host.Calls));
+    }
+
+    [Fact]
+    public void ControlBarrier_IsCancelledWhenTheQueueIsDiscarded()
+    {
+        var (_, queue) = NewQueue();
+        var ran = false;
+        var cancelled = false;
+        Assert.True(queue.TryEnqueueControlBarrier(() => ran = true, () => cancelled = true));
+
+        queue.DiscardAll();
+
+        Assert.False(ran);
+        Assert.True(cancelled);
+        Assert.False(queue.HasPending);
+    }
+
+    [Fact]
+    public void ShutdownDrain_RunsAnAcceptedControlBarrier()
+    {
+        var (_, queue) = NewQueue();
+        var ran = false;
+        Assert.True(queue.TryEnqueueControlBarrier(() => ran = true, () => { }));
+        queue.StopAccepting();
+
+        Assert.Equal(IdleOutcome.Completed, queue.DrainForShutdown(cancelBlockedOnNoProgress: true));
+        Assert.True(ran);
+        Assert.False(queue.HasPending);
     }
 
     [Fact]
@@ -354,22 +434,147 @@ public sealed class CommandStreamQueueTests
     }
 
     [Fact]
-    public async Task Done_FromAnotherThreadWaitsForTheQueueAndCountsFrames()
+    public async Task Done_QueuesTheBoundaryAndOnlyWaitsForASecondOne()
     {
-        var (host, queue) = NewQueue();
+        var host = new RecordingCommandStreamHost();
+        var queue = new CommandStreamQueue(host, boundariesInFlight: 1);
         Enqueue(host, queue, Graphics, 1, CreateInstanceCountPacket(1));
-        var done = Task.Run(queue.Done);
 
-        await Task.WhenAny(done, Task.Delay(100));
-        Assert.False(done.IsCompleted);
+        // The first suspend point returns without draining the accepted submissions.
+        Assert.Equal(IdleOutcome.Completed, await Task.Run(queue.Done).WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(0, queue.FrameNumber);
+        Assert.True(queue.HasPending);
+
+        // The second one waits until the first boundary has been processed.
+        var second = Task.Run(queue.Done);
+        await Task.WhenAny(second, Task.Delay(100));
+        Assert.False(second.IsCompleted);
         Assert.Equal(SliceResult.Completed, queue.ProcessOne());
-        Assert.Equal(IdleOutcome.Completed, await done.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(IdleOutcome.Completed, await second.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal(1, queue.FrameNumber);
 
         // The next graphics submission starts from a reset processor.
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(2, queue.FrameNumber);
         Enqueue(host, queue, Graphics, 2, CreateInstanceCountPacket(2));
         Assert.Equal(SliceResult.Completed, queue.ProcessOne());
         Assert.Equal(2UL, queue.GetInterpreter(0).SubmitId);
     }
 
+    [Fact]
+    public async Task Done_WaitsForItsOwnBoundaryWithoutRunAhead()
+    {
+        var host = new RecordingCommandStreamHost();
+        var queue = new CommandStreamQueue(host, boundariesInFlight: 0);
+        Enqueue(host, queue, Graphics, 1, CreateInstanceCountPacket(1));
+
+        var done = Task.Run(queue.Done);
+        await Task.WhenAny(done, Task.Delay(100));
+        Assert.False(done.IsCompleted);
+
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        await Task.WhenAny(done, Task.Delay(100));
+        Assert.False(done.IsCompleted);
+
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(IdleOutcome.Completed, await done.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(1, queue.FrameNumber);
+        Assert.False(queue.HasPending);
+    }
+
+    [Fact]
+    public async Task Done_KeepsALabelRewrittenAfterItAwayFromAnUnfinishedFrame()
+    {
+        var host = new RecordingCommandStreamHost();
+        var queue = new CommandStreamQueue(host, boundariesInFlight: 0);
+        void WriteLabel(uint value) => Assert.True(host.GuestMemory.TryWrite(StreamRunner.DataAddress, BitConverter.GetBytes(value)));
+        WriteLabel(0);
+        Enqueue(host, queue, Graphics, 1,
+            StreamRunner.Packet(PacketOpcode.WriteData, 0x00000500u, StreamRunner.Low(StreamRunner.DataAddress), StreamRunner.High(StreamRunner.DataAddress), 1),
+            WaitEqual(StreamRunner.DataAddress, 1));
+
+        var guest = Task.Run(() =>
+        {
+            var outcome = queue.Done();
+            WriteLabel(0);
+            return outcome;
+        });
+
+        await Task.WhenAny(guest, Task.Delay(100));
+        Assert.False(guest.IsCompleted);
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(IdleOutcome.Completed, await guest.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PairedLabelWait_SurvivesTheNextFramesResetWithRunAhead(bool is64Bit)
+    {
+        var host = new RecordingCommandStreamHost();
+        var queue = new CommandStreamQueue(host, boundariesInFlight: 1);
+        var packets = new List<uint[]>();
+        for (var pair = 0; pair < 7; pair++)
+        {
+            var address = Label + (ulong)pair * 8;
+            packets.Add(is64Bit
+                ? StreamRunner.Packet(PacketOpcode.WriteData, 0x00000500u,
+                    StreamRunner.Low(address), StreamRunner.High(address), 1, 2)
+                : WriteLabel(address, 1));
+            packets.Add(is64Bit
+                ? StreamRunner.Packet(PacketOpcode.WaitRegisterMemory64, 0x13u,
+                    StreamRunner.Low(address), StreamRunner.High(address), 1, 2, uint.MaxValue, uint.MaxValue, 0)
+                : WaitEqual(address, 1));
+        }
+        Enqueue(host, queue, Graphics, 1, packets.ToArray());
+        host.BeforeGuestRead = address =>
+        {
+            if (address == Label + 6 * 8) host.WriteQword(address, 0);
+        };
+
+        Assert.Equal(IdleOutcome.Completed, await Task.Run(queue.Done).WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(0, queue.FrameNumber); // CPU/GPU overlap remains enabled.
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(0UL, host.ReadQword(Label + 6 * 8)); // The CPU reset was not overwritten.
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+        Assert.Equal(1, queue.FrameNumber);
+        Assert.Equal(0, queue.BlockedQueueCount);
+    }
+
+    [Theory]
+    [InlineData(0)] // A CPU-produced label must still be read from live memory.
+    [InlineData(1)] // Never forward a value from the preceding submission.
+    [InlineData(2)] // Never forward through work that may write the label on the GPU.
+    public void LabelWait_DoesNotForwardAnUnrelatedOrOlderStore(int scenario)
+    {
+        var (host, queue) = NewQueue();
+        host.WriteDword(Label, 0);
+        if (scenario == 0)
+        {
+            Enqueue(host, queue, Graphics, 1, WriteLabel(Label + 8, 1), WaitEqual(Label, 1));
+        }
+        else if (scenario == 1)
+        {
+            Enqueue(host, queue, Graphics, 1, WriteLabel(Label, 1));
+            Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+            host.WriteDword(Label, 0);
+            Enqueue(host, queue, Graphics + 0x100, 2, WaitEqual(Label, 1));
+        }
+        else
+        {
+            Enqueue(host, queue, Graphics, 1, WriteLabel(Label, 1),
+                StreamRunner.Packet(PacketOpcode.DrawIndexAuto, 3, 0), WaitEqual(Label, 1));
+            host.BeforeGuestRead = address =>
+            {
+                if (address == Label) host.WriteDword(Label, 0);
+            };
+        }
+        Assert.Equal(scenario == 1 ? SliceResult.BlockedWithoutProgress : SliceResult.Progressed, queue.ProcessOne());
+        host.BeforeGuestRead = null;
+        host.WriteDword(Label, 1);
+        queue.RetryBlocked();
+        Assert.Equal(SliceResult.Completed, queue.ProcessOne());
+    }
 }

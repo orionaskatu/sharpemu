@@ -24,4 +24,18 @@ public interface IGuestBackedSpace
     // Copies through the backing alias only: no protection change, no store notification.
     bool TryWriteBacking(ulong address, ReadOnlySpan<byte> data);
     bool TryReadBacking(ulong address, Span<byte> data);
+
+    object? BackingAliasSnapshot => null;
+
+    bool TryEnterBackingAliasAccess() => false;
+
+    void ExitBackingAliasAccess()
+    {
+    }
+
+    bool TryResolveBackingAlias(ulong address, ulong size, out ulong alias)
+    {
+        alias = 0;
+        return false;
+    }
 }

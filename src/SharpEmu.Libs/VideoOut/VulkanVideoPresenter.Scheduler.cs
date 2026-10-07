@@ -22,7 +22,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // This partial owns the submission scheduler and the GPU worker relay.
 
         private readonly object _queueGate = new();
-        private readonly GpuWorkerRelay _relay = new(WakeRenderThread);
+        private readonly GpuWorkerRelay _relay;
 
         internal GpuWorkerRelay Relay => _relay;
         private readonly SubmissionContext _submissionContext = new();
@@ -38,6 +38,17 @@ internal static unsafe partial class VulkanVideoPresenter
         void IRenderingState.EndRendering()
         {
             EndRendering();
+        }
+
+        bool IRenderingState.TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers)
+        {
+            if (!_renderingActive)
+            {
+                return false;
+            }
+
+            _barriersAfterRendering.Add((sourceStages, destinationStages, barriers.ToArray()));
+            return true;
         }
 
         internal static void WakeRenderThread()

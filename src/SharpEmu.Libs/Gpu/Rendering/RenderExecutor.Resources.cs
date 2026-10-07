@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
+using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
@@ -129,6 +130,11 @@ public sealed partial class RenderExecutor
     }
 
     // A written buffer resource with an address and a footprint needs a barrier after the stage.
+    // Device-address accesses are not split into reads and writes, so they count as stores.
+    private bool DrawWritesMemory(ShaderStageResources stage) =>
+        stage.Program is { } program &&
+        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
+
     private bool HasBufferWrites(ShaderStageResources stage)
     {
         var program = stage.Program ?? throw _host.Fatal("A shader stage has no program.");
@@ -165,6 +171,30 @@ public sealed partial class RenderExecutor
     private void SetDrawDebugPhase(ulong submitId, in DrawCall draw, uint phase) =>
         _host.SetDebugInformation(draw.Operation, submitId, phase, draw.Count, 0, draw.InstanceCount, draw.FirstInstance);
 
+    private IPreparedBindings PrepareBindings(in ShaderStageResources stage)
+    {
+        var bindings = _host.PrepareBindings(stage);
+        NoteSampledTextures(stage);
+        return bindings;
+    }
+
+    private static void NoteSampledTextures(in ShaderStageResources stage)
+    {
+        if (stage.Program is not { } program)
+        {
+            return;
+        }
+
+        var descriptors = stage.Resources.Images;
+        for (var index = 0; index < program.Images.Length && index < descriptors.Length; index++)
+        {
+            if (program.Images[index].Class == ImageResourceClass.Sampled)
+            {
+                MipStatistics.Shared.NoteSampled(new TextureDescriptorWords(descriptors[index]));
+            }
+        }
+    }
+
     // Binds everything the draw needs inside one preparation scope, then records it.
     private void RecordDraw(
         ulong submitId,
@@ -196,8 +226,8 @@ public sealed partial class RenderExecutor
         IPreparedBindings? pixelBindings;
         try
         {
-            vertexBindings = _host.PrepareBindings(vertexInput.Stage);
-            pixelBindings = state.PixelActive ? _host.PrepareBindings(pixelInput.Stage) : null;
+            vertexBindings = PrepareBindings(vertexInput.Stage);
+            pixelBindings = state.PixelActive ? PrepareBindings(pixelInput.Stage) : null;
         }
         catch (DrawImageTypeMismatchException rejection)
         {
@@ -301,6 +331,11 @@ public sealed partial class RenderExecutor
         {
             _host.EndRendering();
             _host.DebugFillBuffer(emission.IndirectArgumentsAddress + 4, 4, clamp.Count);
+        }
+
+        if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
+        {
+            _host.PrepareMemoryWritingDraw();
         }
 
         _host.BeginRendering(in state.Rendering);

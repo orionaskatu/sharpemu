@@ -144,6 +144,12 @@ public interface IRenderHost
 
     void EndRendering();
 
+    // Whether a texture bound for the draw being prepared reads the depth attachment's subresources.
+    bool SamplesDepthAttachment(in DepthAttachmentState depth) => true;
+
+    // The next draw stores to buffers or storage images; called before its BeginRendering.
+    void PrepareMemoryWritingDraw() { }
+
     void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline);
 
     void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance);
@@ -204,6 +210,10 @@ public interface IRenderHost
     // A small constant fill the CPU can apply to guest memory and the buffers that mirror it
     // without a GPU dispatch; false when the GPU owns any of the bytes.
     bool TryFillGuestMemoryOnCpu(ulong address, ulong size, uint value) => false;
+
+    bool TryFillDccMetadata(ulong address, ulong size, uint fillValue);
+
+    bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words);
 
     Exception Fatal(string message);
 }

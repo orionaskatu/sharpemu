@@ -24,6 +24,13 @@ public sealed class VulkanCommandProfileTests(HeadlessVulkanFixture fixture) : I
     }
 
     [Fact]
+    public void OverlappingSubmissionsCountOnceTowardsBusyTime()
+    {
+        var spans = new List<(ulong Start, ulong End)> { (100, 150), (0, 40), (140, 200), (30, 60), (300, 310) };
+        Assert.Equal((170ul, 60ul), VulkanCommandProfile.MergeSpans(spans));
+    }
+
+    [Fact]
     public void DefaultDeviceDoesNotCreateQueryResources()
     {
         if (!GatePrerequisites.Ready(fixture.Vulkan)) return;
@@ -42,6 +49,7 @@ public sealed class VulkanCommandProfileTests(HeadlessVulkanFixture fixture) : I
         using (device)
         {
             if (!profile.Supported) return;
+            profile.PerCommandMarkers = true;
             var buffer = device.AllocateBuffers(1)[0];
             var command = new CommandBuffer(buffer);
             device.BeginBuffer(buffer);
@@ -77,7 +85,8 @@ public sealed class VulkanCommandProfileTests(HeadlessVulkanFixture fixture) : I
                 LayerCount = 1,
             };
             vulkan.Vk.CmdBeginRendering(command, &rendering);
-            device.CommandProfile!.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            device.CommandProfile!.PerCommandMarkers = true;
+            device.CommandProfile.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             device.CommandProfile.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw, 1, 3, 1);
             vulkan.Vk.CmdEndRendering(command);
             device.EndBuffer(buffer);

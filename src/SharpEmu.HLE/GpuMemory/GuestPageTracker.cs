@@ -15,6 +15,7 @@ public sealed class GuestPageTracker
 
     private readonly PageGuard _pages;
     private readonly TrackedRegion?[] _regions = new TrackedRegion?[TrackerLayout.BlockCount];
+    private readonly long[] _presentRegions = new long[(TrackerLayout.BlockCount + 63) / 64];
     private readonly object _regionGate = new();
     private readonly CpuDirtySummary _cpuDirtySummary = new();
 
@@ -34,6 +35,34 @@ public sealed class GuestPageTracker
             return region.IsModified(WriteOrigin.Cpu, offset, bytes);
         });
     }
+
+    public bool MayHaveCpuDirtyPages(ulong vaddr, ulong size)
+    {
+        if (IsKnownCpuClean(vaddr, size))
+        {
+            return false;
+        }
+
+        var remaining = size;
+        var index = vaddr / BlockBytes;
+        var offset = vaddr % BlockBytes;
+        while (remaining != 0)
+        {
+            var bytes = Math.Min(BlockBytes - offset, remaining);
+            if (Volatile.Read(ref _regions[index]) is not { } region || region.IsModified(WriteOrigin.Cpu, offset, bytes))
+            {
+                return true;
+            }
+
+            remaining -= bytes;
+            offset = 0;
+            index++;
+        }
+
+        return false;
+    }
+
+    public long CpuDirtyEpoch => _cpuDirtySummary.Epoch;
 
     public bool HasGpuDirtyPages(ulong vaddr, ulong size)
     {
@@ -498,18 +527,41 @@ public sealed class GuestPageTracker
         var last = (end - 1) / BlockBytes;
         var runStart = 0UL;
         var inRun = false;
-        for (var index = vaddr / BlockBytes; index <= last; index++)
+        var index = vaddr / BlockBytes;
+        var loadedWord = -1;
+        var possiblyDirty = 0UL;
+        while (index <= last)
         {
-            var possiblyDirty = Volatile.Read(ref _regions[index]) == null || _cpuDirtySummary.IsDirty(index);
-            if (possiblyDirty && !inRun)
+            var word = (int)(index / 64);
+            if (word != loadedWord)
             {
-                runStart = Math.Max(vaddr, index * BlockBytes);
-                inRun = true;
+                loadedWord = word;
+                possiblyDirty = ~(ulong)Volatile.Read(ref _presentRegions[word]) | _cpuDirtySummary.Word(word);
             }
-            else if (!possiblyDirty && inRun)
+
+            var shift = (int)(index % 64);
+            var pending = (inRun ? ~possiblyDirty : possiblyDirty) >> shift;
+            if (pending == 0)
+            {
+                index = ((ulong)word + 1) * 64;
+                continue;
+            }
+
+            index += (ulong)System.Numerics.BitOperations.TrailingZeroCount(pending);
+            if (index > last)
+            {
+                break;
+            }
+
+            if (inRun)
             {
                 visit(runStart, index * BlockBytes - runStart);
                 inRun = false;
+            }
+            else
+            {
+                runStart = Math.Max(vaddr, index * BlockBytes);
+                inRun = true;
             }
         }
 
@@ -574,6 +626,7 @@ public sealed class GuestPageTracker
 
             var created = new TrackedRegion(_pages, index * BlockBytes, _cpuDirtySummary);
             Volatile.Write(ref _regions[index], created);
+            Interlocked.Or(ref _presentRegions[index / 64], 1L << (int)(index % 64));
             return created;
         }
     }

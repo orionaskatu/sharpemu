@@ -33,6 +33,8 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
 
     public List<ulong> GuestReads { get; } = new();
 
+    public Action<ulong>? BeforeGuestRead { get; set; }
+
     public List<DrawIndexedArguments> IndexedDraws { get; } = new();
 
     public List<DrawAutoArguments> AutoDraws { get; } = new();
@@ -55,6 +57,7 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
     public bool TryReadGuest(ulong address, Span<byte> destination)
     {
         GuestReads.Add(address);
+        BeforeGuestRead?.Invoke(address);
         if (PendingGpuValues.Remove(address, out var pending))
         {
             WriteQword(address, pending);

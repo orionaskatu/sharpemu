@@ -57,15 +57,20 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Submits the current recording buffer with everything the batch lists own.
-        private void FlushBatchedGuestCommands()
+        // Returns the timeline tick that contains the commands this call submitted, so a
+        // caller that must wait for its own recording does not read the shared
+        // _submitTimeline field, which the presenter thread also writes.
+        private ulong FlushBatchedGuestCommands()
         {
             if (!_batchOpen)
             {
-                return;
+                return _submitTimeline;
             }
 
             using var profile = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueueSubmit);
-            _scheduler.Flush();
+            var tick = _scheduler.Flush();
+            _bufferCache?.OnBatchSubmitted();
+            return tick;
         }
 
         private void PrepareGuestSubmission(SubmitBundle bundle)

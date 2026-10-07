@@ -384,6 +384,38 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A title submits many command buffers per frame; collection after each of them must not age
+    // the textures it samples once a frame, or they are deleted and uploaded again every frame.
+    [Fact]
+    public void GarbageCollector_AgesImagesByFrameNotBySubmission()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x400000, ReadWrite);
+        var request = Color32(address + 0x330000);
+        ResourceSlotIdentifier[] images = [harness.Find(ref request)];
+        harness.Worker.Run(() =>
+        {
+            harness.Images.SetCollectionThresholds(0, ulong.MaxValue, ulong.MaxValue, 1);
+            harness.Images.ResetRecency(images, 1);
+            for (var submission = 0; submission < 64; submission++)
+            {
+                harness.Images.RunGarbageCollector(endsFrame: false);
+            }
+        });
+        Assert.True(harness.Images.Contains(images[0]));
+
+        harness.Worker.Run(() =>
+        {
+            for (var frame = 0; frame < 64; frame++)
+            {
+                harness.Images.RunGarbageCollector(endsFrame: true);
+            }
+        });
+        Assert.False(harness.Images.Contains(images[0]));
+        harness.Shutdown();
+    }
+
     [Fact]
     public void ScheduledReadback_PublishesAfterTheTickAndKeepsTheImage()
     {
@@ -680,13 +712,16 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
-    [Fact]
-    public void NearCapacityReadback_ReusesTheSharedDownloadRing()
+    [Theory]
+    [InlineData(2047u)]
+    [InlineData(2048u)]
+    [InlineData(4096u)]
+    public void Readback_HandlesNearCapacityAndOversizedImages(uint height)
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
-        const uint width = 4096, height = 2047;
-        const ulong size = (ulong)width * height * 4;
-        using var harness = new CacheHarness(_vulkan, backingBytes: 40UL * 1024 * 1024);
+        const uint width = 4096;
+        var size = (ulong)width * height * 4;
+        using var harness = new CacheHarness(_vulkan, backingBytes: size + 8UL * 1024 * 1024);
         var address = harness.MapBacked(size, ReadWrite);
         var request = LinearRequest(address, size, Format.R8G8B8A8Unorm, GuestPixelFormat.Bits8_8_8_8UNorm, GuestImageType.Color2D, new Extent3D(width, height, 1), 1, 4, 1);
         ulong[] samples = [0, size / 2, size - 4];

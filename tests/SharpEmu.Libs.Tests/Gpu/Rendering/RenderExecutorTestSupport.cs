@@ -393,6 +393,20 @@ internal sealed class RecordingRenderHost : IRenderHost
         return RegisteredDcc.Contains(address);
     }
 
+    public bool TryFillDccMetadata(ulong address, ulong size, uint fillValue)
+    {
+        Calls.Add($"fill_dcc {address:X} {size:X} {fillValue:X8}");
+        return RegisteredDcc.Contains(address);
+    }
+
+    public bool HostCopyAccepted { get; set; } = true;
+
+    public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
+    {
+        Calls.Add($"host_copy {destination:X} {source:X} {sourceWords} {words}");
+        return HostCopyAccepted;
+    }
+
     public Exception Fatal(string message) => new RenderExecutorFatalException(message);
 }
 

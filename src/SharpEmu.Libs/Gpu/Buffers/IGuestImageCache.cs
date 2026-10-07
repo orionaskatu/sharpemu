@@ -13,6 +13,8 @@ public interface IGuestImageCache
 
     bool ClearMetadata(ulong address);
 
+    bool OverlapsDccMetadata(ulong address, ulong size);
+
     void InvalidateMemory(ulong address, ulong size);
 
     void InvalidateMemoryFromGpu(ulong address, ulong size);

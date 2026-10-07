@@ -157,8 +157,73 @@ internal static unsafe partial class VulkanVideoPresenter
         _guestFlipVersionSequence = 0;
     }
 
+    private static readonly bool _shaderPrewarmWaitDisabled =
+        Environment.GetEnvironmentVariable("SHARPEMU_SHADER_PREWARM_WAIT") == "0";
+    private static bool _shaderPrewarmDecided;
+    private static bool _shaderPrewarmRunning;
+    private static bool _shaderPrewarmReleased;
+    private static int _shaderPrewarmHoldReported;
+    private static int _shaderPrewarmProgress;
+    private static int _shaderPrewarmTotal;
+
+    private static void SetShaderPrewarmState(bool running)
+    {
+        lock (_gate)
+        {
+            _shaderPrewarmDecided = true;
+            _shaderPrewarmRunning = running;
+            Volatile.Write(ref _shaderPrewarmReleased, !running);
+            System.Threading.Monitor.PulseAll(_gate);
+        }
+    }
+
+    internal static void WaitForShaderPrewarm(string holder)
+    {
+        if (_shaderPrewarmWaitDisabled || Volatile.Read(ref _shaderPrewarmReleased))
+        {
+            return;
+        }
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var reported = started;
+        var reporter = false;
+        lock (_gate)
+        {
+            while (_thread is not null && (!_shaderPrewarmDecided || _shaderPrewarmRunning) &&
+                   !_closed && _presenterStartupFailure is null &&
+                   !HostSessionControl.IsShutdownRequested && !Volatile.Read(ref _presenterCloseRequested))
+            {
+                if (!reporter && _shaderPrewarmRunning &&
+                    Interlocked.Exchange(ref _shaderPrewarmHoldReported, 1) == 0)
+                {
+                    reporter = true;
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO] Shader prewarm: holding the game at its {holder} until it finishes.");
+                }
+
+                System.Threading.Monitor.Wait(_gate, 1000);
+                if (reporter && System.Diagnostics.Stopwatch.GetElapsedTime(reported) >= TimeSpan.FromSeconds(5))
+                {
+                    reported = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var total = Volatile.Read(ref _shaderPrewarmTotal);
+                    var done = Volatile.Read(ref _shaderPrewarmProgress);
+                    Console.Error.WriteLine(
+                        $"[LOADER][INFO] Shader prewarm: {done}/{total} ({(total == 0 ? 0 : done * 100 / total)}%)");
+                }
+            }
+        }
+
+        if (reporter)
+        {
+            Console.Error.WriteLine(string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"[LOADER][INFO] Shader prewarm: game released after {System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds:F1}s."));
+        }
+    }
+
     public static void HideSplashScreen()
     {
+        WaitForShaderPrewarm("splash screen");
         lock (_gate)
         {
             _splashHidden = true;
@@ -345,6 +410,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private static void Run()
     {
+        SharpEmu.HLE.Host.HostLaneReservation.ApplyToRenderThread();
         uint width;
         uint height;
         lock (_gate)

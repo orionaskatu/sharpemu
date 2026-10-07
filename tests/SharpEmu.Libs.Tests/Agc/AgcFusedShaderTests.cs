@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using SharpEmu.Core.Cpu;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
 using SharpEmu.ShaderCompiler;
@@ -127,6 +128,55 @@ public sealed class AgcFusedShaderTests
         Assert.Equal(0xAABB_CC12u, ReadUInt32(memory, BackRegisters + 12));
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void FuseShaderHalvesLegacy_MergesAllocationsAndPreservesFrontUserData(bool hull, bool scratch)
+    {
+        var (memory, ctx) = CreateGsPair();
+        var rsrc1Offset = hull ? 0x10Au : 0x8Au;
+        var checksumOffset = hull ? 0x100u : 0x80u;
+        var componentShift = hull ? 28 : 29;
+        WriteByte(memory, FrontShader + ShaderTypeOffset, hull ? HsFront : GsFront);
+        WriteByte(memory, BackShader + ShaderTypeOffset, hull ? HsBack : GsBack);
+        WriteUInt64(memory, FrontShader + ShaderUserDataOffset, SizeResult);
+        WriteByte(memory, BackShader + ShaderNumShRegistersOffset, 6);
+        WriteRegister(memory, FrontRegisters, 0, rsrc1Offset, (3u << componentShift) | 31u);
+        WriteRegister(memory, FrontRegisters, 1, rsrc1Offset + 1, 0xA806_000Cu);
+        WriteRegister(memory, FrontRegisters, 2, checksumOffset, 0xAAAA_0001u);
+        WriteRegister(memory, FrontRegisters, 3, checksumOffset, 0xBBBB_0002u);
+        WriteRegister(memory, BackRegisters, 0, hull ? 0x148u : 0xC8u, 0x1111_1111u);
+        WriteRegister(memory, BackRegisters, 1, hull ? 0x149u : 0xC9u, 0xAABB_CC77u);
+        WriteRegister(memory, BackRegisters, 2, checksumOffset, 0x1111_0001u);
+        WriteRegister(memory, BackRegisters, 3, checksumOffset, 0x1111_0002u);
+        WriteRegister(memory, BackRegisters, 4, rsrc1Offset, 0x8000_000Fu | (1u << componentShift));
+        WriteRegister(memory, BackRegisters, 5, rsrc1Offset + 1, 0x5003_8028u);
+
+        ctx[CpuRegister.Rdi] = FusedShader;
+        ctx[CpuRegister.Rsi] = FrontShader;
+        ctx[CpuRegister.Rdx] = BackShader;
+        ctx[CpuRegister.Rcx] = scratch ? Scratch : 0;
+        Assert.Equal(0, AgcExports.FuseShaderHalvesLegacy(ctx));
+
+        var registers = scratch ? Scratch : BackRegisters;
+        Assert.Equal(hull ? 3 : 2, ReadByte(memory, FusedShader + ShaderTypeOffset));
+        Assert.Equal(SizeResult, ReadUInt64(memory, FusedShader + ShaderUserDataOffset));
+        Assert.Equal(registers, ReadUInt64(memory, FusedShader + ShaderShRegistersOffset));
+        Assert.Equal(0x3456_789Au, ReadUInt32(memory, registers + 4));
+        Assert.Equal(0xAABB_CC12u, ReadUInt32(memory, registers + 12));
+        Assert.Equal(0xAAAA_0001u, ReadUInt32(memory, registers + 20));
+        Assert.Equal(0xBBBB_0002u, ReadUInt32(memory, registers + 28));
+        Assert.Equal(hull ? 0xB000_001Fu : 0xE000_001Fu, ReadUInt32(memory, registers + 36));
+        Assert.Equal(hull ? 0xA803_800Cu : 0xA807_800Cu, ReadUInt32(memory, registers + 44));
+        if (scratch)
+        {
+            Assert.Equal(0x1111_1111u, ReadUInt32(memory, BackRegisters + 4));
+            Assert.Equal(0x5003_8028u, ReadUInt32(memory, BackRegisters + 44));
+        }
+    }
+
     [Fact]
     public void FuseShaderHalves_WaveSizeMismatch_Rejects()
     {
@@ -242,10 +292,13 @@ public sealed class AgcFusedShaderTests
         Assert.Equal(0x5555_5555u, ReadUInt32(memory, Scratch + 36));
     }
 
-    [Fact]
-    public void FuseShaderHalves_RegistersBothProgramSegmentsForTranslation()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FuseShaderHalves_RegistersBothProgramSegmentsAcrossThreadWrappers(bool legacy)
     {
-        var (memory, ctx) = CreateGsPair();
+        var (memory, _) = CreateGsPair();
+        var ctx = new CpuContext(new TrackedCpuMemory(memory), Generation.Gen5);
         var entryCode = BaseAddress + 0x1000;
         var continuationCode = BaseAddress + 0x1100;
         WriteUInt64(memory, FrontShader + ShaderCodeOffset, entryCode);
@@ -259,11 +312,14 @@ public sealed class AgcFusedShaderTests
         ctx[CpuRegister.Rsi] = FrontShader;
         ctx[CpuRegister.Rdx] = BackShader;
         ctx[CpuRegister.Rcx] = Scratch;
-        Assert.Equal(0, AgcExports.FuseShaderHalves(ctx));
+        Assert.Equal(0, legacy ? AgcExports.FuseShaderHalvesLegacy(ctx) : AgcExports.FuseShaderHalves(ctx));
 
+        var renderContext = new CpuContext(new TrackedCpuMemory(memory), Generation.Gen5);
+        Assert.True(Gen5ShaderTranslator.TryGetFusedProgramParts(renderContext, entryCode, out var continuation, out _));
+        Assert.Equal(continuationCode, continuation);
         Assert.True(
             Gen5ShaderTranslator.TryDecodeProgram(
-                ctx,
+                renderContext,
                 entryCode,
                 out var program,
                 out var error),
