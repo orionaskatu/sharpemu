@@ -189,6 +189,12 @@ public sealed partial class RenderExecutor
     // TEMP: logs watched color target slots at draw entry, before empty draws return.
     private static void DbgWatchSlots(RegisterBanks banks, string where, ulong count, ulong instances)
     {
+        if (VisibilityFeedback.Enabled)
+        {
+            var feedbackContext = banks.Context;
+            VisibilityFeedback.NoteSlotOne(feedbackContext.ColorTargets[1].BaseAddress, feedbackContext.ColorTargets[1].Info, feedbackContext.RenderTargetMaskForSlot(1) != 0);
+        }
+
         if (Diagnostics.DbgSequence.Active)
         {
             var dbgContext = banks.Context;

@@ -176,6 +176,8 @@ public sealed partial class GpuCommandInterpreter
         var predicate = !DbgCondSync && OnlyOrdersWork(packet.PacketAddress + 4u * (1 + payloadDwords), executeCount)
             ? ReadUnsynchronizedDword(address)
             : ReadDword(address);
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.Active) // TEMP
+            SharpEmu.Libs.Diagnostics.DbgSequence.Note($"COND_EXEC addr=0x{address:X} value=0x{predicate:X} skipDwords={(predicate == 0 ? executeCount : 0)} blockDwords={executeCount}");
         return predicate == 0 ? payloadDwords + executeCount : payloadDwords;
     }
 

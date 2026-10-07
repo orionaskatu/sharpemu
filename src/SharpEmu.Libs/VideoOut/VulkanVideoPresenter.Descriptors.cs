@@ -412,6 +412,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"An image descriptor is too short: image={index} words={words.Length} hash=0x{program.Hash:X16}.");
             }
 
+            if (VisibilityFeedback.Enabled && words.Length >= 8)
+            {
+                // The visibility pass reads the id target the world pass wrote last frame.
+                if (VisibilityFeedback.IdTarget != 0 && VisibilityFeedback.IdTargetWords is null && image.ResourceClass != ShaderCompiler.Resources.ImageResourceClass.Storage &&
+                    new TextureDescriptorWords(words).BaseAddress == VisibilityFeedback.IdTarget)
+                {
+                    VisibilityFeedback.IdTargetWords = (uint[])words.Clone();
+                }
+                else if (program.Hash == VisibilityFeedback.CullProgramHash && index == 0 && VisibilityFeedback.IdTargetWords is { } idWords)
+                {
+                    words = (uint[])idWords.Clone();
+                }
+            }
+
             if (DbgTextureRedirect is { } dbgRedirect && words.Length >= 8) // TEMP
             {
                 var dbgBase = new TextureDescriptorWords(words).BaseAddress;
