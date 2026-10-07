@@ -58,6 +58,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     private static readonly bool FenceRetirement = OperatingSystem.IsMacOS() &&
         Environment.GetEnvironmentVariable("SHARPEMU_FENCE_RETIREMENT") != "0";
 
+    private static readonly bool DbgWaitEachSubmit = Environment.GetEnvironmentVariable("SHARPEMU_DBG_WAIT_EACH_SUBMIT") == "1"; // TEMP
     private readonly object _fenceGate = new();
     private sealed class InFlightFence(ulong tick, Fence fence)
     {
@@ -378,6 +379,24 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                     }
 
                     _freeFences.Push(fence);
+                }
+            }
+
+            if (result == Result.Success && DbgWaitEachSubmit)
+            {
+                // TEMP: SHARPEMU_DBG_WAIT_EACH_SUBMIT=1 waits for every submission so a GPU fault is attributed to its own tick.
+                var dbgTick = 0UL;
+                for (var index = 0; index < bundle.SignalCount; index++)
+                    if (signalSemaphores[index] == _timeline.Handle) dbgTick = Math.Max(dbgTick, signalTicks[index]);
+                if (dbgTick != 0)
+                {
+                    var dbgSemaphore = _timeline;
+                    var dbgWait = new SemaphoreWaitInfo { SType = StructureType.SemaphoreWaitInfo, SemaphoreCount = 1, PSemaphores = &dbgSemaphore, PValues = &dbgTick };
+                    var dbgResult = _vk.WaitSemaphores(_device, &dbgWait, 5_000_000_000UL);
+                    if (dbgResult != Result.Success)
+                    {
+                        Console.Error.WriteLine($"[GPU][DBGWAIT] submission tick={dbgTick} did not complete: {dbgResult} {(dbgResult == Result.ErrorDeviceLost ? DescribeDeviceFault() : "")}");
+                    }
                 }
             }
 

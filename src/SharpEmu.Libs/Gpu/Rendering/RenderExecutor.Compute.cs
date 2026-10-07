@@ -56,6 +56,7 @@ public sealed partial class RenderExecutor
         .Select(item => item.Split(':')).Where(parts => parts.Length >= 3).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToInt32(parts[1], 16), Convert.ToInt32(parts[2]), parts.Length > 3 ? Convert.ToUInt64(parts[3].Replace("0x", ""), 16) : 0UL)).ToArray(); // TEMP
     private static readonly int DbgBootFrames = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_BOOT_FRAMES"), out var dbgBoot) ? dbgBoot : 0; // TEMP
     private static int _dbgBootCount; // TEMP
+    private static readonly HashSet<ulong> DbgRunOnly = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_RUN_CS") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).Select(h => Convert.ToUInt64(h.Replace("0x", ""), 16)).ToHashSet(); // TEMP
     private static readonly HashSet<ulong> DbgSkipHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_CS") ?? "")
         .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(h => Convert.ToUInt64(h.Replace("0x", ""), 16)).ToHashSet();
 
@@ -222,7 +223,7 @@ public sealed partial class RenderExecutor
             }
         }
 
-        if (DbgSkipHashes.Contains(program.Hash)) return; // TEMP
+        if (DbgSkipHashes.Contains(program.Hash) || Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_ALL_CS") == "1" || (DbgRunOnly.Count != 0 && !DbgRunOnly.Contains(program.Hash))) return; // TEMP
         if (DbgFillWrittenHashes.Contains(program.Hash) && DbgInBootWindow()) // TEMP: replace the dispatch by all-ones fills of its written buffers
         {
             for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
@@ -238,6 +239,7 @@ public sealed partial class RenderExecutor
             return;
         }
         DbgCountDispatch(program.Hash, groupsX * groupsY * groupsZ, indirectArgumentsAddress != 0); // TEMP
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG") == "1") Console.Error.WriteLine($"[DBG][DISPLOG] cs=0x{program.Hash:X16} groups={groupsX}x{groupsY}x{groupsZ} indirect={indirectArgumentsAddress != 0} local={input.ThreadsX}x{input.ThreadsY}x{input.ThreadsZ} wave={input.WaveSize} buffers={program.Buffers.Length} images={program.Images.Length}"); // TEMP
         if (RenderTrace.Enabled)
         {
             RenderTrace.Write(
@@ -259,13 +261,13 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (indirectArgumentsAddress == 0 && TryConsumeBoundedFill(input, groupsX, groupsY, groupsZ, dispatchInitiator))
+        if (indirectArgumentsAddress == 0 && !SharpEmu.ShaderCompiler.DbgFlags.Disabled("boundedfill") && TryConsumeBoundedFill(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
             _host.ResetBindings();
             return;
         }
 
-        if (indirectArgumentsAddress == 0 && TryConsumeBoundedCopy(input, groupsX, groupsY, groupsZ, dispatchInitiator))
+        if (indirectArgumentsAddress == 0 && !SharpEmu.ShaderCompiler.DbgFlags.Disabled("boundedfill") && TryConsumeBoundedCopy(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
             _host.ResetBindings();
             return;

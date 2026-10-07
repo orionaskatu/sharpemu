@@ -715,10 +715,19 @@ public static partial class Gen5SpirvTranslator
         // A planned slot is inside the table the host binds, so its load skips the runtime bounds
         // check. Large shaders make hundreds of these reads, and every check costs the Metal
         // compiler time (one large pixel shader made about 376 of them).
-        private uint LoadFlattenedSlot(uint slot) =>
-            slot < _request.FlattenedTableReservedWords
-                ? Load(_uintType, BlockWordPointer(_flattenedTable, UInt(slot)))
-                : LoadFlattenedWord(UInt(slot));
+        private uint LoadFlattenedSlot(uint slot)
+        {
+            if (slot >= _request.FlattenedTableReservedWords)
+            {
+                return LoadFlattenedWord(UInt(slot));
+            }
+
+            // The bindless image slots precede the planned words in the table.
+            var bias = _request.Bindings.UsesBindlessImages
+                ? BindingLayout.ImageSlotTableDwordCount(_request.Resources.Info)
+                : 0u;
+            return Load(_uintType, BlockWordPointer(_flattenedTable, UInt(bias + slot)));
+        }
 
         // The shader base the host pushes for this draw, as two dwords.
         private (uint Low, uint High) LoadShaderBase()

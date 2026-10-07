@@ -1665,7 +1665,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 textureCount += stage.Textures.Length;
-                maxStageImages = Math.Max(maxStageImages, stage.Textures.Length);
+                maxStageImages = Math.Max(maxStageImages, stage.Descriptors.Images.Length);
             }
 
             // All stages that read the same stencil bytes share the shader's working image.
