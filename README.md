@@ -1,4 +1,18 @@
-﻿<!--
+# DISCLAIMER
+
+> [!WARNING] 
+> This branch is a <ins>**really dirty**</ins> LLM-only development (opus5.5 and sonnet 5.5), the produced code is <ins>**ugly**</ins>, probably not optimized and <ins>**should never be included upstream**</ins>!
+> The goal is to see how far it can go and if it can make Ghost of Yotei playable.
+> It'll probably break other games.
+
+> [!NOTE]
+> Based on the **great work** done by **foufouadi**: https://github.com/foufouadi/sharpemu/tree/yotei-rendering
+
+Current status, ~2fps:
+<img width="1591" height="926" alt="image" src="https://github.com/user-attachments/assets/ad07e460-c5c9-43da-9b1f-6d6c12bef35a" />
+
+
+ <!--
 Copyright (C) 2026 SharpEmu Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
