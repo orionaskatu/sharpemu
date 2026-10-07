@@ -862,6 +862,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 : null;
         private static readonly HashSet<(ulong, ulong, bool, Format)> DbgImageUseSeen = new();
         // TEMP: SHARPEMU_DBG_PROGRAM_IMAGES=hash,... logs every image those programs bind.
+        private static readonly bool DbgOnePixel = Environment.GetEnvironmentVariable("SHARPEMU_DBG_ONEPX") == "1"; // TEMP
         private static readonly HashSet<ulong> DbgProgramImageHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROGRAM_IMAGES") ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
 
@@ -1574,6 +1575,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         if (DbgImageUseSeen.Add(dbgKey))
                             Console.Error.WriteLine($"[DBG][IMGUSE] words=[{string.Join(",", snapshot.Images[index].Select(w => w.ToString("X8")))}] size=0x{image.Description.Data.Size:X} hash=0x{program.Hash:X16} slot={index} addr=0x{image.Description.Data.Address:X} extent={image.Description.Extent.Width}x{image.Description.Extent.Height} storage={binding.IsStorage} written={resource.Written} view={view.Format} backing={image.Description.PixelFormat} mip={view.BaseLevel} image=0x{image.Backing.Handle.Handle:X}");
+                    }
+                }
+
+                if (DbgOnePixel && image.Backing.Extent.Width == 1 && image.Backing.Extent.Height == 1) // TEMP
+                {
+                    var dbgOneKey = (program.Hash, image.Description.Data.Address, binding.IsStorage, view.Format);
+                    lock (DbgImageUseSeen)
+                    {
+                        if (DbgImageUseSeen.Add(dbgOneKey))
+                            Console.Error.WriteLine($"[DBG][ONEPX] hash=0x{program.Hash:X16} stage={prepared.Program.Stage} slot={index} addr=0x{image.Description.Data.Address:X} storage={binding.IsStorage} written={resource.Written} fmt={view.Format} words=[{string.Join(",", snapshot.Images[index].Select(w => w.ToString("X8")))}]");
                     }
                 }
 

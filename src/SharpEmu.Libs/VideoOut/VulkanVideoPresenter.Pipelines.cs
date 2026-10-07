@@ -122,7 +122,37 @@ internal static unsafe partial class VulkanVideoPresenter
         private const int SpeculationInterval = 8;
 
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
+        // TEMP: SHARPEMU_DBG_SYNC_ZERO_READS=1 waits for the GPU and registers its device-address writes before
+        // accepting a zero word, to test whether zero descriptors are GPU writes the CPU has not seen yet.
+        private static readonly bool DbgSyncZeroReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SYNC_ZERO_READS") == "1";
+        private bool _dbgInZeroSync;
+        private static long _dbgZeroSyncs, _dbgZeroSyncChanged;
+
         public bool TryReadGuestWord(ulong address, out uint word)
+        {
+            var ok = TryReadGuestWordCore(address, out word);
+            if (DbgSyncZeroReads && ok && word == 0 && !_dbgInZeroSync && _bufferCache.DbgFaultProcessPending)
+            {
+                _dbgInZeroSync = true;
+                try
+                {
+                    FlushAndWait();
+                    _bufferCache.ProcessPendingFaultBuffer();
+                    ok = TryReadGuestWordCore(address, out word);
+                    var count = Interlocked.Increment(ref _dbgZeroSyncs);
+                    if (word != 0 && Interlocked.Increment(ref _dbgZeroSyncChanged) <= 20)
+                        Console.Error.WriteLine($"[DBG][ZEROSYNC] address=0x{address:X} became 0x{word:X} after the GPU settled (syncs={count})");
+                }
+                finally
+                {
+                    _dbgInZeroSync = false;
+                }
+            }
+
+            return ok;
+        }
+
+        private bool TryReadGuestWordCore(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
