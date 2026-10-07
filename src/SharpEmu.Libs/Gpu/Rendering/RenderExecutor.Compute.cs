@@ -35,7 +35,7 @@ public sealed partial class RenderExecutor
     // SHARPEMU_DBG_FILL_WRITTEN_CS=off keeps the real pass; a hash list overrides the default.
     private static readonly HashSet<ulong> DbgFillWrittenHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_FILL_WRITTEN_CS") switch
     {
-        null => [0x17444E6ABBF4F82CUL],
+        null => [], // the real visibility pass: forcing every triangle visible draws all instances and garbage geometry
         var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
