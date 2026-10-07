@@ -216,6 +216,11 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
+        {
+            return;
+        }
+
         if (DbgBisectSkip(vertexInput.Stage.Program?.Hash ?? 0, state.PixelActive)) // TEMP
         {
             return;
