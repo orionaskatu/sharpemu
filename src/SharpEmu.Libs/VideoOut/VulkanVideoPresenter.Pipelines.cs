@@ -222,10 +222,44 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool IsGuestMapped(ulong address) => _guestMemory.CanRead(address, sizeof(uint));
 
         // Refused while a GPU buffer or image write may still own the range.
+        // Ownership of a 256-byte granule, checked once and shared by the clean reads of one
+        // materialization: nothing is recorded to the GPU in between, so a granule that held no
+        // GPU-owned bytes still holds none.
+        private const ulong CleanGranuleBytes = 256;
+        private const int CleanGranuleSlots = 256;
+        private static readonly bool CleanGranuleCache = Environment.GetEnvironmentVariable("SHARPEMU_CLEAN_GRANULES") != "0";
+        private readonly ulong[] _cleanGranuleTags = new ulong[CleanGranuleSlots];
+        private readonly long[] _cleanGranuleSessions = new long[CleanGranuleSlots];
+        private long _cleanReadSession = 1;
+
+        private bool _materializationSessionsBegun;
+
+        // Reads outside a materialization session (nothing announced one) keep the exact per-word checks.
+        public void BeginMaterializationSession()
+        {
+            _cleanReadSession++;
+            _materializationSessionsBegun = true;
+        }
+
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
+            var granule = address / CleanGranuleBytes;
+            var granuleSlot = (int)(granule & (CleanGranuleSlots - 1));
+            var granuleAligned = (address & (sizeof(uint) - 1)) == 0 && CleanGranuleCache && _materializationSessionsBegun;
+            if (granuleAligned && _cleanGranuleTags[granuleSlot] == granule + 1 && _cleanGranuleSessions[granuleSlot] == _cleanReadSession)
+            {
+                Span<byte> cached = stackalloc byte[sizeof(uint)];
+                if (!_guestMemory.TryRead(address, cached))
+                {
+                    return false;
+                }
+
+                word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cached);
+                return true;
+            }
+
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
@@ -257,6 +291,17 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (granuleAligned)
+            {
+                var start = granule * CleanGranuleBytes;
+                if (_guestMemory.CanRead(start, CleanGranuleBytes) && !_bufferCache.HasGpuDirtyBytes(start, CleanGranuleBytes) &&
+                    _imageCache.UnsynchronizedGpuImageRanges(start, CleanGranuleBytes).Count == 0)
+                {
+                    _cleanGranuleTags[granuleSlot] = granule + 1;
+                    _cleanGranuleSessions[granuleSlot] = _cleanReadSession;
+                }
+            }
+
             return true;
         }
 

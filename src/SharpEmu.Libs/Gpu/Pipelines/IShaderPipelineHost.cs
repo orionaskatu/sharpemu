@@ -70,6 +70,10 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
+    // A materialization starts: no GPU work is recorded until it ends, so the host may share
+    // ownership checks between the clean reads inside it.
+    void BeginMaterializationSession() { }
+
     // Whether recorded GPU work still owns the dword, so the host can copy it on the device
     // when it binds the flattened table instead of downloading it now.
     bool IsGpuPendingGuestWord(ulong address) => false;

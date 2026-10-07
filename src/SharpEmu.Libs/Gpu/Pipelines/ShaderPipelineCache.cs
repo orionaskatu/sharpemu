@@ -31,6 +31,54 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly Dictionary<GraphicsPipelineKey, PipelineHandle> _graphicsPipelines = new();
     private readonly Dictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new();
     private readonly object _gate = new();
+    // TEMP: lock-wait diagnostics for the shared pipeline-cache gate (SHARPEMU_DBG_GATE=1).
+    private static readonly bool _dbgGate = Environment.GetEnvironmentVariable("SHARPEMU_DBG_GATE") == "1";
+    private static string _dbgGateHolder = "";
+    private static long _dbgGateLast = Environment.TickCount64;
+    private static readonly Dictionary<string, (long Count, long WaitTicks, long HoldTicks)> _dbgGateStats = new();
+    private readonly struct DbgGateScope : IDisposable
+    {
+        private readonly ShaderPipelineCache _owner;
+        private readonly string _who;
+        private readonly long _acquired;
+        public DbgGateScope(ShaderPipelineCache owner, string who)
+        {
+            _owner = owner; _who = who;
+            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var holder = _dbgGateHolder;
+            System.Threading.Monitor.Enter(owner._gate);
+            _acquired = System.Diagnostics.Stopwatch.GetTimestamp();
+            var waited = _acquired - t0;
+            lock (_dbgGateStats)
+            {
+                _dbgGateStats.TryGetValue(who + "<-" + (waited > System.Diagnostics.Stopwatch.Frequency / 1000 ? holder : "-"), out var v);
+                _dbgGateStats[who + "<-" + (waited > System.Diagnostics.Stopwatch.Frequency / 1000 ? holder : "-")] = (v.Count + 1, v.WaitTicks + waited, v.HoldTicks);
+            }
+            _dbgGateHolder = who;
+        }
+        public void Dispose()
+        {
+            var held = System.Diagnostics.Stopwatch.GetTimestamp() - _acquired;
+            _dbgGateHolder = "";
+            lock (_dbgGateStats)
+            {
+                var key = _who + "#hold";
+                _dbgGateStats.TryGetValue(key, out var v);
+                _dbgGateStats[key] = (v.Count + 1, v.WaitTicks, v.HoldTicks + held);
+                if (Environment.TickCount64 - _dbgGateLast > 10000)
+                {
+                    _dbgGateLast = Environment.TickCount64;
+                    var f = System.Diagnostics.Stopwatch.Frequency / 1000.0;
+                    foreach (var (k, st) in _dbgGateStats.OrderByDescending(x => x.Value.WaitTicks + x.Value.HoldTicks).Take(10))
+                        Console.Error.WriteLine($"[DBG][GATE] {k} n={st.Count} wait_ms={st.WaitTicks / f:F0} hold_ms={st.HoldTicks / f:F0}");
+                    _dbgGateStats.Clear();
+                }
+            }
+            System.Threading.Monitor.Exit(_owner._gate);
+        }
+    }
+    private DbgGateScope DbgGate(string who) => new(this, who);
+
     private readonly bool _strictShaders = Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
     private readonly HashSet<(ShaderStage Stage, ulong Hash, uint CodeSize)> _reportedShaderSkips = [];
 
@@ -124,7 +172,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         };
         ShaderProgram handle;
         ShaderStageResources stage;
-        lock (_gate)
+        using (DbgGate("hull"))
         {
             var pushDataCursor = 0u;
             if (!TryPrepareProgram(source, new StageCompileOptions { ComputeInfo = input, HullDispatch = hull }, ref pushDataCursor, out handle, out stage))
@@ -192,7 +240,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgramHandle = default;
         ShaderStageResources vertexStage;
         ShaderStageResources pixelStage = default;
-        lock (_gate)
+        using (DbgGate("graphicsprep"))
         {
             var pushDataCursor = 0u;
             if (pixelSource is not null)
@@ -457,7 +505,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         ShaderProgram handle;
         ShaderStageResources stage;
-        lock (_gate)
+        using (DbgGate("computeprep"))
         {
             var pushDataCursor = 0u;
             if (!TryPrepareProgram(
@@ -478,6 +526,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private bool TryPrepareProgram(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
         out ShaderProgram program, out ShaderStageResources stage)
     {
+        _host.BeginMaterializationSession();
         if (_programs.TryGetProgram(source, options, _strictShaders, ref pushDataCursor, out program, out stage, out var rejection))
             return true;
 
@@ -539,7 +588,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
             vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts);
         var key = KeyOf(description);
-        lock (_gate)
+        using (DbgGate("graphicspipe(542)"))
         {
             if (_graphicsPipelines.TryGetValue(key, out var cached))
             {
@@ -746,7 +795,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
         var key = new ComputePipelineKey(program.Id);
-        lock (_gate)
+        using (DbgGate("x749"))
         {
             if (_computePipelines.TryGetValue(key, out var cached))
             {
@@ -776,7 +825,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
         var key = new ComputePipelineKey(program.Id);
-        lock (_gate)
+        using (DbgGate("computepipe"))
         {
             if (_computePipelines.TryGetValue(key, out var cached))
             {

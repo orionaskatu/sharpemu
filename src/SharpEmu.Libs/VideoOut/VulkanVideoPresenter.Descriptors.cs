@@ -1033,8 +1033,28 @@ internal static unsafe partial class VulkanVideoPresenter
             if (traceAddress != 0 && !memory.Covers(traceAddress, 1))
                 GuestGpuMemoryHook.Trace(traceAddress, 1,
                     $"device-address-mapping-check readable={_guestMemory.CanRead(traceAddress, 1)} backed={_guestBacking.IsBackedView(traceAddress)}");
+            // The sweep finds CPU writes since the last one; every device-address draw repeating it
+            // within a fraction of a millisecond finds nothing new, and the page-guard locks it takes
+            // were a tenth of the render thread. SHARPEMU_BDA_SWEEP_US=0 sweeps for every draw.
+            var sweepNow = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (BdaSweepIntervalTicks != 0 && _bdaSweepMappingKey == _bdaSpanMapping && sweepNow - _bdaSweepTimestamp < BdaSweepIntervalTicks &&
+                _scheduler.CurrentTick == _bdaSweepTick)
+            {
+                return;
+            }
+
+            _bdaSweepMappingKey = _bdaSpanMapping;
+            _bdaSweepTimestamp = sweepNow;
+            _bdaSweepTick = _scheduler.CurrentTick;
             _bufferCache.PrepareBda(spans, _bdaSpanMapping);
         }
+
+        private static readonly long BdaSweepIntervalTicks = long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_US"), out var bdaSweepMicroseconds)
+            ? bdaSweepMicroseconds * System.Diagnostics.Stopwatch.Frequency / 1_000_000
+            : 500 * System.Diagnostics.Stopwatch.Frequency / 1_000_000;
+        private ulong _bdaSweepMappingKey = ulong.MaxValue;
+        private long _bdaSweepTimestamp;
+        private ulong _bdaSweepTick;
 
         private List<GuestSpan>? _bdaSpans;
         private GuestGpuMemory? _bdaSpanMemory;

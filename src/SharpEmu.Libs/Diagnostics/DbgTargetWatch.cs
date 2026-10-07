@@ -12,7 +12,7 @@ internal static class DbgTargetWatch
     public static readonly HashSet<ulong> MetadataAddresses = new();
     private static readonly Dictionary<string, int> Seen = new();
 
-    private static readonly bool EnabledFlag = Addresses.Count != 0 || PhysicalWatchEnabled() || Environment.GetEnvironmentVariable("SHARPEMU_DBG_GFX_STORES") == "1" || Environment.GetEnvironmentVariable("SHARPEMU_DBG_ALL_FILLS") == "1";
+    private static readonly bool EnabledFlag = Addresses.Count != 0 || PhysicalWatchEnabled() || Environment.GetEnvironmentVariable("SHARPEMU_DBG_GFX_STORES") == "1" || Environment.GetEnvironmentVariable("SHARPEMU_DBG_ALL_FILLS") == "1" || Environment.GetEnvironmentVariable("SHARPEMU_DBG_REAL_VCULL") is { Length: > 0 };
     public static bool Enabled => EnabledFlag;
     private static bool PhysicalWatchEnabled() => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SHARPEMU_DBG_PHYS_WATCH"));
 

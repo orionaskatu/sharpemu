@@ -224,7 +224,8 @@ public sealed partial class RenderExecutor
         }
 
         if (DbgSkipHashes.Contains(program.Hash) || Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_ALL_CS") == "1" || (DbgRunOnly.Count != 0 && !DbgRunOnly.Contains(program.Hash))) return; // TEMP
-        if (DbgFillWrittenHashes.Contains(program.Hash) && DbgInBootWindow()) // TEMP: replace the dispatch by all-ones fills of its written buffers
+        DbgVcullWatch(program, input); // TEMP
+        if (DbgFillWrittenHashes.Contains(program.Hash) && DbgInBootWindow() && !DbgInRealVcullWindow()) // TEMP: replace the dispatch by all-ones fills of its written buffers
         {
             for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
             {
@@ -239,6 +240,18 @@ public sealed partial class RenderExecutor
             return;
         }
         DbgCountDispatch(program.Hash, groupsX * groupsY * groupsZ, indirectArgumentsAddress != 0); // TEMP
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG") == "2" && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds is var dbgNow && dbgNow >= double.Parse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG_FROM") ?? "0") && dbgNow < double.Parse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG_FROM") ?? "0") + 8) // TEMP: per-dispatch inputs
+        {
+            var dbgUser = input.Stage.Resources.UserData;
+            var dbgBuffers = string.Join(" ", Enumerable.Range(0, input.Stage.Resources.Buffers.Length).Select(index =>
+            {
+                var words = input.Stage.Resources.Buffers[index];
+                if (words.Length < 4) return "-";
+                var descriptor = BufferDescriptorWords.From(words);
+                return $"{descriptor.Address:X}+{descriptor.Footprint() ?? 0:X}{(program.Buffers[index].Written ? "w" : "")}";
+            }));
+            Console.Error.WriteLine($"[DBG][DISPIN] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F3} cs={program.Hash:X16} g={groupsX}x{groupsY}x{groupsZ} ind={(indirectArgumentsAddress != 0 ? 1 : 0)} ud=" + string.Join(",", dbgUser.Take(16).Select(word => word.ToString("X"))) + " buf=" + dbgBuffers);
+        }
         if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG") == "1") Console.Error.WriteLine($"[DBG][DISPLOG] cs=0x{program.Hash:X16} groups={groupsX}x{groupsY}x{groupsZ} indirect={indirectArgumentsAddress != 0} local={input.ThreadsX}x{input.ThreadsY}x{input.ThreadsZ} wave={input.WaveSize} buffers={program.Buffers.Length} images={program.Images.Length}"); // TEMP
         if (RenderTrace.Enabled)
         {
@@ -301,8 +314,10 @@ public sealed partial class RenderExecutor
         _host.EndRendering();
         var dbgT2 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         long dbgT3 = 0, dbgT4 = 0, dbgT5 = 0;
+        var dbgTb0 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         using (_host.BeginPreparation())
         {
+            DbgBeginPrep += System.Diagnostics.Stopwatch.GetTimestamp() - dbgTb0; // TEMP
             // The host may compile this program off the command-stream thread and report that
             // the pipeline is not ready yet. The dispatch waits for it rather than being
             // dropped: a guest that does not replay a one-shot dispatch deadlocks, because
@@ -392,6 +407,49 @@ public sealed partial class RenderExecutor
 
     // TEMP: SHARPEMU_DBG_DISP_STATS=1 prints per-program dispatch phase costs every 10 s.
     private static readonly bool _dbgDispStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISP_STATS") == "1";
+    // TEMP: SHARPEMU_DBG_REAL_VCULL=from:len runs the real visibility-feedback pass in that window of process time
+    // and logs which draws and dispatches touch its two visibility images (T# base addresses learned at the pass).
+    private static readonly (double From, double Length)? DbgRealVcull = Environment.GetEnvironmentVariable("SHARPEMU_DBG_REAL_VCULL") is { Length: > 0 } dbgRv && dbgRv.Split(':') is { Length: 2 } dbgRvParts
+        ? (double.Parse(dbgRvParts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(dbgRvParts[1], System.Globalization.CultureInfo.InvariantCulture)) : null;
+    private static bool DbgInRealVcullWindow()
+    {
+        if (DbgRealVcull is not { } window) return false;
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds;
+        return elapsed >= window.From && elapsed < window.From + window.Length;
+    }
+
+    private static readonly HashSet<ulong> DbgVcullAddresses = new();
+    private static int _dbgVcullLogs;
+    private static void DbgVcullWatch(ShaderProgramInfo program, ComputeInputInfo input)
+    {
+        if (DbgRealVcull is null || !DbgInRealVcullWindow() || input.Stage.Program is not { } stageProgram) return;
+        var images = input.Stage.Resources.Images;
+        if (program.Hash == 0x17444E6ABBF4F82CUL || stageProgram.Hash == 0x17444E6ABBF4F82CUL)
+        {
+            for (var index = 0; index < images.Length; index++)
+            {
+                if (images[index].Length < 8) continue;
+                var address = ((ulong)images[index][0] | ((ulong)(images[index][1] & 0xFFu) << 32)) << 8;
+                if (DbgVcullAddresses.Add(address))
+                {
+                    Diagnostics.DbgTargetWatch.Addresses.Add(address);
+                    Console.Error.WriteLine($"[DBG][VCULL] image[{index}] addr=0x{address:X} t#={string.Join(",", images[index].Take(8).Select(word => word.ToString("X8")))}");
+                }
+            }
+
+            return;
+        }
+
+        for (var index = 0; index < images.Length; index++)
+        {
+            if (images[index].Length < 8) continue;
+            var address = ((ulong)images[index][0] | ((ulong)(images[index][1] & 0xFFu) << 32)) << 8;
+            if (DbgVcullAddresses.Contains(address) && Interlocked.Increment(ref _dbgVcullLogs) <= 400)
+                Console.Error.WriteLine($"[DBG][VCULL] dispatch cs=0x{stageProgram.Hash:X16} binds watched image[{index}] addr=0x{address:X} t#={string.Join(",", images[index].Take(8).Select(word => word.ToString("X8")))}");
+        }
+    }
+    private static long DbgBeginPrep; // TEMP: ticks spent in BeginPreparation (flush + capacity wait)
+    private static long DbgEndRendering; // TEMP
     private static readonly Dictionary<ulong, long[]> _dbgDispPhases = new();
     private static long _dbgDispPhasesLast = Environment.TickCount64;
     private static void DbgDispStat(ulong hash, long t0, long t1, long t2, long t3, long t4, long t5, long t6, int buffers, int images)
@@ -402,6 +460,7 @@ public sealed partial class RenderExecutor
         if (Environment.TickCount64 - _dbgDispPhasesLast < 10000) return;
         _dbgDispPhasesLast = Environment.TickCount64;
         var f = System.Diagnostics.Stopwatch.Frequency / 1e6;
+        Console.Error.WriteLine($"[DBG][DISPPH] beginprep_ms={DbgBeginPrep / (System.Diagnostics.Stopwatch.Frequency / 1000.0):F0}"); DbgBeginPrep = 0;
         Console.Error.WriteLine($"[DBG][DISPPH] programs={_dbgDispPhases.Count} total_ms={_dbgDispPhases.Values.Sum(v => v[1] + v[2] + v[3] + v[4] + v[5]) / f / 1000:F0}");
         foreach (var (h, v) in _dbgDispPhases.OrderByDescending(x => x.Value[1] + x.Value[2] + x.Value[3] + x.Value[4] + x.Value[5]).Take(14))
             Console.Error.WriteLine($"[DBG][DISPPH]   0x{h:X16} n={v[0]} us/op: program={v[1] / f / v[0]:F0} pipeline={v[2] / f / v[0]:F0} prepare={v[3] / f / v[0]:F0} bind={v[4] / f / v[0]:F0} record={v[5] / f / v[0]:F0} bufs={v[6]} imgs={v[7]}");

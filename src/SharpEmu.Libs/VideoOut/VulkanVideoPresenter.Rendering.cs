@@ -407,6 +407,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             // Acquire the decoded frame before any stage selects its movie texture planes.
             PumpHostMovieFrame();
+            _cleanReadSession++;
 
             if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
