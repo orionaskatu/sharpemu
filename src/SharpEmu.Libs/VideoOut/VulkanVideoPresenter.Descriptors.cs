@@ -1143,6 +1143,37 @@ internal static unsafe partial class VulkanVideoPresenter
             start = now;
         }
 
+        // Only host movie planes own a staging buffer that must outlive the submission. Keeping
+        // every binding until GPU completion promoted each draw's bindings out of gen0.
+        private static TextureResource[] TexturesWithStaging(TextureResource[] textures)
+        {
+            var count = 0;
+            foreach (var texture in textures)
+            {
+                if (texture.StagingBuffer.Handle != 0)
+                {
+                    count++;
+                }
+            }
+
+            if (count == 0)
+            {
+                return [];
+            }
+
+            var retained = new TextureResource[count];
+            count = 0;
+            foreach (var texture in textures)
+            {
+                if (texture.StagingBuffer.Handle != 0)
+                {
+                    retained[count++] = texture;
+                }
+            }
+
+            return retained;
+        }
+
         // Textures bound for the draw being prepared; cleared when its preparation closes.
         private readonly List<TextureResource[]> _preparedTextures = new();
 
@@ -1951,7 +1982,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _batchResources.Add(new SubmissionUploadResources
             {
                 DebugName = bindPoint == PipelineBindPoint.Compute ? "SharpEmu dispatch" : "SharpEmu draw",
-                Textures = textures,
+                Textures = TexturesWithStaging(textures),
                 FeedbackSnapshots = preparation.FeedbackSnapshots?.ToArray() ?? [],
                 OverflowBuffers = preparation.OverflowBuffers.Count == 0 ? null : preparation.OverflowBuffers.ToArray(),
             });
