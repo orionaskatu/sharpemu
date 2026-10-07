@@ -132,11 +132,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
             // Only the bytes a buffer write covered can differ from guest memory: a GPU write
             // elsewhere on the page does not make this word stale, so it needs no download.
-            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && _bufferCache.MayHaveGpuDirtyPages(address, 4) && DbgShaderRead(address) &&
-                !_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                    SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
+            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && _bufferCache.MayHaveGpuDirtyPages(address, 4) && DbgShaderRead(address))
             {
-                return false;
+                var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
+                var synchronized = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                    SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
+                if (Diagnostics.DbgReadbackStats.Enabled) // TEMP
+                    Diagnostics.DbgReadbackStats.Record(address, System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds);
+                if (!synchronized)
+                {
+                    return false;
+                }
             }
 
             Span<byte> bytes = stackalloc byte[sizeof(uint)];
@@ -755,11 +761,19 @@ internal static unsafe partial class VulkanVideoPresenter
                     };
                 }
 
+                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_BLEND_MUL") is { } dbgMul && dbgMul.Contains($"{description.PixelStage?.Hash ?? 0:X16}") && colorCount > 0) // TEMP
+                {
+                    blends[0].BlendEnable = true;
+                    blends[0].SrcColorBlendFactor = BlendFactor.DstColor;
+                    blends[0].DstColorBlendFactor = BlendFactor.Zero;
+                    blends[0].ColorBlendOp = BlendOp.Add;
+                }
+
                 var colorFormats = new Format[colorCount];
                 Array.Copy(rendering.ColorFormats, colorFormats, colorCount);
-                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PIPE_PS") is { } dbgPs && dbgPs.Contains($"{description.PixelStage?.Hash ?? 0:X16}")) // TEMP
+                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PIPE_PS") is { } dbgPs && (dbgPs == "ALL" || dbgPs.Contains($"{description.PixelStage?.Hash ?? 0:X16}"))) // TEMP
                     for (var index = 0; index < colorCount; index++)
-                        Console.Error.WriteLine($"[DBG][PIPE] ps=0x{description.PixelStage?.Hash ?? 0:X16} att={index} fmt={colorFormats[index]} mask={blends[index].ColorWriteMask} blend={blends[index].BlendEnable} src={blends[index].SrcColorBlendFactor} dst={blends[index].DstColorBlendFactor} op={blends[index].ColorBlendOp} asrc={blends[index].SrcAlphaBlendFactor} adst={blends[index].DstAlphaBlendFactor}");
+                        Console.Error.WriteLine($"[DBG][PIPE] ps=0x{description.PixelStage?.Hash ?? 0:X16} att={index} fmt={colorFormats[index]} mask={blends[index].ColorWriteMask} blend={blends[index].BlendEnable.Value} src={blends[index].SrcColorBlendFactor} dst={blends[index].DstColorBlendFactor} op={blends[index].ColorBlendOp} asrc={blends[index].SrcAlphaBlendFactor} adst={blends[index].DstAlphaBlendFactor}");
                 var cullMode = CullModeFlags.None;
                 if (parameters.CullBack)
                 {

@@ -69,6 +69,13 @@ internal readonly record struct VulkanGuestQueueIdentity(
 
 internal static unsafe partial class VulkanVideoPresenter
 {
+    static VulkanVideoPresenter()
+    {
+        // Descriptors of GPU-driven indirect draws come from memory the GPU produces; read them on the device.
+        ShaderCompiler.Resources.ResourceTracker.ForceDeviceDescriptors =
+            Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DESCRIPTORS") != "0";
+    }
+
     private static readonly object _gate = new();
     private const string DebugUtilsExtensionName = "VK_EXT_debug_utils";
     private const string SwapchainColorspaceExtensionName = "VK_EXT_swapchain_colorspace";

@@ -511,7 +511,7 @@ public static class ResourceMaterializer
     {
         ReadOnlySpan<uint> reserved =
         [
-            0x00000000u, 0x20000000u, 0xf0003000u, 0x00000000u,
+            0x00000000u, 0x20000000u, 0x70003000u, 0x00000000u,
             0xe000e000u, 0xf9000000u, 0x00007b00u, 0x00000000u,
         ];
         for (var dword = 0; dword < reserved.Length; dword++)
@@ -873,6 +873,8 @@ public static class ResourceMaterializer
         }
     }
 
+    private static readonly bool DbgBufferTable = Environment.GetEnvironmentVariable("SHARPEMU_DBG_BUFTABLE") == "1"; // TEMP
+
     private static bool ProbeBufferTableImage(
         IndirectImageSelector indirect,
         ulong baseAddress,
@@ -917,16 +919,27 @@ public static class ResourceMaterializer
                 readable = ScalarBufferRangeRead.TryReadAddress(baseAddress, entry, inputs, candidate.AsSpan(0, (int)dwords)) ||
                     TryReadWords(baseAddress, entry, dwords, inputs, candidate);
                 if (!readable)
+                {
+                    if (DbgBufferTable)
+                        Console.Error.WriteLine($"[DBG][BUFTABLE] record {record} unreadable at 0x{baseAddress:X}+0x{entry:X}");
                     break;
+                }
             }
 
             if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) || !ReservedImageBitsClear(candidate) ||
                 !ImageBaseMapped(candidate, inputs))
+            {
+                if (DbgBufferTable)
+                    Console.Error.WriteLine($"[DBG][BUFTABLE] record {record} rejected: null={NullImageDescriptor(candidate)} valid={ValidImageDescriptor(candidate, r128)} reservedClear={ReservedImageBitsClear(candidate)} mapped={ImageBaseMapped(candidate, inputs)} resBits=[{string.Join(",", new uint[] { 0x00000000u, 0x20000000u, 0x70003000u, 0x00000000u, 0xe000e000u, 0xf9000000u, 0x00007b00u, 0x00000000u }.Select((mask, i) => (candidate[i] & mask).ToString("X8")))}] words={string.Join(",", candidate.Select(w => w.ToString("X8")))}");
                 Array.Clear(candidate);
+            }
+
             probed.Add(candidate);
             keys.Add(checked((uint)(record * indirect.BufferTableStride)));
         }
 
+        if (DbgBufferTable)
+            Console.Error.WriteLine($"[DBG][BUFTABLE] base=0x{baseAddress:X} range=0x{rangeBytes:X} stride={indirect.BufferTableStride} offset={indirect.TableOffset} count={count} probed={probed.Count}");
         if (probed.Count == 0)
         {
             probed.Add(new uint[8]);

@@ -12,8 +12,24 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Registration in the page owner index, page watches, CPU-write invalidation and unmapping.
 public sealed partial class GuestImageCache
 {
+    // Changes whenever an image enters or leaves the index, so lookups resolved before stay
+    // valid until it changes.
+    private long _structureVersion;
+    public long StructureVersion => Volatile.Read(ref _structureVersion);
+    internal void BumpStructureVersion() => Interlocked.Increment(ref _structureVersion);
+
+    // The bookkeeping FindImage does for a hit, for a caller that resolved the image earlier.
+    public void TouchFoundImage(ResourceSlotIdentifier imageIdentifier)
+    {
+        using var held = _lock.Hold();
+        var image = _slots[imageIdentifier];
+        image.LastAccessTick = _scheduler.CurrentTick;
+        TouchImage(image);
+    }
+
     private void AddToIndex(ResourceSlotIdentifier imageIdentifier)
     {
+        Interlocked.Increment(ref _structureVersion);
         var image = _slots[imageIdentifier];
         if (image.Registered || ImageDescription.IsEmptyRange(image.Description.Data))
         {
@@ -44,6 +60,7 @@ public sealed partial class GuestImageCache
 
     private void RemoveFromIndex(ResourceSlotIdentifier imageIdentifier)
     {
+        Interlocked.Increment(ref _structureVersion);
         var image = _slots[imageIdentifier];
         if (!image.Registered)
         {

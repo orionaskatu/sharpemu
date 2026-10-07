@@ -231,6 +231,8 @@ internal sealed class ShaderProgramCache
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
         {
+            SharpEmu.Libs.Diagnostics.DbgReadbackStats.CurrentShader = source.Hash; // TEMP
+            SharpEmu.Libs.Diagnostics.DbgReadbackStats.CurrentLabel = source.Label; // TEMP
             // Failure capture needs the full walk, so a dump run bypasses the cache.
             var materialized = _materializations is not null && captureIndirectImageFailure is null
                 ? _materializations.Materialize(entry.Plan, inputs, _host.TryReadResidentGuestBytes, ref snapshot, ref specialization,

@@ -225,6 +225,7 @@ public sealed class RuntimeValueEvaluator
             return true;
         }
 
+        DbgFlags.CurrentRawRead = (long)value.Payload; // TEMP
         if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
         {
             // Every read is evaluated up front, including ones in branches the shader skips

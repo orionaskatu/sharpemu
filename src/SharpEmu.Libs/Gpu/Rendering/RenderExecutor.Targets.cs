@@ -26,6 +26,12 @@ public sealed partial class RenderExecutor
 
         for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
         {
+            if (Diagnostics.DbgTargetWatch.Enabled && Diagnostics.DbgTargetWatch.Addresses.Contains(context.ColorTargets[slot].BaseAddress)) // TEMP
+            {
+                var dbgSlot = slot;
+                Diagnostics.DbgTargetWatch.Log($"slot {slot} {context.ColorTargets[slot].BaseAddress:X} {context.RenderTargetMask:X} {context.ShaderInterface.ColorShaderMask:X}", () =>
+                    $"slot={dbgSlot} base=0x{context.ColorTargets[dbgSlot].BaseAddress:X} info=0x{context.ColorTargets[dbgSlot].Info:X8} targetMask=0x{context.RenderTargetMask:X8} shaderMask=0x{context.ShaderInterface.ColorShaderMask:X8} slotMask=0x{context.RenderTargetMaskForSlot(dbgSlot):X} ps=0x{banks.Shader.Pixel.Address:X}");
+            }
             if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
             {
                 continue;

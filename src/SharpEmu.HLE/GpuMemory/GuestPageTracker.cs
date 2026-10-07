@@ -424,6 +424,62 @@ public sealed class GuestPageTracker
             }
         });
 
+    // The CPU-dirty page runs of every tracked block, or with pendingOnly of the blocks marked
+    // since the previous pending sweep. Runs are read under each block's lock and visited after
+    // it is released, so the visitor may synchronize the pages.
+    public void ForEachCpuDirtyRun(List<GuestSpan> scratch, bool pendingOnly, Action<ulong, ulong> visit)
+    {
+        RejectUploadCallbackReentry();
+        scratch.Clear();
+        void Collect(ulong block)
+        {
+            if (Volatile.Read(ref _regions[block]) is not { } region)
+            {
+                return;
+            }
+
+            using var _ = region.Lock.Hold();
+            region.ForEachModifiedRange(WriteOrigin.Cpu, clear: false, region.BaseAddress, BlockBytes,
+                (address, size) => scratch.Add(new GuestSpan(address, size)));
+        }
+
+        if (pendingOnly)
+        {
+            _cpuDirtySummary.TakePending(Collect);
+        }
+        else
+        {
+            _cpuDirtySummary.TakePending(static _ => { });
+            _cpuDirtySummary.ForEachDirty(block =>
+            {
+                if (_cpuDirtySummary.IsDirty(block))
+                {
+                    Collect(block);
+                }
+            });
+        }
+
+        foreach (var run in scratch)
+        {
+            visit(run.Address, run.Size);
+        }
+    }
+
+    // Makes the next pending sweep revisit the blocks of the range, e.g. after a buffer
+    // starts covering CPU-dirty pages no earlier sweep could upload.
+    public void MarkCpuSweepPending(ulong vaddr, ulong size)
+    {
+        if (size == 0 || !new GuestSpan(vaddr, size).IsValid)
+        {
+            return;
+        }
+
+        for (var block = vaddr / BlockBytes; block <= (vaddr + size - 1) / BlockBytes; block++)
+        {
+            _cpuDirtySummary.MarkPending(block);
+        }
+    }
+
     public void ForEachPossiblyCpuDirtyRange(ulong vaddr, ulong size, Action<ulong, ulong> visit)
     {
         if (size == 0)

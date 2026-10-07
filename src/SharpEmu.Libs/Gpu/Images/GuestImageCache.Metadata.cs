@@ -54,6 +54,12 @@ public sealed unsafe partial class GuestImageCache
     // True when registered DCC absorbed the fill and the guest dispatch can be skipped.
     public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
     {
+        if (Diagnostics.DbgTargetWatch.Enabled) // TEMP
+        {
+            bool watched; lock (Diagnostics.DbgTargetWatch.MetadataAddresses) watched = Diagnostics.DbgTargetWatch.MetadataAddresses.Contains(address);
+            Diagnostics.DbgTargetWatch.Log($"fill {address:X} {size:X} {fillValue:X}", () => $"dccfill address=0x{address:X} size=0x{size:X} value=0x{fillValue:X8} watchedMetadata={watched} known={_surfaceMetadata.ContainsKey(address)}");
+        }
+
         if (!IsValidRange(address, size))
         {
             throw SubmissionScheduler.Fatal($"The DCC fill range is invalid: address=0x{address:X16} size=0x{size:X16}.");

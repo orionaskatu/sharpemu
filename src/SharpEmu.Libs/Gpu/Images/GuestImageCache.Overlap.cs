@@ -644,6 +644,7 @@ public sealed partial class GuestImageCache
 
         TouchImage(record);
         record.AssociateDepth(depthImageIdentifier);
+        BumpStructureVersion();
         return association;
     }
 }

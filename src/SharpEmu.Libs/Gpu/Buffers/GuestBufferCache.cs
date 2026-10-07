@@ -644,6 +644,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
+    private static readonly bool DbgAllFills = Environment.GetEnvironmentVariable("SHARPEMU_DBG_ALL_FILLS") == "1"; // TEMP
+
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {
         if ((guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress)
@@ -668,6 +670,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var images = RequireImageCache();
+        if (DbgAllFills && size >= 0x1000) // TEMP
+            Diagnostics.DbgTargetWatch.Log($"anyfill {guestAddress >> 16:X} {size:X} {value:X}", () => $"anyfill address=0x{guestAddress:X} size=0x{size:X} value=0x{value:X8}");
+        if (Diagnostics.DbgTargetWatch.Enabled) // TEMP
+        {
+            bool watched; lock (Diagnostics.DbgTargetWatch.MetadataAddresses) watched = Diagnostics.DbgTargetWatch.MetadataAddresses.Contains(guestAddress);
+            if (watched || Diagnostics.DbgTargetWatch.Addresses.Any(watch => guestAddress < watch + (32UL << 20) && watch < guestAddress + size))
+                Diagnostics.DbgTargetWatch.Log($"dmafill {guestAddress:X} {size:X} {value:X}", () => $"dmafill address=0x{guestAddress:X} size=0x{size:X} value=0x{value:X8}");
+        }
         _ = images.ClearMetadata(guestAddress);
         var region = images.QueryRegion(guestAddress, size);
         if (!HasGpuDirtyBytes(guestAddress, size) && !region.GpuImageBytes)
@@ -711,6 +721,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var images = RequireImageCache();
+        if (Diagnostics.DbgTargetWatch.Enabled) // TEMP
+        {
+            foreach (var watch in Diagnostics.DbgTargetWatch.Addresses)
+            {
+                if ((dstMemory && dstVaddr < watch + (32UL << 20) && watch < dstVaddr + size) || (srcMemory && srcVaddr < watch + (32UL << 20) && watch < srcVaddr + size))
+                    Diagnostics.DbgTargetWatch.Log($"dmacopy {dstVaddr:X} {srcVaddr:X} {size:X}", () => $"dmacopy dst=0x{dstVaddr:X} src=0x{srcVaddr:X} size=0x{size:X} srcGpuDirty={HasGpuDirtyBytes(srcVaddr, size)} srcGpuImage={images.QueryRegion(srcVaddr, size).GpuImageBytes}");
+            }
+        }
         var srcRegion = srcMemory ? images.QueryRegion(srcVaddr, size) : default;
         var dstRegion = dstMemory ? images.QueryRegion(dstVaddr, size) : default;
         if (srcMemory && dstMemory && !HasGpuDirtyBytes(srcVaddr, size) && !HasGpuDirtyBytes(dstVaddr, size) &&
@@ -810,6 +828,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         buffer.NoteGpuWrite();
         // A tracker page the guest CPU wrote since keeps its newer CPU data.
         _tracker.MarkGpuDirtyPagesWhereCpuClean(pageAddress, pageSize, _noteGpuModifiedRange ??= (address, size) => _gpuModifiedRanges.Add(address, size));
+        if (Diagnostics.DbgTargetWatch.Enabled && Diagnostics.DbgTargetWatch.Addresses.Any(watch => pageAddress >= watch && pageAddress < watch + 0x800000)) // TEMP
+            Diagnostics.DbgTargetWatch.Log($"devwrite {pageAddress >> 20:X}", () => $"devwrite page=0x{pageAddress:X} tick={_scheduler.CurrentTick}");
         if (DbgWriteLog && Interlocked.Increment(ref _dbgWrittenPages) <= 200) // TEMP
             Console.Error.WriteLine($"[DBG][DEVWRITTEN] page=0x{pageAddress:X}");
     }
@@ -883,6 +903,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     // The mapped parts of one dirty block, reused across the blocks of a sweep.
     private readonly List<GuestSpan> _mappedWithinScratch = [];
+    private readonly List<GuestSpan> _cpuDirtyRunScratch = [];
+    private ulong _bdaSweepMapping = ulong.MaxValue;
 
     public void PrepareBda(long mappingVersion, Func<IReadOnlyCollection<GuestSpan>> mapped, Action<ulong, ulong, List<GuestSpan>> mappedWithin)
     {
@@ -916,13 +938,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     _tracker.ForEachPossiblyCpuDirtyRange(span.Address, span.Size, UploadDirtyBuffersInRange);
             }
             else
-            _tracker.ForEachCpuDirtyBlock((address, size) =>
             {
-                _mappedWithinScratch.Clear();
-                mappedWithin(address, size, _mappedWithinScratch);
-                foreach (var span in _mappedWithinScratch)
-                    UploadDirtyBuffersInRange(span.Address, span.Size);
-            });
+                // Only blocks that gained dirty pages since the previous sweep are revisited: CPU-dirty
+                // pages no buffer covers stay dirty, and rescanning them and the thousands of small
+                // buffers around them for every device-address draw dominated the frame. A mapping
+                // change can expose dirty pages the earlier sweeps skipped, so it sweeps every block.
+                var pendingOnly = _bdaSweepMapping == (ulong)mappingVersion;
+                _bdaSweepMapping = (ulong)mappingVersion;
+                _tracker.ForEachCpuDirtyRun(_cpuDirtyRunScratch, pendingOnly, (address, size) =>
+                {
+                    _mappedWithinScratch.Clear();
+                    mappedWithin(address, size, _mappedWithinScratch);
+                    foreach (var span in _mappedWithinScratch)
+                        UploadDirtyBuffersInRange(span.Address, span.Size);
+                });
+            }
         }
 
         if (traceAddress != 0)
@@ -1151,6 +1181,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 $"unsupported buffer readback from an asynchronous GPU completion, addr=0x{guestAddress:X16} size=0x{size:X16}");
         }
 
+        // A guest thread waits for the GPU itself: the GPU queue thread only submits the copy
+        // and clears the tracking afterwards, so it keeps recording while the GPU catches up.
+        if (!_relay.IsGpuQueueThread && AsyncReadback is not null && AsyncGuestReadback)
+        {
+            PendingGuestRead? pending = null;
+            if (_relay.TryRunOnGpuQueue(() => pending = BeginGuestRead(guestAddress, size, isWrite, source)))
+            {
+                if (pending is null)
+                {
+                    return true;
+                }
+
+                AsyncReadback.Wait(pending.Ticket);
+                if (_relay.TryRunOnGpuQueue(() => FinishGuestRead(pending)))
+                {
+                    return true;
+                }
+            }
+
+            lock (_shutdownGate)
+            {
+                while (_outcome == ShutdownOutcome.Pending)
+                {
+                    Monitor.Wait(_shutdownGate);
+                }
+
+                return _outcome == ShutdownOutcome.Drained;
+            }
+        }
+
         var dbgStart = DbgStacks.Start(); // TEMP
         if (_relay.TryRunOnGpuQueue(() => ReadMemoryOnGpu(guestAddress, size, isWrite, source)))
         {
@@ -1166,6 +1226,104 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
 
             return _outcome == ShutdownOutcome.Drained;
+        }
+    }
+
+    private static readonly bool AsyncGuestReadback = Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GUEST_READBACK") == "1";
+
+    private sealed record PendingGuestRead(VulkanAsyncReadback.Ticket Ticket, List<DownloadPiece> Copies, ulong WindowBegin, ulong WindowEnd, ulong WaitTick, bool IsWrite, ulong Address, ulong Size);
+
+    // The GPU-queue half of a guest read: submits the download when it can run without this
+    // thread waiting, otherwise performs the whole read here and returns null.
+    private PendingGuestRead? BeginGuestRead(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source)
+    {
+        if (isWrite && !IsRegionRegistered(guestAddress, size))
+        {
+            return null;
+        }
+
+        var copies = CollectReadbackWindow(guestAddress, size, out var windowBegin, out var windowEnd);
+        var waitTick = 0UL;
+        var total = 0UL;
+        var asyncPossible = copies.Count != 0;
+        foreach (var copy in copies)
+        {
+            var written = copy.Buffer.LastGpuWriteTick;
+            asyncPossible &= written != 0;
+            waitTick = Math.Max(waitTick, written);
+            total += copy.Size;
+        }
+
+        if (!asyncPossible || total > AsyncReadbackLimit)
+        {
+            ReadMemoryOnGpu(guestAddress, size, isWrite, source);
+            return null;
+        }
+
+        if (waitTick >= _scheduler.CurrentTick)
+        {
+            _scheduler.Flush();
+        }
+
+        var pieces = new ReadbackPiece[copies.Count];
+        for (var index = 0; index < pieces.Length; index++)
+        {
+            pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
+        }
+
+        if (AsyncReadback!.TrySubmit(pieces, waitTick) is not { } ticket)
+        {
+            ReadMemoryOnGpu(guestAddress, size, isWrite, source);
+            return null;
+        }
+
+        return new PendingGuestRead(ticket, copies, windowBegin, windowEnd, waitTick, isWrite, guestAddress, size);
+    }
+
+    // Runs after the guest thread wrote the downloaded bytes. A newer GPU write to the same
+    // buffers keeps the pages GPU-dirty, so the next guest access downloads again.
+    // The guest bytes are written here, on the GPU queue thread: a range another download
+    // already brought back (and possibly newer) is no longer GPU-modified and is skipped.
+    private void FinishGuestRead(PendingGuestRead pending)
+    {
+        var readback = AsyncReadback!;
+        try
+        {
+            foreach (var copy in pending.Copies)
+            {
+                if (copy.Buffer.LastGpuWriteTick > pending.WaitTick)
+                {
+                    return;
+                }
+            }
+
+            for (var index = 0; index < pending.Copies.Count; index++)
+            {
+                var copy = pending.Copies[index];
+                if (!_gpuModifiedRanges.Overlaps(copy.Address, copy.Size))
+                {
+                    continue;
+                }
+
+                readback.Consume(pending.Ticket, index, (_, bytes) =>
+                {
+                    if (!_backing.TryWriteBacking(copy.Address, bytes))
+                    {
+                        throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{(ulong)bytes.Length:X16}");
+                    }
+                });
+                _gpuModifiedRanges.Remove(copy.Address, copy.Size);
+            }
+        }
+        finally
+        {
+            readback.Release(pending.Ticket);
+        }
+
+        _tracker.ClearGpuDirtyPages(pending.WindowBegin, pending.WindowEnd - pending.WindowBegin);
+        if (pending.IsWrite)
+        {
+            _tracker.MarkCpuDirtyPages(pending.Address, pending.Size);
         }
     }
 
@@ -1299,6 +1457,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (insert)
         {
             _registry.RegisterBuffer(bufferIdentifier, _retirementPolicy.CurrentTick);
+            _tracker.MarkCpuSweepPending(buffer.CpuAddress, buffer.Size);
             var addresses = new ulong[sizePages];
             for (ulong page = 0; page < sizePages; page++)
             {

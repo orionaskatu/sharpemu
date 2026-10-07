@@ -176,6 +176,7 @@ public sealed partial class RenderExecutor
             IndirectArgumentsAddress = 0,
             UnboundedIndexBuffer = false,
         };
+        DbgWatchSlots(banks, "cpuargs", resolved.IndexCount, resolved.InstanceCount); // TEMP
         if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
         {
             _host.ResetBindings();
@@ -183,6 +184,44 @@ public sealed partial class RenderExecutor
         }
 
         DrawIndexedCore(submitId, banks, in resolved);
+    }
+
+    // TEMP: logs watched color target slots at draw entry, before empty draws return.
+    private static void DbgWatchSlots(RegisterBanks banks, string where, ulong count, ulong instances)
+    {
+        if (Diagnostics.DbgSequence.Active)
+        {
+            var dbgContext = banks.Context;
+            if (where.StartsWith("indexed") || where == "auto" || where == "cpuargs")
+            {
+                var dbgSlots = new System.Text.StringBuilder();
+                for (var dbgS = 0u; dbgS < 8; dbgS++)
+                    dbgSlots.Append($" [{dbgS}:{dbgContext.ColorTargets[dbgS].BaseAddress >> 16:X}/{dbgContext.ColorTargets[dbgS].Info:X8}]");
+                Diagnostics.DbgSequence.Note($"  slots targetMask=0x{dbgContext.RenderTargetMask:X8} shaderMask=0x{dbgContext.ShaderInterface.ColorShaderMask:X8}{dbgSlots} ps=0x{banks.Shader.Pixel.Address:X} stages=0x{dbgContext.ShaderStages:X}");
+            }
+
+            for (var dbgSlot = 0u; dbgSlot < 8; dbgSlot++)
+            {
+                var dbgInfo = dbgContext.ColorTargets[dbgSlot].Info;
+                if ((dbgInfo == 0x10050410 || dbgInfo == 0x10050408) && dbgContext.RenderTargetMaskForSlot(dbgSlot) != 0)
+                    Diagnostics.DbgSequence.Note($"  VISBUF draw {where} slot={dbgSlot} base=0x{dbgContext.ColorTargets[dbgSlot].BaseAddress:X} info=0x{dbgInfo:X8} mask=0x{dbgContext.RenderTargetMaskForSlot(dbgSlot):X}");
+            }
+
+            Diagnostics.DbgSequence.Note($"draw {where} rt0=0x{dbgContext.ColorTargets[0].BaseAddress:X}/{dbgContext.RenderTargetMaskForSlot(0):X} rt1=0x{dbgContext.ColorTargets[1].BaseAddress:X}/{dbgContext.RenderTargetMaskForSlot(1):X} empty={count == 0 || instances == 0} ps=0x{banks.Shader.Pixel.Address:X}");
+        }
+
+        if (!Diagnostics.DbgTargetWatch.Enabled)
+            return;
+        var context = banks.Context;
+        for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
+        {
+            var target = context.ColorTargets[slot];
+            if (!Diagnostics.DbgTargetWatch.Addresses.Contains(target.BaseAddress))
+                continue;
+            var dbgSlot = slot;
+            Diagnostics.DbgTargetWatch.Log($"entry {where} {slot} {target.BaseAddress:X} {count == 0 || instances == 0}", () =>
+                $"entry {where} slot={dbgSlot} base=0x{target.BaseAddress:X} info=0x{target.Info:X8} slotMask=0x{context.RenderTargetMaskForSlot(dbgSlot):X} count={count} instances={instances} ps=0x{banks.Shader.Pixel.Address:X}");
+        }
     }
 
     private void DrawIndexedCore(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
@@ -202,6 +241,7 @@ public sealed partial class RenderExecutor
         var userConfig = banks.UserConfig;
         var shader = banks.Shader;
         _host.SetDebugInformation(RecordedOperation.DrawIndex, submitId, arguments.IndexCount, 0, 1, arguments.InstanceCount, arguments.IndexAddress);
+        DbgWatchSlots(banks, $"indexed(type={arguments.IndexTypeAndSize} addr=0x{arguments.IndexAddress:X} unbounded={arguments.UnboundedIndexBuffer} off={arguments.OffsetSource} vs=0x{banks.Shader.Vertex.ExportAddress:X})", arguments.IndexCount, arguments.InstanceCount); // TEMP
         if (arguments.IndexCount == 0 || arguments.InstanceCount == 0)
         {
             return;
@@ -372,6 +412,7 @@ public sealed partial class RenderExecutor
         var userConfig = banks.UserConfig;
         var shader = banks.Shader;
         _host.SetDebugInformation(RecordedOperation.DrawIndexAuto, submitId, arguments.VertexCount, 0, arguments.FirstVertex, arguments.InstanceCount, arguments.FirstInstance);
+        DbgWatchSlots(banks, "auto", arguments.VertexCount, arguments.InstanceCount); // TEMP
         if (arguments.VertexCount == 0 || arguments.InstanceCount == 0)
         {
             return;
@@ -387,7 +428,8 @@ public sealed partial class RenderExecutor
         {
             DbgDrawStats.Record(banks.Context.ShaderStages, "tessellated"); // TEMP
             ValidateDrawRegisters(banks);
-            DrawTessellated(submitId, banks, arguments.VertexCount, arguments.InstanceCount, arguments.FirstVertex);
+            if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_TESS") != "1") // TEMP
+                DrawTessellated(submitId, banks, arguments.VertexCount, arguments.InstanceCount, arguments.FirstVertex);
             return;
         }
 

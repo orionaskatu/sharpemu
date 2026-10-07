@@ -211,9 +211,29 @@ public sealed partial class GpuCommandInterpreter
         }
     }
 
-    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+    internal uint PushMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.TrackMarkers) // TEMP
+        {
+            var text = new string(System.Text.Encoding.ASCII.GetString(System.Runtime.InteropServices.MemoryMarshal.AsBytes(payload)).Where(ch => ch >= 32 && ch < 127).ToArray());
+            SharpEmu.Libs.Diagnostics.DbgSequence.PushMarker(text);
+            if (SharpEmu.Libs.Diagnostics.DbgSequence.Active)
+                SharpEmu.Libs.Diagnostics.DbgSequence.Note($"PUSH '{text}'");
+        }
 
-    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload) => packet.Length - 1;
+        return packet.Length - 1;
+    }
+
+    internal uint PopMarkerPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
+    {
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.TrackMarkers) // TEMP
+        {
+            SharpEmu.Libs.Diagnostics.DbgSequence.PopMarker();
+            if (SharpEmu.Libs.Diagnostics.DbgSequence.Active)
+                SharpEmu.Libs.Diagnostics.DbgSequence.Note("POP");
+        }
+        return packet.Length - 1;
+    }
 
     internal uint FlipPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {

@@ -27,6 +27,35 @@ public sealed partial class RenderExecutor
     private const uint ImageClearUserDataCount = 8;
 
     // TEMP: SHARPEMU_DBG_SKIP_CS=hash,... drops those dispatches to bound their cost.
+    // Ghost of Yotei culls its static world with a visibility feedback loop: compute 17444E6A... turns the
+    // previous frame's visibility-buffer images into a per-triangle bitmask that the compaction passes read.
+    // Those images (cleared with DCC constant-encoded fills) never receive visibility data in this emulation, so
+    // the bitmask stays empty and every static mesh is culled. Until the loop is emulated the pass is replaced by
+    // an all-ones fill (everything the frustum culler selected is drawn; occlusion culling is only an optimisation).
+    // SHARPEMU_DBG_FILL_WRITTEN_CS=off keeps the real pass; a hash list overrides the default.
+    private static readonly HashSet<ulong> DbgFillWrittenHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_FILL_WRITTEN_CS") switch
+    {
+        null => [0x17444E6ABBF4F82CUL],
+        var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
+            .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
+    };
+    // TEMP: SHARPEMU_DBG_BOOT_WINDOW=fromSeconds:lengthSeconds limits the replacement to that window of process time.
+    private static readonly (double From, double Length)? DbgBootWindow = Environment.GetEnvironmentVariable("SHARPEMU_DBG_BOOT_WINDOW") is { Length: > 0 } dbgWindow && dbgWindow.Split(':') is { Length: 2 } dbgWindowParts
+        ? (double.Parse(dbgWindowParts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(dbgWindowParts[1], System.Globalization.CultureInfo.InvariantCulture)) : null;
+    private static readonly long DbgProcessStart = System.Diagnostics.Stopwatch.GetTimestamp();
+    private static bool DbgInBootWindow()
+    {
+        if (DbgBootWindow is not { } window)
+            return true;
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds;
+        return elapsed >= window.From && elapsed < window.From + window.Length;
+    }
+
+    private static readonly (ulong Hash, int Slot, int Words, ulong Offset)[] DbgPeek = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PEEK") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
+        .Select(item => item.Split(':')).Where(parts => parts.Length >= 3).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToInt32(parts[1], 16), Convert.ToInt32(parts[2]), parts.Length > 3 ? Convert.ToUInt64(parts[3].Replace("0x", ""), 16) : 0UL)).ToArray(); // TEMP
+    private static readonly int DbgBootFrames = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_BOOT_FRAMES"), out var dbgBoot) ? dbgBoot : 0; // TEMP
+    private static int _dbgBootCount; // TEMP
     private static readonly HashSet<ulong> DbgSkipHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_CS") ?? "")
         .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(h => Convert.ToUInt64(h.Replace("0x", ""), 16)).ToHashSet();
 
@@ -121,7 +150,86 @@ public sealed partial class RenderExecutor
 
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
+        if (Diagnostics.DbgSequence.Active) // TEMP
+        {
+            var dbgWrites = new System.Text.StringBuilder();
+            for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
+            {
+                if (!program.Buffers[index].Written || input.Stage.Resources.Buffers[index].Length < 4)
+                    continue;
+                var dbgDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[index]);
+                dbgWrites.Append($" w{index}=0x{dbgDescriptor.Address:X}+0x{dbgDescriptor.Footprint() ?? 0:X}/stride{dbgDescriptor.Stride}/rec{dbgDescriptor.RecordCount}");
+                if ((dbgDescriptor.Footprint() ?? 0) == 0)
+                    dbgWrites.Append($"[raw={string.Join(",", input.Stage.Resources.Buffers[index].ToArray().Select(word => word.ToString("X8")))}]");
+            }
+            var dbgCb = banks.Context;
+            Diagnostics.DbgSequence.Note($"  cbstate cb0[base=0x{dbgCb.ColorTargets[0].BaseAddress:X} info=0x{dbgCb.ColorTargets[0].Info:X8} dcc=0x{dbgCb.ColorTargets[0].DccAddress:X} clr0=0x{dbgCb.ColorTargets[0].ClearWord0:X8} clr1=0x{dbgCb.ColorClearWord1[0]:X8}] cb1[base=0x{dbgCb.ColorTargets[1].BaseAddress:X} info=0x{dbgCb.ColorTargets[1].Info:X8} dcc=0x{dbgCb.ColorTargets[1].DccAddress:X} clr0=0x{dbgCb.ColorTargets[1].ClearWord0:X8} clr1=0x{dbgCb.ColorClearWord1[1]:X8}]");
+            var dbgUser = input.Stage.Resources.UserData;
+            Diagnostics.DbgSequence.Note($"dispatch cs=0x{program.Hash:X16} groups={groupsX}x{groupsY}x{groupsZ} local={input.ThreadsX}{dbgWrites} ud4-7={(dbgUser.Length >= 8 && program.Hash == 0x2BD3CD129405F9A9UL ? $"{dbgUser[4]:X8},{dbgUser[5]:X8},{dbgUser[6]:X8},{dbgUser[7]:X8}" : "-")}");
+        }
+        if (DbgPeek.Length != 0) // TEMP: SHARPEMU_DBG_PEEK=hash:slot:dwords,... logs guest dwords of a bound buffer per dispatch
+        {
+            foreach (var (peekHash, peekSlot, peekWords, peekOffset) in DbgPeek)
+            {
+                if (peekHash != program.Hash)
+                    continue;
+                ulong peekAddress;
+                if (peekSlot == 0xFE) // V# at ud pointer + offset: dump the first dwords of every record
+                {
+                    var peekUser2 = input.Stage.Resources.UserData;
+                    var vsharp = new byte[16];
+                    if (peekUser2.Length < 2 || !_host.TryReadGuest((peekUser2[0] | ((ulong)peekUser2[1] << 32)) + peekOffset, vsharp))
+                        continue;
+                    var baseAddress = BitConverter.ToUInt32(vsharp, 0) | ((ulong)(BitConverter.ToUInt32(vsharp, 4) & 0xFFFF) << 32);
+                    var recordStride = (BitConverter.ToUInt32(vsharp, 4) >> 16) & 0x3FFF;
+                    var recordCount = BitConverter.ToUInt32(vsharp, 8);
+                    Console.Error.WriteLine($"[DBG][PEEK] V# base=0x{baseAddress:X} stride=0x{recordStride:X} records={recordCount} groups={groupsX}");
+                    for (var record = 0u; record < Math.Min(recordCount, 64u); record++)
+                    {
+                        var recordBytes = new byte[peekWords * 4];
+                        var recordRead = _host.TryReadGuest(baseAddress + record * recordStride, recordBytes);
+                        Console.Error.WriteLine($"[DBG][PEEK]   rec {record}: " + (recordRead ? string.Join(" ", Enumerable.Range(0, peekWords).Select(index => BitConverter.ToUInt32(recordBytes, index * 4).ToString("X8"))) : "unreadable"));
+                    }
+
+                    continue;
+                }
+
+                if (peekSlot == 0xFF)
+                {
+                    var peekUser = input.Stage.Resources.UserData;
+                    if (peekUser.Length < 2)
+                        continue;
+                    peekAddress = (peekUser[0] | ((ulong)peekUser[1] << 32)) + peekOffset;
+                }
+                else
+                {
+                    if (peekSlot >= input.Stage.Resources.Buffers.Length || input.Stage.Resources.Buffers[peekSlot].Length < 4)
+                        continue;
+                    peekAddress = BufferDescriptorWords.From(input.Stage.Resources.Buffers[peekSlot]).Address + peekOffset;
+                }
+
+                var peekBytes = new byte[peekWords * 4];
+                var peekRead = _host.TryReadGuest(peekAddress, peekBytes);
+                Console.Error.WriteLine($"[DBG][PEEK] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F2} cs=0x{program.Hash:X} slot={peekSlot:X} addr=0x{peekAddress:X} groups={groupsX} " +
+                    (peekRead ? string.Join(" ", Enumerable.Range(0, peekWords).Select(index => BitConverter.ToUInt32(peekBytes, index * 4).ToString("X8"))) : "unreadable"));
+            }
+        }
+
         if (DbgSkipHashes.Contains(program.Hash)) return; // TEMP
+        if (DbgFillWrittenHashes.Contains(program.Hash) && DbgInBootWindow()) // TEMP: replace the dispatch by all-ones fills of its written buffers
+        {
+            for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
+            {
+                if (!program.Buffers[index].Written || input.Stage.Resources.Buffers[index].Length < 4)
+                    continue;
+                var descriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[index]);
+                if (descriptor.Footprint() is { } footprint && descriptor.Address != 0 && footprint != 0)
+                    _host.DebugFillBuffer(descriptor.Address & ~3UL, (footprint + 3) & ~3UL, 0xFFFFFFFF);
+            }
+
+            _host.ResetBindings();
+            return;
+        }
         DbgCountDispatch(program.Hash, groupsX * groupsY * groupsZ, indirectArgumentsAddress != 0); // TEMP
         if (RenderTrace.Enabled)
         {
@@ -211,15 +319,41 @@ public sealed partial class RenderExecutor
                 physicalGroups[axisOrder[logical]] = logicalGroups[logical];
             }
 
+            if (_host.DebugCapturing) // TEMP: expose the resolved buffers so captures can name them by slot
+            {
+                var dbgBuffers = new (ulong, ulong)[input.Stage.Resources.Buffers.Length];
+                for (var index = 0; index < dbgBuffers.Length; index++)
+                {
+                    if (input.Stage.Resources.Buffers[index].Length >= 4)
+                    {
+                        var dbgDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[index]);
+                        dbgBuffers[index] = (dbgDescriptor.Address, dbgDescriptor.Footprint() ?? 0);
+                    }
+                }
+
+                _host.DebugSetDispatchBuffers(dbgBuffers);
+            }
+
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
             }
             _host.ShaderAccessBarrier();
+            foreach (var (fillHash, fillSlot, fillValue) in DbgFillAfter) // TEMP: SHARPEMU_DBG_FILL_AFTER=hash:slot:value,... overwrites a bound buffer after the dispatch
+            {
+                if (fillHash != program.Hash || fillSlot >= input.Stage.Resources.Buffers.Length || input.Stage.Resources.Buffers[fillSlot].Length < 4)
+                    continue;
+                var fillDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[fillSlot]);
+                if (fillDescriptor.Footprint() is { } fillFootprint && fillDescriptor.Address != 0 && fillFootprint != 0)
+                    _host.DebugFillBuffer(fillDescriptor.Address & ~3UL, (fillFootprint + 3) & ~3UL, fillValue);
+            }
         }
 
         _host.ResetBindings();
     }
+
+    private static readonly (ulong Hash, int Slot, uint Value)[] DbgFillAfter = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_FILL_AFTER") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
+        .Select(item => item.Split(':')).Where(parts => parts.Length == 3).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToInt32(parts[1], 16), Convert.ToUInt32(parts[2].Replace("0x", ""), 16))).ToArray(); // TEMP
 
     // The dispatch counts threads; the host counts groups of the shader's thread size.
     public static uint GroupsFromThreads(uint threads, uint groupSize)

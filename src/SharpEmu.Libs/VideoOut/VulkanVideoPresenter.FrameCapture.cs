@@ -227,7 +227,96 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CaptureNoteIndirect(BufferBinding arguments)
         {
             if (_captureState == 1 && _captureIndirect.Count > 0 && _captureIndirect[^1].Info.Length == 0)
-                _captureIndirect[^1] = (arguments, $"pass={_capturePass} ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} vs=0x{_boundGraphicsPipeline?.ProfileVertexHash ?? 0:X}");
+                _captureIndirect[^1] = (arguments, $"pass={_capturePass} marker='{SharpEmu.Libs.Diagnostics.DbgSequence.Marker}' ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} vs=0x{_boundGraphicsPipeline?.ProfileVertexHash ?? 0:X}");
+        }
+
+        // TEMP: SHARPEMU_CAPTURE_BUFFERS_AT=csHash:addr:size:nth,... copies guest buffers right before the nth dispatch of that compute shader.
+        private static readonly (ulong Hash, ulong Address, ulong Size, int Nth)[] CaptureBuffersAt =
+            (Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_BUFFERS_AT") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(item => item.Split(':')).Where(parts => parts.Length >= 3)
+            .Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToUInt64(parts[1].Replace("0x", ""), 16), Convert.ToUInt64(parts[2].Replace("0x", ""), 16), parts.Length > 3 ? int.Parse(parts[3]) : 0)).ToArray();
+        private (ulong Address, ulong Size)[] _dbgDispatchBuffers = [];
+        public void DebugSetDispatchBuffers((ulong Address, ulong Size)[] buffers) => _dbgDispatchBuffers = buffers;
+        private ulong _dbgDrawHash;
+        public void DebugSetDrawHash(ulong vertexHash) => _dbgDrawHash = vertexHash;
+
+        private void CaptureSnapshotBuffersAtDraw()
+        {
+            if (CaptureBuffersAt.Length == 0 || _captureState != 1)
+                return;
+            var saved = _dbgComputeHash;
+            _dbgComputeHash = _dbgDrawHash;
+            CaptureSnapshotBuffersAt();
+            _dbgComputeHash = saved;
+        }
+        private readonly int[] _captureBuffersAtSeen = new int[CaptureBuffersAt.Length];
+        private readonly List<(string Name, VkBuffer Buffer, DeviceMemory Memory, ulong Size, ulong Address)> _captureBufferSnaps = [];
+
+        private void CaptureSnapshotBuffersAt()
+        {
+            if (CaptureBuffersAt.Length == 0 || _captureState != 1)
+                return;
+            for (var index = 0; index < CaptureBuffersAt.Length; index++)
+            {
+                var entry = CaptureBuffersAt[index];
+                if (entry.Hash != _dbgComputeHash || _captureBuffersAtSeen[index]++ != entry.Nth)
+                    continue;
+                var address = entry.Address;
+                var size = entry.Size;
+                if (address < 256) // slot form: "hash:slot:0:nth" captures the slot's whole resolved range
+                {
+                    if ((int)address >= _dbgDispatchBuffers.Length || _dbgDispatchBuffers[(int)address].Size == 0)
+                        continue;
+                    var slot = (int)address;
+                    address = _dbgDispatchBuffers[slot].Address;
+                    size = size == 0 ? Math.Min(_dbgDispatchBuffers[slot].Size, 64ul << 20) : size;
+                    _captureManifest.Add($"bufferat-slot hash=0x{entry.Hash:X} slot={slot} addr=0x{address:X} size=0x{size:X}");
+                }
+
+                var (source, sourceOffset) = _bufferCache.ObtainBuffer(address, size, false);
+                var buffer = CreateBuffer(size, BufferUsageFlags.TransferDstBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, out var memory);
+                var command = BeginBatchedGuestCommands();
+                var barrier = new MemoryBarrier2 { SType = StructureType.MemoryBarrier2, SrcAccessMask = AccessFlags2.MemoryWriteBit, DstAccessMask = AccessFlags2.TransferReadBit };
+                VulkanSynchronization.PipelineBarrier(_vk, command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, 0, 1, &barrier, 0, null, 0, null);
+                var region = new BufferCopy(sourceOffset, 0, size);
+                _vk.CmdCopyBuffer(command, source.Handle, buffer, 1, &region);
+                _captureBufferSnaps.Add(($"at_{entry.Hash:X16}_{(entry.Address < 256 ? "slot" + entry.Address : "0x" + entry.Address.ToString("X"))}_n{entry.Nth}", buffer, memory, size, address));
+            }
+        }
+
+        private void CaptureWriteBufferSnaps()
+        {
+            if (_captureBufferSnaps.Count == 0)
+                return;
+            SynchronizeGpu();
+            foreach (var (name, buffer, memory, size, snapAddress) in _captureBufferSnaps)
+            {
+                void* mapped;
+                if (_vk.MapMemory(_device, memory, 0, size, 0, &mapped) == Result.Success)
+                {
+                    var bytes = new ReadOnlySpan<byte>(mapped, (int)size);
+                    File.WriteAllBytes(Path.Combine(_captureDirectory!, $"buffer_{name}.bin"), bytes.ToArray());
+                    var nonZero = 0;
+                    for (var i = 0; i + 3 < bytes.Length; i += 4)
+                        if (BitConverter.ToUInt32(bytes.Slice(i, 4)) != 0) nonZero++;
+                    var guestNow = new byte[size];
+                    var guestNonZero = -1;
+                    if (TryReadGuest(snapAddress, guestNow))
+                    {
+                        guestNonZero = 0;
+                        for (var i = 0; i + 3 < guestNow.Length; i += 4)
+                            if (BitConverter.ToUInt32(guestNow, i) != 0) guestNonZero++;
+                    }
+
+                    _captureManifest.Add($"bufferat {name} size=0x{size:X} nonzero_dwords={nonZero} guest_nonzero_at_frame_end={guestNonZero}");
+                    _vk.UnmapMemory(_device, memory);
+                }
+
+                _vk.DestroyBuffer(_device, buffer, null);
+                _deviceInfo.FreeMemory(memory);
+            }
+
+            _captureBufferSnaps.Clear();
         }
 
         private void CaptureReadBuffers()
@@ -255,6 +344,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     var bytes = new ReadOnlySpan<byte>(mapped, (int)size);
                     File.WriteAllBytes(Path.Combine(_captureDirectory!, $"buffer_0x{address:X}.bin"), bytes.ToArray());
+                    var guestCopy = new byte[size]; // TEMP: compare GPU copy against guest memory
+                    if (TryReadGuest(address, guestCopy))
+                    {
+                        File.WriteAllBytes(Path.Combine(_captureDirectory!, $"guest_0x{address:X}.bin"), guestCopy);
+                        var differing = 0;
+                        for (var i = 0; i + 3 < guestCopy.Length; i += 4)
+                            if (BitConverter.ToUInt32(guestCopy, i) != BitConverter.ToUInt32(bytes.Slice(i, 4))) differing++;
+                        _captureManifest.Add($"guestcmp 0x{address:X}+0x{size:X} differing_dwords={differing}");
+                    }
                     var histogram = new long[256];
                     foreach (var value in bytes) histogram[value]++;
                     _captureManifest.Add($"buffer 0x{address:X}+0x{size:X} top=" + string.Join(",", Enumerable.Range(0, 256).OrderByDescending(index => histogram[index]).Take(8).Select(index => $"{index:X2}:{histogram[index]}")));
@@ -286,7 +384,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CaptureNoteDraw(string kind, uint count, uint instances)
         {
             if (_captureState == 1)
-                _captureManifest.Add($"drawcall pass={_capturePass} active={_renderingActive} kind={kind} count={count} instances={instances} pipeline={_boundGraphicsPipeline?.Id ?? 0} ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} {_dbgDepthState}");
+                _captureManifest.Add($"drawcall pass={_capturePass} marker='{SharpEmu.Libs.Diagnostics.DbgSequence.Marker}' active={_renderingActive} kind={kind} count={count} instances={instances} pipeline={_boundGraphicsPipeline?.Id ?? 0} ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} {_dbgDepthState}");
         }
 
         private void CaptureNotePass(in Gpu.Rendering.RenderingState state)
@@ -318,9 +416,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var backing = target.Image.Backing;
             // TEMP: SHARPEMU_CAPTURE_LAST_ADDRS=addr,... keeps only the last write of those images
             // (one readback buffer per address, overwritten by every later pass).
-            if (_captureLastAddresses is { } lastAddresses && !lastAddresses.Contains(target.Address))
+            var captureEveryPass = _captureAllAddresses is { } everyPass && everyPass.Contains(target.Address); // TEMP: SHARPEMU_CAPTURE_ALL_ADDRS keeps every pass of those images
+            if (!captureEveryPass && _captureLastAddresses is { } lastAddresses && !lastAddresses.Contains(target.Address))
                 return;
-            var lastIndex = _captureLastAddresses is null ? -1 : _captureReadbacks.FindIndex(entry => entry.Target.Address == target.Address && entry.Slot == slot);
+            var lastIndex = captureEveryPass || _captureLastAddresses is null ? -1 : _captureReadbacks.FindIndex(entry => entry.Target.Address == target.Address && entry.Slot == slot);
             var texelBytes = TexelBytes(target.Format, depth);
             var width = Math.Max(1u, backing.Extent.Width >> (int)target.View.BaseLevel);
             var height = Math.Max(1u, backing.Extent.Height >> (int)target.View.BaseLevel);
@@ -370,6 +469,10 @@ internal static unsafe partial class VulkanVideoPresenter
             _captureReadbacks.Add((_capturePass, slot, target with { Width = width, Height = height }, buffer, memory, size, texelBytes));
         }
 
+        private static readonly HashSet<ulong>? _captureAllAddresses = // TEMP
+            Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_ALL_ADDRS") is { Length: > 0 } allText
+                ? allText.Split(',').Select(text => Convert.ToUInt64(text.Trim(), 16)).ToHashSet()
+                : null;
         private static readonly HashSet<ulong>? _captureLastAddresses = // TEMP
             Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_LAST_ADDRS") is { Length: > 0 } lastText
                 ? lastText.Split(',').Select(text => Convert.ToUInt64(text.Trim(), 16)).ToHashSet()
@@ -470,6 +573,7 @@ internal static unsafe partial class VulkanVideoPresenter
             Directory.CreateDirectory(_captureDirectory!);
             CaptureReadIndirect();
             CaptureReadBuffers();
+            CaptureWriteBufferSnaps();
             SynchronizeGpu();
             CaptureWriteCopies();
             CaptureQueueTextures();
@@ -487,6 +591,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 try
                 {
+                    if ((texelBytes == 4 || (texelBytes == 8 && Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_RAW64") == "1")) && !target.Depth) // TEMP: raw dump next to the PNG (offline value analysis)
+                        File.WriteAllBytes(Path.Combine(_captureDirectory!, name + ".raw"), new ReadOnlySpan<byte>(mapped, checked((int)size)).ToArray());
                     var stats = WriteCapturePng(Path.Combine(_captureDirectory!, name + ".png"),
                         new ReadOnlySpan<byte>(mapped, checked((int)size)), target.Format, target.Depth, target.Width, target.Height, texelBytes);
                     _captureManifest.Add($"{name} layer={target.View.BaseLayer} level={target.View.BaseLevel} {stats}");

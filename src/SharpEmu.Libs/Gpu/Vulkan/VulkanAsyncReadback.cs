@@ -14,6 +14,16 @@ public readonly record struct ReadbackPiece(GpuBuffer Source, ulong SourceOffset
 internal interface IBufferReadback : IDisposable
 {
     void Read(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, VulkanAsyncReadback.ReadbackConsumer consume);
+
+    // Submits the copies without waiting; null when no submission slot is free. Only the
+    // GPU queue thread submits. Complete may run on any thread, once per ticket.
+    VulkanAsyncReadback.Ticket? TrySubmit(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick) => null;
+
+    void Wait(VulkanAsyncReadback.Ticket ticket) { }
+
+    void Consume(VulkanAsyncReadback.Ticket ticket, int index, VulkanAsyncReadback.ReadbackConsumer consume) { }
+
+    void Release(VulkanAsyncReadback.Ticket ticket) { }
 }
 
 // Copies GPU-written buffer ranges back to the host on a second queue. The copy waits
@@ -177,6 +187,174 @@ internal sealed unsafe class VulkanAsyncReadback : IBufferReadback
 
     public delegate void ReadbackConsumer(int index, ReadOnlySpan<byte> bytes);
 
+    // A copy in flight on the readback queue; its slot returns to the pool on completion.
+    public sealed class Ticket
+    {
+        internal Slot Slot = null!;
+        internal ulong SignalValue;
+        internal ulong[] Offsets = [];
+        internal ulong[] Sizes = [];
+    }
+
+    internal sealed class Slot
+    {
+        public CommandBuffer Command;
+        public GpuBuffer? Staging;
+        public bool Busy;
+    }
+
+    private const int SlotCount = 8;
+    private readonly List<Slot> _slots = new();
+
+    public Ticket? TrySubmit(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick)
+    {
+        lock (_gate)
+        {
+            Slot? slot = null;
+            foreach (var candidate in _slots)
+            {
+                if (!candidate.Busy)
+                {
+                    slot = candidate;
+                    break;
+                }
+            }
+
+            var vk = _device.Vk;
+            if (slot is null)
+            {
+                if (_slots.Count >= SlotCount)
+                {
+                    return null;
+                }
+
+                var allocateInfo = new CommandBufferAllocateInfo
+                {
+                    SType = StructureType.CommandBufferAllocateInfo,
+                    CommandPool = _pool,
+                    Level = CommandBufferLevel.Primary,
+                    CommandBufferCount = 1,
+                };
+                CommandBuffer command;
+                Require(vk.AllocateCommandBuffers(_device.Device, &allocateInfo, &command), "vkAllocateCommandBuffers(readback slot)");
+                slot = new Slot { Command = command };
+                _slots.Add(slot);
+            }
+
+            var offsets = new ulong[pieces.Length];
+            var sizes = new ulong[pieces.Length];
+            var total = 0UL;
+            for (var index = 0; index < pieces.Length; index++)
+            {
+                total = AlignUp(total, Alignment);
+                offsets[index] = total;
+                sizes[index] = pieces[index].Size;
+                total += pieces[index].Size;
+            }
+
+            if (slot.Staging is not { } existing || existing.Size < total)
+            {
+                slot.Staging?.Dispose();
+                slot.Staging = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.TransferDstBit, Math.Max(total, 1UL << 20));
+            }
+
+            Require(vk.ResetCommandBuffer(slot.Command, 0), "vkResetCommandBuffer(readback slot)");
+            var beginInfo = new CommandBufferBeginInfo
+            {
+                SType = StructureType.CommandBufferBeginInfo,
+                Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+            };
+            Require(vk.BeginCommandBuffer(slot.Command, &beginInfo), "vkBeginCommandBuffer(readback slot)");
+            for (var index = 0; index < pieces.Length; index++)
+            {
+                var region = new BufferCopy(pieces[index].SourceOffset, offsets[index], pieces[index].Size);
+                vk.CmdCopyBuffer(slot.Command, pieces[index].Source.Handle, slot.Staging.Handle, 1, &region);
+            }
+
+            var toHost = new MemoryBarrier2
+            {
+                SType = StructureType.MemoryBarrier2,
+                SrcStageMask = PipelineStageFlags2.CopyBit,
+                SrcAccessMask = AccessFlags2.TransferWriteBit,
+                DstStageMask = PipelineStageFlags2.HostBit,
+                DstAccessMask = AccessFlags2.HostReadBit,
+            };
+            var dependency = new DependencyInfo
+            {
+                SType = StructureType.DependencyInfo,
+                MemoryBarrierCount = 1,
+                PMemoryBarriers = &toHost,
+            };
+            vk.CmdPipelineBarrier2(slot.Command, &dependency);
+            Require(vk.EndCommandBuffer(slot.Command), "vkEndCommandBuffer(readback slot)");
+
+            var signalValue = ++_signaled;
+            var wait = new SemaphoreSubmitInfo
+            {
+                SType = StructureType.SemaphoreSubmitInfo,
+                Semaphore = new VkSemaphore(_scheduler.Timeline.Handle),
+                Value = waitTick,
+                StageMask = PipelineStageFlags2.AllCommandsBit,
+            };
+            var signal = new SemaphoreSubmitInfo
+            {
+                SType = StructureType.SemaphoreSubmitInfo,
+                Semaphore = _timeline,
+                Value = signalValue,
+                StageMask = PipelineStageFlags2.AllCommandsBit,
+            };
+            var commandInfo = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = slot.Command,
+                DeviceMask = 1,
+            };
+            var submit = new SubmitInfo2
+            {
+                SType = StructureType.SubmitInfo2,
+                WaitSemaphoreInfoCount = waitTick == 0 ? 0u : 1u,
+                PWaitSemaphoreInfos = &wait,
+                CommandBufferInfoCount = 1,
+                PCommandBufferInfos = &commandInfo,
+                SignalSemaphoreInfoCount = 1,
+                PSignalSemaphoreInfos = &signal,
+            };
+            Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback slot)");
+            slot.Busy = true;
+            return new Ticket { Slot = slot, SignalValue = signalValue, Offsets = offsets, Sizes = sizes };
+        }
+    }
+
+    // Any thread: blocks until the ticket's copies are in its staging memory.
+    public void Wait(Ticket ticket)
+    {
+        var semaphore = _timeline;
+        var value = ticket.SignalValue;
+        var waitInfo = new SemaphoreWaitInfo
+        {
+            SType = StructureType.SemaphoreWaitInfo,
+            SemaphoreCount = 1,
+            PSemaphores = &semaphore,
+            PValues = &value,
+        };
+        Require(_device.Vk.WaitSemaphores(_device.Device, &waitInfo, ulong.MaxValue), "vkWaitSemaphores(readback slot)");
+    }
+
+    public void Consume(Ticket ticket, int index, ReadbackConsumer consume)
+    {
+        var staging = ticket.Slot.Staging!;
+        staging.Invalidate(ticket.Offsets[index], ticket.Sizes[index]);
+        consume(index, staging.Mapped.Slice((int)ticket.Offsets[index], (int)ticket.Sizes[index]));
+    }
+
+    public void Release(Ticket ticket)
+    {
+        lock (_gate)
+        {
+            ticket.Slot.Busy = false;
+        }
+    }
+
     private GpuBuffer EnsureStaging(ulong size)
     {
         if (_staging is { } existing && existing.Size >= size)
@@ -221,6 +399,9 @@ internal sealed unsafe class VulkanAsyncReadback : IBufferReadback
 
             _staging?.Dispose();
             _staging = null;
+            foreach (var slot in _slots)
+                slot.Staging?.Dispose();
+            _slots.Clear();
             vk.DestroySemaphore(_device.Device, _timeline, null);
             vk.DestroyCommandPool(_device.Device, _pool, null);
         }

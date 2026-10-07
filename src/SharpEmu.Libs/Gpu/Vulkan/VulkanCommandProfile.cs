@@ -144,7 +144,7 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
                 continue;
             var marker = queries.Markers[index];
             var key = marker.Key;
-            if (!_totals.ContainsKey(key) && _totals.Count >= 256)
+            if (!_totals.ContainsKey(key) && _totals.Count >= 8192)
                 key = new IntervalKey(IntervalKind.Overflow, 0);
             if (!_totals.TryGetValue(key, out var total))
                 _totals.Add(key, total = new IntervalTotal());
@@ -167,7 +167,7 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
         if (_totals.Count != 0 || _skippedMarkers != 0 || _unavailableBuffers != 0)
         {
             _write($"[PERF][GPU_INTERVAL] completed_ms={_totals.Values.Sum(total => total.Milliseconds):F3} intervals={_totals.Values.Sum(total => (long)total.Count)} skipped_markers={_skippedMarkers} unavailable_buffers={_unavailableBuffers}");
-            foreach (var (key, total) in _totals.OrderByDescending(pair => pair.Value.Milliseconds).Take(12))
+            foreach (var (key, total) in _totals.OrderByDescending(pair => pair.Value.Milliseconds).Take(30))
                 _write($"[PERF][GPU_INTERVAL] kind={key.Kind} pipeline={key.Pipeline} count={total.Count} total_ms={total.Milliseconds:F3} max_ms={total.MaximumMilliseconds:F3} max_args={total.MaximumMarker.First},{total.MaximumMarker.Second},{total.MaximumMarker.Third}");
         }
         _totals.Clear();

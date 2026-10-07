@@ -603,11 +603,18 @@ public sealed partial class ResourceTracker
     // record offset the shader computes at run time (key * stride). The hardware reads
     // whichever record the offset names; the host binds every image the table holds and
     // the shader selects one by the same offset.
+    private static readonly bool DbgImgPlanEnabled = Environment.GetEnvironmentVariable("SHARPEMU_DBG_IMGPLAN") == "1"; // TEMP
+    private void DbgImgPlan(int reason, uint pc, ScalarValue handle)
+    {
+        if (DbgImgPlanEnabled)
+            Console.Error.WriteLine($"[DBG][IMGPLAN] buffer-table image rejected: reason={reason} pc=0x{pc:X} program=0x{_graph.Program.Address:X}");
+    }
+
     private bool TryMakeBufferTableImage(ScalarValue handle, uint pc, bool r128, out IndirectImagePlan plan)
     {
         plan = null!;
         if (handle.Kind != ScalarValueKind.ImageHandle || handle.Operands.Length != 8)
-            return false;
+            { DbgImgPlan(1, pc, handle); return false; }
 
         // A 128-bit resource reads only the first four dwords of the handle.
         var dwords = r128 ? 4 : 8;
@@ -621,15 +628,15 @@ public sealed partial class ResourceTracker
             var read = handle.Operands[dword];
             var memory = ScalarReadMemory(read, out var memoryIndex);
             if (memory is null || memory.Kind != MemoryResourceKind.ScalarBuffer || !MemoryIndexBelongsTo(memoryIndex, read))
-                return false;
+                { DbgImgPlan(2, pc, handle); return false; }
 
             var componentOffset = (uint)dword * sizeof(uint);
             if (memory.Offset < componentOffset)
-                return false;
+                { DbgImgPlan(3, pc, handle); return false; }
             if (dword == 0)
                 tableImmediate = memory.Offset;
             else if (memory.Offset - componentOffset != tableImmediate)
-                return false;
+                { DbgImgPlan(4, pc, handle); return false; }
 
             if (tableHandle is null)
             {
@@ -638,7 +645,7 @@ public sealed partial class ResourceTracker
             }
             else if (!ReferenceEquals(read.Operands[0], tableHandle) || !_graph.Equivalent(read.Operands[1], offset!))
             {
-                return false;
+                { DbgImgPlan(5, pc, handle); return false; }
             }
 
             reads[dword] = read;
@@ -646,13 +653,13 @@ public sealed partial class ResourceTracker
         }
 
         if (tableHandle is null || offset is null || !TryGetRecordStride(offset, out var stride))
-            return false;
+            { DbgImgPlan(6, pc, handle); return false; }
 
         // Other consumers of the same words (a sampler or another image in the record) keep
         // the loads; they are ordinary buffer reads at the offset the shader computes.
         var suppressReads = reads.All(read => UsesOnly(read, [handle]));
         if (!MakeRuntimeBufferSource(tableHandle, pc, out var tableSourceIndex, out var tableSource))
-            return false;
+            { DbgImgPlan(7, pc, handle); return false; }
 
         var imageSource = new DescriptorSource
         {

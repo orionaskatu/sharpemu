@@ -401,7 +401,7 @@ public static partial class Gen5SpirvTranslator
                     var laneActive = Load(
                         _boolType,
                         _usesPixelValidMask ? _pixelValidMaskActive : _exec);
-                    if (DbgNoKillAddresses.Contains(_request.Program.Address)) // TEMP: keep every fragment
+                    if (DbgNoKillAll || DbgNoKillAddresses.Contains(_request.Program.Address)) // TEMP: keep every fragment
                     {
                         laneActive = _module.ConstantBool(true);
                     }
@@ -6616,6 +6616,19 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.CompositeConstruct,
                     output.Type,
                     values);
+                if (export.Target == 0 && output.Kind == Gen5PixelOutputKind.Float && (DbgPsColorAuto || DbgPsColors.ContainsKey(_request.Program.Address))) // TEMP: flat color per pixel shader
+                {
+                    var dbgColor = DbgPsColors.TryGetValue(_request.Program.Address, out var dbgFixed) ? dbgFixed : DbgAutoColor(_request.Program.Address);
+                    if (DbgPsColorAuto)
+                        Console.Error.WriteLine($"[DBG][PSCOLOR] ps=0x{_request.Program.Address:X} color={dbgColor:X6}");
+                    vector = _module.AddInstruction(
+                        SpirvOp.CompositeConstruct,
+                        output.Type,
+                        Float(((dbgColor >> 16) & 0xFF) / 255f),
+                        Float(((dbgColor >> 8) & 0xFF) / 255f),
+                        Float((dbgColor & 0xFF) / 255f),
+                        Float(1f));
+                }
                 if (output.Kind == Gen5PixelOutputKind.Float &&
                     PixelExportVgprAddressMatches() &&
                     uint.TryParse(
@@ -7417,6 +7430,36 @@ public static partial class Gen5SpirvTranslator
             }
         }
 
+        private static readonly bool DbgPsColorAuto = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_COLORS") == "auto"; // TEMP
+        private static uint DbgAutoColor(ulong address)
+        {
+            var hash = (uint)((address >> 8) * 2654435761UL >> 7);
+            var hue = (hash % 360) / 60.0;
+            var x = 1 - Math.Abs(hue % 2 - 1);
+            var (r, g, b) = (int)hue switch { 0 => (1.0, x, 0.0), 1 => (x, 1.0, 0.0), 2 => (0.0, 1.0, x), 3 => (0.0, x, 1.0), 4 => (x, 0.0, 1.0), _ => (1.0, 0.0, x) };
+            return ((uint)(r * 255) << 16) | ((uint)(g * 255) << 8) | (uint)(b * 255);
+        }
+
+        // TEMP: SHARPEMU_DBG_PS_COLORS=addr=RRGGBB,... makes those pixel programs export a flat color to target 0.
+        private static readonly Dictionary<ulong, uint> DbgPsColors = ParseDbgPsColors(Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_COLORS"));
+
+        private static Dictionary<ulong, uint> ParseDbgPsColors(string? text)
+        {
+            var result = new Dictionary<ulong, uint>();
+            foreach (var item in (text ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = item.Split('=');
+                if (parts.Length == 2 &&
+                    ulong.TryParse(parts[0].Replace("0x", ""), System.Globalization.NumberStyles.HexNumber, null, out var address) &&
+                    uint.TryParse(parts[1], System.Globalization.NumberStyles.HexNumber, null, out var color))
+                {
+                    result[address] = color;
+                }
+            }
+
+            return result;
+        }
+
         private bool PixelExportVgprAddressMatches()
         {
             var addressFilter = Environment.GetEnvironmentVariable(
@@ -7706,7 +7749,8 @@ public static partial class Gen5SpirvTranslator
             .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
 
         // TEMP: SHARPEMU_DBG_PS_NO_KILL=addr,... never kills fragments of those pixel programs.
-        private static readonly HashSet<ulong> DbgNoKillAddresses = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_NO_KILL") ?? "")
+        private static readonly bool DbgNoKillAll = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_NO_KILL") == "all";
+        private static readonly HashSet<ulong> DbgNoKillAddresses = DbgNoKillAll ? [] : (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PS_NO_KILL") ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
 
         // TEMP: SHARPEMU_DBG_FORCE_STORE=addr,... makes those programs store magenta through float image stores.

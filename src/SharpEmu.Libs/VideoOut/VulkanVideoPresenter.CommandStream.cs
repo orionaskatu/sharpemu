@@ -319,9 +319,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private readonly List<SharpEmu.HLE.GpuMemory.GuestSpan> _publications = new();
 
+        private static readonly bool DbgPublish = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH") != "0"; // TEMP
+        private static readonly string? DbgPublishMode = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH_MODE"); // TEMP
+
         public void PublishGpuResults()
         {
-            if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH") != "0") // TEMP
+            if (DbgPublish) // TEMP
             _imageCache.TakeScheduledPublications(_publications);
             if (_publications.Count != 0)
             {
@@ -332,7 +335,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     // downloads them once this work completes; the image is copied in after it.
                     if (_imageCache.CanPublishLinearImage(span.Address))
                     {
-                        var dbgMode = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PUBLISH_MODE"); // TEMP
+                        var dbgMode = DbgPublishMode; // TEMP
                         var (buffer, _) = _bufferCache.ObtainBuffer(span.Address, span.Size, isWritten: dbgMode != "copyonly");
                         if (dbgMode != "nocopy")
                         _ = _imageCache.PublishLinearImage(span.Address, buffer);
@@ -391,6 +394,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 0,
                 null);
         }
+
+        public void DebugFillBuffer(ulong address, ulong size, uint value) => FillBuffer(address, size, value, isGds: false); // TEMP
 
         public void FillBuffer(ulong address, ulong size, uint value, bool isGds)
         {

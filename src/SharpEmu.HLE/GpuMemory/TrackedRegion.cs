@@ -33,6 +33,7 @@ public sealed class TrackedRegion
         _writable.Fill();
         _readable.Fill();
         _summary?.Set(BaseAddress / BlockBytes, dirty: true);
+        _summary?.MarkPending(BaseAddress / BlockBytes);
     }
 
     public RegionLock Lock { get; } = new();
@@ -171,6 +172,12 @@ public sealed class TrackedRegion
         var (start, end) = GetPageRange(address, size);
         var upload = new PageMask(_cpuDirty, start, end);
         var cleared = preserveHotPages ? upload & ~_hotCpuWrites : upload;
+        if (preserveHotPages && (upload & _hotCpuWrites).Any)
+        {
+            // Hot pages stay dirty and writable, so later CPU writes to them do not fault.
+            _summary?.MarkPending(BaseAddress / BlockBytes);
+        }
+
         foreach (var (runStart, runEnd) in cleared)
         {
             visitCleared(BaseAddress + (ulong)runStart * PageBytes, (ulong)(runEnd - runStart) * PageBytes);
@@ -229,6 +236,11 @@ public sealed class TrackedRegion
     private void UpdateCpuProtection(bool track)
     {
         _summary?.Set(BaseAddress / BlockBytes, _cpuDirty.Any);
+        if ((_cpuDirty & ~_writable).Any)
+        {
+            _summary?.MarkPending(BaseAddress / BlockBytes);
+        }
+
         var mask = _cpuDirty ^ _writable;
         _writable = _cpuDirty;
         if (mask.None)

@@ -6200,6 +6200,24 @@ public static partial class KernelMemoryCompatExports
 
     // The guest mapping containing the address, for the GPU caches: a device-address fault
     // inside it registers part of that mapping rather than a single page.
+    // TEMP: the direct-memory offset behind a virtual address, for GPU alias diagnostics.
+    internal static bool DbgTryGetPhysical(ulong address, out ulong physical, out ulong regionStart, out ulong regionLength)
+    {
+        lock (_memoryGate)
+        {
+            if (TryFindVirtualQueryRegionLocked(address, findNext: false, out var region) && !region.IsReserved && region.IsDirect)
+            {
+                physical = region.DirectStart + (address - region.Address);
+                regionStart = region.Address;
+                regionLength = region.Length;
+                return true;
+            }
+        }
+
+        physical = regionStart = regionLength = 0;
+        return false;
+    }
+
     internal static bool TryGetMappedRange(ulong address, out ulong start, out ulong length)
     {
         lock (_memoryGate)

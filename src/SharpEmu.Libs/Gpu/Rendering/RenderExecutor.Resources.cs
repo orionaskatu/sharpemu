@@ -181,7 +181,16 @@ public sealed partial class RenderExecutor
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawResourcePreparation);
         var context = banks.Context;
         var vertexInput = state.Programs.VertexInput;
+        if (DbgSkipVertexHashes.Count != 0 && DbgSkipVertexHashes.Contains(vertexInput.Stage.Program?.Hash ?? 0)) // TEMP
+        {
+            return;
+        }
         var pixelInput = state.Programs.PixelInput;
+        if (state.PixelActive && SkippedPixelHashes.Count != 0 && SkippedPixelHashes.Contains(pixelInput.Stage.Program?.Hash ?? 0))
+        {
+            return;
+        }
+
         using var preparation = _host.BeginPreparation();
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
@@ -249,8 +258,25 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x200);
         }
 
-        if (emission.IndirectArgumentsAddress != 0 && _host.DebugCapturing) _host.DebugNote($"argsaddr=0x{emission.IndirectArgumentsAddress:X} submit={submitId} vs=0x{vertexInput.Stage.Program?.Hash ?? 0:X} {dbgArgsState} bound=0x{indirectArguments.Handle:X}+0x{indirectArguments.Offset:X}"); // TEMP
+        if (emission.IndirectArgumentsAddress != 0 && _host.DebugCapturing) _host.DebugNote($"argsaddr=0x{emission.IndirectArgumentsAddress:X} marker='{SharpEmu.Libs.Diagnostics.DbgSequence.Marker}' submit={submitId} vs=0x{vertexInput.Stage.Program?.Hash ?? 0:X} {dbgArgsState} bound=0x{indirectArguments.Handle:X}+0x{indirectArguments.Offset:X}"); // TEMP
+        if (_host.DebugCapturing) // TEMP: let captures snapshot the vertex stage's buffers by slot
+        {
+            var dbgBuffers = new (ulong, ulong)[vertexInput.Stage.Resources.Buffers.Length];
+            for (var index = 0; index < dbgBuffers.Length; index++)
+            {
+                if (vertexInput.Stage.Resources.Buffers[index].Length >= 4)
+                {
+                    var dbgDescriptor = BufferDescriptorWords.From(vertexInput.Stage.Resources.Buffers[index]);
+                    dbgBuffers[index] = (dbgDescriptor.Address, dbgDescriptor.Footprint() ?? 0);
+                }
+            }
+
+            _host.DebugSetDispatchBuffers(dbgBuffers);
+            _host.DebugSetDrawHash(vertexInput.Stage.Program?.Hash ?? 0);
+        }
+
         if (emission.IndirectArgumentsAddress != 0) _host.DebugCaptureIndirectArguments(indirectArguments); // TEMP
+        if (emission.IndirectArgumentsAddress != 0) _host.DebugReportArgsWriter(vertexInput.Stage.Program?.Hash ?? 0, emission.IndirectArgumentsAddress); // TEMP
         _host.BindVertexBuffers(vertexBuffers, vertexInput);
 
         if (pixelBindings is not null && setAutoDebug)
@@ -322,6 +348,22 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x700);
         }
     }
+
+    // Ghost of Yotei renders skin with screen-space subsurface scattering: the character meshes are redrawn into an
+    // irradiance buffer, blurred, and the composite pass replaces the deferred result of those pixels with the blurred
+    // irradiance alone. The blurred buffer carries no albedo (the albedo multiply is not reproduced yet), so skin
+    // turns white-gray up close. Skipping the passes keeps the deferred skin shading (what distant skin uses).
+    // SHARPEMU_SKIP_PS=off keeps them; a hash list overrides the default.
+    private static readonly HashSet<ulong> SkippedPixelHashes = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_PS") switch
+    {
+        null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL],
+        var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
+            .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
+    };
+
+    private static readonly HashSet<ulong> DbgSkipVertexHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") ?? "") // TEMP
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
 
     private const ulong IndexedIndirectArgumentsSize = 20;
     private const ulong IndirectArgumentsSize = 16;

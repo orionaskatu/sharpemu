@@ -156,6 +156,10 @@ public interface IRenderHost
     void DebugCopyBuffer(ulong address, ulong size, string label) { } // TEMP
     void DebugNote(string line) { } // TEMP
     string DebugBufferState(ulong address, ulong size) => ""; // TEMP
+    void DebugReportArgsWriter(ulong vertexHash, ulong argsAddress) { } // TEMP
+    void DebugFillBuffer(ulong address, ulong size, uint value) { } // TEMP
+    void DebugSetDispatchBuffers((ulong Address, ulong Size)[] buffers) { } // TEMP
+    void DebugSetDrawHash(ulong vertexHash) { } // TEMP
 
     void DrawIndexedIndirect(BufferBinding arguments) =>
         throw new NotSupportedException("The render host does not draw from indirect arguments.");

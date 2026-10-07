@@ -127,6 +127,23 @@ public sealed partial class GpuCommandInterpreter
             drawCount = Math.Min(ReadDword(countAddress), maxCountOrCount);
         }
 
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.Active) // TEMP
+            SharpEmu.Libs.Diagnostics.DbgSequence.Note($"mdi count={drawCount} max={maxCountOrCount} rt1=0x{TypedRegisters.Context.ColorTargets[1].BaseAddress:X}");
+        if (SharpEmu.Libs.Diagnostics.DbgTargetWatch.Enabled) // TEMP
+        {
+            var context = TypedRegisters.Context;
+            for (var slot = 0u; slot < 8; slot++)
+            {
+                var target = context.ColorTargets[slot];
+                if (!SharpEmu.Libs.Diagnostics.DbgTargetWatch.Addresses.Contains(target.BaseAddress))
+                    continue;
+                var dbgSlot = slot;
+                var dbgCount = drawCount;
+                SharpEmu.Libs.Diagnostics.DbgTargetWatch.Log($"mdi {slot} {target.BaseAddress:X} {drawCount == 0} {indexed}", () =>
+                    $"mdi slot={dbgSlot} base=0x{target.BaseAddress:X} slotMask=0x{context.RenderTargetMaskForSlot(dbgSlot):X} count={dbgCount} max={maxCountOrCount} countAddress=0x{countAddress:X} args=0x{DrawIndirectArgumentsBase + dataOffset:X} stride={strideInBytes} indexed={indexed} ps=0x{TypedRegisters.Shader.Pixel.Address:X} vs=0x{TypedRegisters.Shader.Vertex.ExportAddress:X}");
+            }
+        }
+
         if (drawCount == 0)
         {
             return;

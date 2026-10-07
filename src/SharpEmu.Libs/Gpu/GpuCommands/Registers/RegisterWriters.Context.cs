@@ -759,8 +759,12 @@ internal static partial class RegisterWriters
         }
     }
 
-    private static void BlendControlEntry(RegisterBanks banks, uint offset, uint value) =>
+    private static void BlendControlEntry(RegisterBanks banks, uint offset, uint value)
+    {
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.Active) // TEMP
+            SharpEmu.Libs.Diagnostics.DbgSequence.Note($"blend{offset - CbBlend0Control}=0x{value:X8}");
         banks.Context.BlendControls[offset - CbBlend0Control] = BlendRegisters.Decode(value);
+    }
 
     private static void DepthZInfoEntry(RegisterBanks banks, uint offset, uint value)
     {
@@ -810,6 +814,19 @@ internal static partial class RegisterWriters
     {
         ref var target = ref ColorTarget(banks, offset, CbColor0Base, ColorSlotStride);
         target = target with { BaseAddress = RegisterField.WithLowAddress(target.BaseAddress, value) };
+        if (Diagnostics.DbgSequence.Active && (offset - CbColor0Base) / ColorSlotStride <= 1) // TEMP
+            Diagnostics.DbgSequence.Note($"cb{(offset - CbColor0Base) / ColorSlotStride}base=0x{value:X8}");
+        if (Diagnostics.DbgTargetWatch.Enabled) // TEMP
+        {
+            foreach (var watch in Diagnostics.DbgTargetWatch.Addresses)
+            {
+                if ((uint)(watch >> 8) == value)
+                {
+                    var dbgOffset = offset;
+                    Diagnostics.DbgTargetWatch.Log($"cbbase {offset:X} {value:X}", () => $"cbbase-write reg=0x{dbgOffset:X} value=0x{value:X8} watch=0x{watch:X}");
+                }
+            }
+        }
     }
 
     private static void ColorBaseHighEntry(RegisterBanks banks, uint offset, uint value)

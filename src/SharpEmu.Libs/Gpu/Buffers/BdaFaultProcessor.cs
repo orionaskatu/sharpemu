@@ -280,8 +280,16 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             _writeDownloadBuffer.Invalidate(offset, PageFaultAreaSize);
             var written = MemoryMarshal.Cast<byte, ulong>(_writeDownloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
             var writtenCount = Math.Min((uint)written[0], MaxPageFaults - 1);
+            if (Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0) // TEMP
+            {
+                var dbgReported = (uint)written[0];
+                var dbgUsed = writtenCount;
+                Diagnostics.DbgTargetWatch.Log($"bdawrites {dbgUsed} {dbgReported > dbgUsed}", () => $"bdawrites reported={dbgReported} used={dbgUsed} truncated={dbgReported > dbgUsed}");
+            }
             for (var index = 1; index <= writtenCount; index++)
             {
+                if (Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0) // TEMP
+                    Diagnostics.DbgTargetWatch.CheckPhysical("devwrite", written[index], _pageSize, () => "");
                 _cache.NoteDeviceAddressWrite(written[index], _pageSize);
             }
 
@@ -296,6 +304,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 for (var index = 1; index <= Math.Min(count, 6u); index++) first.Append($" 0x{faults[(int)index]:X}");
                 Console.Error.WriteLine($"[DBG][BDAFAULT] pages={count} total={_dbgFaultPages} first={first}");
             }
+            for (var index = 1; index <= count && Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0; index++) // TEMP
+                Diagnostics.DbgTargetWatch.CheckPhysical("devfault", faults[(int)index], _pageSize, () => "");
             for (var index = 1; index <= count; index++)
             {
                 var insideMapping = KernelMemoryCompatExports.TryGetMappedRange(faults[index], out var mappingStart, out var mappingLength);

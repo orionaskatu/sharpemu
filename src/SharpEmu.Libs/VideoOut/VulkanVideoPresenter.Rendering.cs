@@ -906,6 +906,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
         {
+            CaptureSnapshotBuffersAtDraw(); // TEMP
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             var count = vertexCount;
@@ -929,6 +930,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
         {
+            CaptureSnapshotBuffersAtDraw(); // TEMP
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
@@ -946,6 +948,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndexedIndirect(BufferBinding arguments)
         {
+            CaptureSnapshotBuffersAtDraw(); // TEMP
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
@@ -964,10 +967,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         void IRenderHost.DrawIndirect(BufferBinding arguments)
         {
+            CaptureSnapshotBuffersAtDraw(); // TEMP
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
+            CaptureNoteIndirect(arguments); // TEMP
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
@@ -980,6 +985,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            CaptureSnapshotBuffersAt(); // TEMP
             _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
             if (DebugCapturing) DebugNote($"dispatch pass={_capturePass} cs=0x{_dbgComputeHash:X} groups={groupsX}x{groupsY}x{groupsZ}"); // TEMP
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
@@ -1005,6 +1011,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Size = 3u * sizeof(uint),
             };
             VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
+            CaptureSnapshotBuffersAt(); // TEMP
             _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
             if (DebugCapturing) { DebugNote($"dispatch pass={_capturePass} cs=0x{_dbgComputeHash:X} indirect=0x{argumentsAddress:X}"); DebugCaptureIndirectArguments(new BufferBinding(buffer.Handle.Handle, offset)); CaptureNoteIndirect(new BufferBinding(buffer.Handle.Handle, offset)); } // TEMP
             CaptureSnapshotStorage(command); // TEMP

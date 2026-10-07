@@ -147,6 +147,13 @@ public static class DepthTargetResolver
     // Null means no depth or stencil state is active for the draw.
     public static DepthTargetState? Resolve(ContextRegisters context, IImageFormatSupport device, Func<string, Exception> fatal)
     {
+        if (Diagnostics.DbgTargetWatch.Enabled) // TEMP
+        {
+            var dbgDepth = context.DepthTarget;
+            Diagnostics.DbgTargetWatch.Log($"depth {dbgDepth.ZWriteBase:X} {dbgDepth.ZReadBase:X} {dbgDepth.StencilWriteBase:X}", () =>
+                $"depth zwrite=0x{dbgDepth.ZWriteBase:X} zread=0x{dbgDepth.ZReadBase:X} stencil=0x{dbgDepth.StencilWriteBase:X} info=0x{dbgDepth.ZInfo:X8}");
+        }
+
         if (ImageRequestBuilders.DepthTarget(in context.DepthTarget, device) is not { } target)
         {
             return null;

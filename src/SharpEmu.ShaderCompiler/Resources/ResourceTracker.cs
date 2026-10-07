@@ -389,6 +389,38 @@ public sealed partial class ResourceTracker
             (_plan.ValidateRuntimeValue(dword) || DependsOnScalarBufferWord(dword))) &&
         handle.Operands.Any(DependsOnScalarBufferWord);
 
+    // Every buffer V# loaded by the shader from memory is read on the GPU at run time (the
+    // descriptors of GPU-driven indirect draws come from memory the GPU itself produces, so a
+    // host-side evaluation at record time reads stale words). The emulator switches it on at start-up
+    // (SHARPEMU_DEVICE_DESCRIPTORS=0 keeps the host evaluation); library users default to off.
+    public static bool ForceDeviceDescriptors { get; set; }
+
+    private static bool DependsOnScalarAddressWord(ScalarValue value)
+    {
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.ScalarAddressWord)
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
     private static bool DependsOnScalarBufferWord(ScalarValue value)
     {
         var pending = new Stack<ScalarValue>();
@@ -904,6 +936,20 @@ public sealed partial class ResourceTracker
 
         if (memory.PlanningOnly || IsIndirectPlanningMemory(index))
         {
+            return;
+        }
+
+        if (isBuffer && ForceDeviceDescriptors && memory.Kind == MemoryResourceKind.Buffer &&
+            access.Handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } deviceHandle &&
+            deviceHandle.Operands.All(dword => dword.Type == ScalarValueType.U32) &&
+            deviceHandle.Operands.Any(DependsOnScalarAddressWord) &&
+            !memory.Opcode.StartsWith("TBuffer", StringComparison.Ordinal) &&
+            !(memory.Formatted && memory.Access != MemoryAccess.Read))
+        {
+            // The shader reads its V# from memory itself; the access goes through the
+            // device-address table instead of a binding the CPU must build per draw.
+            memory.DeviceDescriptor = true;
+            _info.UsesDeviceAddresses = true;
             return;
         }
 

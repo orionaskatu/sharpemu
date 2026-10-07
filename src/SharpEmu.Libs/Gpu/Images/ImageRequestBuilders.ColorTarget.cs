@@ -84,8 +84,31 @@ public static partial class ImageRequestBuilders
     };
 
     // Builds the request for a bound color target. Null when the slot carries no target.
+    private static readonly bool DbgAllTargets = Environment.GetEnvironmentVariable("SHARPEMU_DBG_ALL_TARGETS") == "1"; // TEMP
+
     public static ColorTargetResolution? ColorTarget(in ColorTargetWords words, uint targetMask, uint drawLayerOffset, bool ignoreTargetMask)
     {
+        if (DbgAllTargets && words.BaseAddress != 0) // TEMP
+        {
+            var copy = words;
+            Diagnostics.DbgTargetWatch.Log($"all {copy.BaseAddress:X} {copy.Info:X} {copy.Attrib2:X} {targetMask:X}", () =>
+                $"anytarget base=0x{copy.BaseAddress:X} info=0x{copy.Info:X8} fmt={(copy.Info >> 2) & 0x1F} num={(copy.Info >> 8) & 7} size={copy.Width + 1}x{copy.Height + 1} mask=0x{targetMask:X} view=0x{copy.View:X8}");
+        }
+        if (Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0 && words.BaseAddress != 0) // TEMP
+        {
+            var copy = words;
+            Diagnostics.DbgTargetWatch.CheckPhysical("target", copy.BaseAddress, (ulong)(copy.Width + 1) * (copy.Height + 1) * 4,
+                () => $"info=0x{copy.Info:X8} size={copy.Width + 1}x{copy.Height + 1} mask=0x{targetMask:X}");
+        }
+        if (Diagnostics.DbgTargetWatch.Enabled && Diagnostics.DbgTargetWatch.Addresses.Contains(words.BaseAddress)) // TEMP
+        {
+            var copy = words;
+            if (copy.DccAddress != 0) lock (Diagnostics.DbgTargetWatch.MetadataAddresses) Diagnostics.DbgTargetWatch.MetadataAddresses.Add(copy.DccAddress);
+            if (copy.CmaskAddress != 0) lock (Diagnostics.DbgTargetWatch.MetadataAddresses) Diagnostics.DbgTargetWatch.MetadataAddresses.Add(copy.CmaskAddress);
+            Diagnostics.DbgTargetWatch.Log($"bind {copy.BaseAddress:X} {copy.Info:X} {copy.DccAddress:X} {copy.ClearWord0:X} {copy.DccControl:X} {copy.Attrib2:X}", () =>
+                $"bind target=0x{copy.BaseAddress:X} info=0x{copy.Info:X8} dcc={copy.DccEnabled} dccAddr=0x{copy.DccAddress:X} fastClear={copy.FastClear} cmask=0x{copy.CmaskAddress:X} clear0=0x{copy.ClearWord0:X8} dccControl=0x{copy.DccControl:X8} mask=0x{targetMask:X} size={copy.Width + 1}x{copy.Height + 1} tile={copy.TileMode} attrib=0x{copy.Attrib:X8} view=0x{copy.View:X8}");
+        }
+
         var mask = targetMask & 0xF;
         if (ignoreTargetMask && words.BaseAddress != 0 && mask == 0)
         {

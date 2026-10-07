@@ -288,6 +288,21 @@ public sealed partial class GpuCommandInterpreter
             }
 
             var payload = ReadPayload(cursorIndex, packetAddress, length - 1);
+            if (SharpEmu.Libs.Diagnostics.DbgTargetWatch.RawWatch.Length != 0) // TEMP: any packet dword equal to a watched value
+            {
+                for (var dbgIndex = 0; dbgIndex < payload.Length; dbgIndex++)
+                {
+                    if (Array.IndexOf(SharpEmu.Libs.Diagnostics.DbgTargetWatch.RawWatch, payload[dbgIndex]) >= 0)
+                    {
+                        var dbgHeader = header;
+                        var dbgPayload = payload.ToArray();
+                        var dbgAt = dbgIndex;
+                        SharpEmu.Libs.Diagnostics.DbgTargetWatch.Log($"raw {opcode:X} {dbgIndex} {payload[dbgIndex]:X}", () =>
+                            $"rawpacket opcode=0x{opcode:X2} header=0x{dbgHeader:X8} index={dbgAt} payload=[{string.Join(",", dbgPayload.Take(14).Select(w => w.ToString("X8")))}] addr=0x{packetAddress:X}");
+                    }
+                }
+            }
+
             var packet = new PacketContext(header & ~1u, packetAddress, offset, remaining, total);
             var consumed = handler(this, in packet, payload) + 1;
             if (consumed > remaining)
