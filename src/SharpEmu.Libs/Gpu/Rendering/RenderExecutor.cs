@@ -150,6 +150,7 @@ public sealed partial class RenderExecutor
 
     // Reads the indirect arguments now and draws from them, as the interpreter would have.
     private static int _dbgCpuArgs; // TEMP
+    private static int _dbgGrassLogs2; // TEMP
     private void DrawIndexedWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
         if (_dbgCpuArgs++ % 50 == 0) Console.Error.WriteLine($"[DBG][CPUARGS] gpuok={CanDrawIndirectOnGpu(banks, in arguments)} prim={banks.UserConfig.PrimitiveType} index={arguments.IndexTypeAndSize} reset={banks.UserConfig.PrimitiveResetControl} resetIndex=0x{banks.Context.PrimitiveResetIndex:X} count=0x{arguments.IndexCount:X} addr=0x{arguments.IndexAddress:X}"); // TEMP
@@ -177,6 +178,8 @@ public sealed partial class RenderExecutor
             UnboundedIndexBuffer = false,
         };
         DbgWatchSlots(banks, "cpuargs", resolved.IndexCount, resolved.InstanceCount); // TEMP
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.Marker.Contains("Grass") && System.Threading.Interlocked.Increment(ref _dbgGrassLogs2) <= 120) // TEMP
+            Console.Error.WriteLine($"[DBG][GRASSCPU] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} marker={SharpEmu.Libs.Diagnostics.DbgSequence.Marker} addr=0x{arguments.IndirectArgumentsAddress:X} words={string.Join(",", words.ToArray().Select(w => w.ToString("X")))} index=0x{resolved.IndexAddress:X}");
         if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
         {
             _host.ResetBindings();

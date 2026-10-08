@@ -102,6 +102,8 @@ public static partial class Gen5SpirvTranslator
                 return;
             }
 
+            if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_STRUCT_REASON") == "1") // TEMP
+                Console.Error.WriteLine($"[DBG][STRUCT] dispatcher fallback hash=0x{_request.Hash:X16} blocks={blocks.Count} reason={reason}");
 
         }
 

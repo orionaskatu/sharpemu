@@ -217,6 +217,8 @@ public sealed partial class RenderExecutor
     }
 
     // Binds everything the draw needs inside one preparation scope, then records it.
+    private static int _dbgGrassLogs; // TEMP
+    private static int _dbgHogLogs; // TEMP
     private void RecordDraw(
         ulong submitId,
         RegisterBanks banks,
@@ -238,6 +240,14 @@ public sealed partial class RenderExecutor
         }
 
         Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
+        if (!emission.Indexed && (draw.Count == 16293 || draw.Count == 216 || draw.Count == 2898) && System.Threading.Interlocked.Increment(ref _dbgHogLogs) % 25 == 1) // TEMP
+            Console.Error.WriteLine($"[DBG][HOG] vs=0x{vertexInput.Stage.Program?.Hash:X} ps=0x{state.Programs.PixelInput.Stage.Program?.Hash:X} pixelActive={state.PixelActive} colors={state.ColorCount} depth={state.Depth.HasTarget} count={draw.Count} indexed={emission.Indexed} instances={draw.InstanceCount} marker={Diagnostics.DbgSequence.Marker}");
+        if (emission.IndirectArgumentsAddress != 0 && Diagnostics.DbgSequence.Marker.Contains("Grass") && System.Threading.Interlocked.Increment(ref _dbgGrassLogs) <= 120) // TEMP
+        {
+            var dbgBytes = new byte[20];
+            var dbgOk = _host.TryReadGuest(emission.IndirectArgumentsAddress, dbgBytes);
+            Console.Error.WriteLine($"[DBG][GRASSARGS] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} marker={Diagnostics.DbgSequence.Marker} indexed={emission.Indexed} addr=0x{emission.IndirectArgumentsAddress:X} vs=0x{vertexInput.Stage.Program?.Hash ?? 0:X} read={dbgOk} words={string.Join(",", Enumerable.Range(0, 5).Select(i => BitConverter.ToUInt32(dbgBytes, i * 4).ToString("X")))}");
+        }
         if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
         {
             return;
