@@ -28,18 +28,79 @@ internal static class DbgSequence
             .Select(parts => (double.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture), parts[2].Split('|'))).ToArray();
 
     // Innermost PUSH marker name of the current command stream (tracked only while capturing or sequencing).
-    public static readonly bool TrackMarkers = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_FRAME_DIR") is { Length: > 0 } || At >= 0 || FogOff || SkipSchedule.Length != 0;
+    public static readonly bool TrackMarkers = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_FRAME_DIR") is { Length: > 0 } || Environment.GetEnvironmentVariable("SHARPEMU_DBG_TALLY") == "1" || At >= 0 || FogOff || SkipSchedule.Length != 0;
 
     [ThreadStatic] private static List<string>? _markers;
     public static string Marker => _markers is { Count: > 0 } ? string.Join("/", _markers.Skip(Math.Max(0, _markers.Count - 2))) : "";
-    public static void PushMarker(string text) => (_markers ??= []).Add(text);
-    public static void PopMarker() { if (_markers is { Count: > 0 }) _markers.RemoveAt(_markers.Count - 1); }
+    // Particle simulation (emit, update, sort, ribbons, wind) runs on one frame out of SHARPEMU_PARTICLE_EVERY (default 4; 1 = every
+    // frame): the many tiny dispatches cost far more than their GPU work. Skipped frames reuse the previous particle buffers.
+    private static readonly int ParticleEvery = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PARTICLE_EVERY"), out var every) ? Math.Max(1, every) : 4;
+    private static readonly string[] ParticleSimMarkers = ["Particle Update", "Particle Emit", "Particle No Deps", "Particle Sort", "Particle Ribbon",
+        "Particle Post-Update", "ParticleWind", "Particle Wait For Velocity", "Particle CS Frame"];
+    private static int _frames;
+
+    public static void PushMarker(string text)
+    {
+        (_markers ??= []).Add(text);
+        if (text == "Frame") Interlocked.Increment(ref _frames);
+        if (TallyOn) { lock (Tallies) { var key = "P " + text; Tallies.TryGetValue(key, out var entry); Tallies[key] = (entry.Count + 1, entry.Ticks); } }
+    }
+    public static void PopMarker()
+    {
+        if (TallyOn) { lock (Tallies) { var key = "P- " + (_markers is { Count: > 0 } ? _markers[^1] : "(empty)"); Tallies.TryGetValue(key, out var entry); Tallies[key] = (entry.Count + 1, entry.Ticks); } }
+        if (_markers is { Count: > 0 }) _markers.RemoveAt(_markers.Count - 1);
+    }
+
+    // TEMP: SHARPEMU_DBG_TALLY=1 counts draws and dispatches per shader (and per innermost marker) and attributes the wall time
+    // between consecutive ops to the earlier one; printed every 10 s.
+    public static readonly bool TallyOn = Environment.GetEnvironmentVariable("SHARPEMU_DBG_TALLY") == "1";
+    private static readonly Dictionary<string, (long Count, long Ticks)> Tallies = [];
+    private static long _tallyNext;
+    [ThreadStatic] private static string? _tallyPrev;
+    [ThreadStatic] private static long _tallyPrevAt;
+
+    public static void Tally(string kind, ulong hash)
+    {
+        if (!TallyOn) return;
+        var now = Stopwatch.GetTimestamp();
+        var marker = _markers is { Count: > 0 } ? _markers[^1] : "";
+        lock (Tallies)
+        {
+            if (_tallyPrev is not null && now - _tallyPrevAt < Stopwatch.Frequency / 4)
+                foreach (var key in _tallyPrev.Split('|'))
+                {
+                    Tallies.TryGetValue(key, out var entry);
+                    Tallies[key] = (entry.Count, entry.Ticks + now - _tallyPrevAt);
+                }
+
+            _tallyPrev = $"{kind} {hash:X16}|M {marker}|X {kind} {hash:X16} {marker}";
+            _tallyPrevAt = now;
+            foreach (var key in _tallyPrev.Split('|'))
+            {
+                Tallies.TryGetValue(key, out var entry);
+                Tallies[key] = (entry.Count + 1, entry.Ticks);
+            }
+
+            if (now < _tallyNext) return;
+            var first = _tallyNext == 0;
+            _tallyNext = now + 10 * Stopwatch.Frequency;
+            if (!first)
+            {
+                Console.Error.WriteLine($"[DBG][TALLY] t={Stopwatch.GetElapsedTime(Start).TotalSeconds:F0} by wall time (ms, count)");
+                foreach (var pair in Tallies.OrderByDescending(pair => pair.Key.StartsWith("P") ? long.MaxValue : pair.Value.Ticks).Take(700))
+                    Console.Error.WriteLine($"[DBG][TALLY]   {pair.Value.Ticks * 1000 / Stopwatch.Frequency,7}ms {pair.Value.Count,7} {pair.Key}");
+            }
+
+            Tallies.Clear();
+        }
+    }
 
     public static bool SkipByMarker
     {
         get
         {
             if (_markers is not { Count: > 0 }) return false;
+            if (ParticleEvery > 1 && (Volatile.Read(ref _frames) % ParticleEvery) != 0 && Array.IndexOf(ParticleSimMarkers, _markers[^1]) >= 0) return true;
             if (FogOff)
             {
                 foreach (var marker in _markers)

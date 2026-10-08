@@ -224,6 +224,7 @@ public sealed partial class RenderExecutor
         }
 
         if (DbgSkipHashes.Contains(program.Hash) || Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_ALL_CS") == "1" || (DbgRunOnly.Count != 0 && !DbgRunOnly.Contains(program.Hash))) return; // TEMP
+        Diagnostics.DbgSequence.Tally("CS", program.Hash); // TEMP
         if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
         {
             _host.ResetBindings();

@@ -66,6 +66,8 @@ public sealed unsafe partial class GuestImageCache
         return true;
     }
 
+    private static readonly HashSet<ulong> DbgNoClear = [.. (Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_DCC_CLEAR") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).Select(item => Convert.ToUInt64(item, 16))]; // TEMP
+
     // True when registered DCC absorbed the fill and the guest dispatch can be skipped.
     public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
     {
@@ -74,6 +76,8 @@ public sealed unsafe partial class GuestImageCache
             bool watched; lock (Diagnostics.DbgTargetWatch.MetadataAddresses) watched = Diagnostics.DbgTargetWatch.MetadataAddresses.Contains(address);
             Diagnostics.DbgTargetWatch.Log($"fill {address:X} {size:X} {fillValue:X}", () => $"dccfill address=0x{address:X} size=0x{size:X} value=0x{fillValue:X8} watchedMetadata={watched} known={_surfaceMetadata.ContainsKey(address)}");
         }
+
+        if (DbgNoClear.Contains(address)) return true; // TEMP
 
         if (!IsValidRange(address, size))
         {

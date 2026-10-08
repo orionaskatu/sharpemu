@@ -216,6 +216,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
         if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
         {
             return;
