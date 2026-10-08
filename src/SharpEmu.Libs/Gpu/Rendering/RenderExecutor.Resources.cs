@@ -4,6 +4,7 @@
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 
@@ -24,6 +25,26 @@ public sealed partial class RenderExecutor
     }
 
     private readonly record struct PreparedIndexBuffer(BufferBinding Binding, ulong Size, IndexType Type);
+
+    private void PrepareDrawBufferAllocations(VertexInputInfo vertexInput, in IndexSource index, ulong indirectAddress)
+    {
+        if (vertexInput.Buffers.Length > VertexInputInfo.MaxBuffers)
+            throw _host.Fatal($"The vertex input has too many buffers: count={vertexInput.Buffers.Length} max={VertexInputInfo.MaxBuffers}.");
+        Span<GuestSpan> ranges = stackalloc GuestSpan[VertexInputInfo.MaxBuffers + 2];
+        var count = 0;
+        foreach (var vertex in vertexInput.Buffers)
+        {
+            if (vertex.Size == 0) continue;
+            if (vertex.Address == 0 || vertex.Size > ulong.MaxValue - vertex.Address)
+                throw _host.Fatal($"The vertex buffer range is invalid: address=0x{vertex.Address:X16} size=0x{vertex.Size:X16}.");
+            ranges[count++] = new GuestSpan(vertex.Address, _host.ClampMappedSize(vertex.Address, vertex.Size));
+        }
+        if (index.Enabled && index.HostData is null)
+            ranges[count++] = new GuestSpan(index.Address, index.Size);
+        if (indirectAddress != 0)
+            ranges[count++] = new GuestSpan(indirectAddress, IndexedIndirectArgumentsSize);
+        _host.PrepareBufferAllocations(ranges[..count]);
+    }
 
     // Merges the vertex ranges, obtains one host buffer per merged range and offsets every slot into it.
     private BufferBinding[] AcquireVertexBuffers(VertexInputInfo vertexInput)
@@ -196,6 +217,8 @@ public sealed partial class RenderExecutor
     }
 
     // Binds everything the draw needs inside one preparation scope, then records it.
+    private static int _dbgGrassLogs; // TEMP
+    private static int _dbgHogLogs; // TEMP
     private void RecordDraw(
         ulong submitId,
         RegisterBanks banks,
@@ -217,6 +240,14 @@ public sealed partial class RenderExecutor
         }
 
         Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
+        if (!emission.Indexed && (draw.Count == 16293 || draw.Count == 216 || draw.Count == 2898) && System.Threading.Interlocked.Increment(ref _dbgHogLogs) % 25 == 1) // TEMP
+            Console.Error.WriteLine($"[DBG][HOG] vs=0x{vertexInput.Stage.Program?.Hash:X} ps=0x{state.Programs.PixelInput.Stage.Program?.Hash:X} pixelActive={state.PixelActive} colors={state.ColorCount} depth={state.Depth.HasTarget} count={draw.Count} indexed={emission.Indexed} instances={draw.InstanceCount} marker={Diagnostics.DbgSequence.Marker}");
+        if (emission.IndirectArgumentsAddress != 0 && Diagnostics.DbgSequence.Marker.Contains("Grass") && System.Threading.Interlocked.Increment(ref _dbgGrassLogs) <= 120) // TEMP
+        {
+            var dbgBytes = new byte[20];
+            var dbgOk = _host.TryReadGuest(emission.IndirectArgumentsAddress, dbgBytes);
+            Console.Error.WriteLine($"[DBG][GRASSARGS] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} marker={Diagnostics.DbgSequence.Marker} indexed={emission.Indexed} addr=0x{emission.IndirectArgumentsAddress:X} vs=0x{vertexInput.Stage.Program?.Hash ?? 0:X} read={dbgOk} words={string.Join(",", Enumerable.Range(0, 5).Select(i => BitConverter.ToUInt32(dbgBytes, i * 4).ToString("X")))}");
+        }
         if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
         {
             return;
@@ -237,8 +268,13 @@ public sealed partial class RenderExecutor
         IPreparedBindings? pixelBindings;
         try
         {
-            vertexBindings = PrepareBindings(vertexInput.Stage);
-            pixelBindings = state.PixelActive ? PrepareBindings(pixelInput.Stage) : null;
+            // The pixel program reads its position in host texels; the attachments say how
+            // many of those one guest pixel covers.
+            var attachmentScale = AttachmentRenderScale(in state);
+            vertexBindings = PrepareBindings(vertexInput.Stage with { AttachmentRenderScale = attachmentScale });
+            pixelBindings = state.PixelActive
+                ? PrepareBindings(pixelInput.Stage with { AttachmentRenderScale = attachmentScale })
+                : null;
         }
         catch (DrawImageTypeMismatchException rejection)
         {
@@ -257,6 +293,11 @@ public sealed partial class RenderExecutor
         }
         var vertexProgram = vertexInput.Stage.Program ?? throw _host.Fatal("The vertex stage has no program.");
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
+        DropUnwrittenColorTargets(context, ref state, pixelProgram);
+        state.Rendering = AcquireAttachments(ref state, context);
+        // Attachment uploads can submit work. Finish every allocation merge before any
+        // shader descriptor, vertex binding or index binding takes a buffer handle.
+        PrepareDrawBufferAllocations(vertexInput, in indexSource, emission.IndirectArgumentsAddress);
         if (vertexProgram.UsesDeviceAddresses || (pixelProgram?.UsesDeviceAddresses ?? false))
         {
             _host.PrepareDeviceAddresses();
@@ -272,10 +313,8 @@ public sealed partial class RenderExecutor
         var indexBuffer = AcquireIndexBuffer(in indexSource);
         var dbgArgsState = emission.IndirectArgumentsAddress != 0 && _host.DebugCapturing ? _host.DebugBufferState(emission.IndirectArgumentsAddress, emission.Indexed ? IndexedIndirectArgumentsSize : IndirectArgumentsSize) : ""; // TEMP
         var indirectArguments = emission.IndirectArgumentsAddress != 0
-            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, emission.Indexed ? IndexedIndirectArgumentsSize : IndirectArgumentsSize, isWritten: false)
+            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, emission.Indexed ? IndexedIndirectArgumentsSize : AutoIndirectArgumentsSize, isWritten: false)
             : default;
-        DropUnwrittenColorTargets(context, ref state, pixelProgram);
-        state.Rendering = AcquireAttachments(ref state);
         // Nothing after the pipeline touches guest memory.
         var pipeline = _pipelines.CreateGraphicsPipeline(
             BoundColors(ref state),
@@ -349,6 +388,7 @@ public sealed partial class RenderExecutor
             _host.PrepareMemoryWritingDraw();
         }
 
+        _host.PrepareGraphicsPipeline(in pipeline);
         _host.BeginRendering(in state.Rendering);
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (setAutoDebug)
@@ -356,7 +396,11 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x500);
         }
 
-        if (emission.IndirectArgumentsAddress != 0)
+        if (state.Programs.Tessellation is not null)
+        {
+            _host.Draw(draw.Count, 1, 0, 0);
+        }
+        else if (emission.IndirectArgumentsAddress != 0)
         {
             // Uploads and shader writes end with barriers to all commands, so the
             // indirect read sees them.
@@ -381,7 +425,7 @@ public sealed partial class RenderExecutor
         var writeStages = PipelineStageFlags.None;
         if (HasBufferWrites(vertexInput.Stage))
         {
-            writeStages |= PipelineStageFlags.VertexShaderBit;
+            writeStages |= vertexInput.Tessellation is null ? PipelineStageFlags.VertexShaderBit : PipelineStageFlags.TessellationEvaluationShaderBit;
         }
 
         if (state.PixelActive && HasBufferWrites(pixelInput.Stage))
@@ -455,14 +499,23 @@ public sealed partial class RenderExecutor
 
     private static readonly HashSet<ulong> SkippedPixelHashes = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_PS") switch
     {
-        null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL],
+        // The first six are the skin subsurface composites (white skin); F23F7E7F... is the grass pixel shader, whose
+        // waterfall loop hangs the GPU (device lost) on the first frame with grass.
+        null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL,
+            0xF23F7E7F30362713UL],
         var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
     };
 
-    private static readonly HashSet<ulong> DbgSkipVertexHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") ?? "") // TEMP
-        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+    // The water deferred draws (vertex shader 4D314AF5...) take 5 s of GPU time per frame (pixel shader 459074A8...), so they
+    // are skipped by default; SHARPEMU_DBG_SKIP_VS=off draws them.
+    private static readonly HashSet<ulong> DbgSkipVertexHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") switch
+    {
+        null => [0x4D314AF535375953UL],
+        var text => text.Split(',', StringSplitOptions.RemoveEmptyEntries).Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
+            .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet(),
+    };
 
     private const ulong IndexedIndirectArgumentsSize = 20;
     private const ulong IndirectArgumentsSize = 16;

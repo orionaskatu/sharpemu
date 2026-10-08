@@ -408,7 +408,7 @@ public static partial class KernelMemoryCompatExports
             {
                 _insideMappingTransaction = false;
             }
-        });
+        }, () => onlyAddsOutsideGpuMemory?.Invoke() != true);
         return result;
     }
 

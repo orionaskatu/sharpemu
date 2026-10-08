@@ -7,6 +7,7 @@ using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.VideoOut;
+using SharpEmu.ShaderCompiler;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
 
@@ -49,11 +50,10 @@ public sealed partial class RenderExecutor
         (stages & ~VgtShaderStagesWaveSizeBits) is 0x02002000 or 0x00002000 or 0x00002030;
     private const uint MaxOutputPerSubgroupLimit = 0x40;
     private static int _geometryWarningShown;
-    private static int _dbgTessDraws; // TEMP
+    private static int _tessellationWarningShown;
 
     private readonly IRenderHost _host;
     private readonly IShaderPipelineProvider _pipelines;
-    private readonly HashSet<(ulong, ulong, ulong)> _dumpedUnsupportedPrograms = [];
     private readonly bool _strictDrawResources;
     private readonly HashSet<(ulong ShaderHash, ImageType ImageType, ImageViewType ViewType)> _reportedDrawImageTypeMismatches = [];
 
@@ -150,6 +150,7 @@ public sealed partial class RenderExecutor
 
     // Reads the indirect arguments now and draws from them, as the interpreter would have.
     private static int _dbgCpuArgs; // TEMP
+    private static int _dbgGrassLogs2; // TEMP
     private void DrawIndexedWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
         if (_dbgCpuArgs++ % 50 == 0) Console.Error.WriteLine($"[DBG][CPUARGS] gpuok={CanDrawIndirectOnGpu(banks, in arguments)} prim={banks.UserConfig.PrimitiveType} index={arguments.IndexTypeAndSize} reset={banks.UserConfig.PrimitiveResetControl} resetIndex=0x{banks.Context.PrimitiveResetIndex:X} count=0x{arguments.IndexCount:X} addr=0x{arguments.IndexAddress:X}"); // TEMP
@@ -177,6 +178,8 @@ public sealed partial class RenderExecutor
             UnboundedIndexBuffer = false,
         };
         DbgWatchSlots(banks, "cpuargs", resolved.IndexCount, resolved.InstanceCount); // TEMP
+        if (SharpEmu.Libs.Diagnostics.DbgSequence.Marker.Contains("Grass") && System.Threading.Interlocked.Increment(ref _dbgGrassLogs2) <= 120) // TEMP
+            Console.Error.WriteLine($"[DBG][GRASSCPU] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} marker={SharpEmu.Libs.Diagnostics.DbgSequence.Marker} addr=0x{arguments.IndirectArgumentsAddress:X} words={string.Join(",", words.ToArray().Select(w => w.ToString("X")))} index=0x{resolved.IndexAddress:X}");
         if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
         {
             _host.ResetBindings();
@@ -259,11 +262,18 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        if (Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages))
+        {
+            if (IsSupportedTessellation(banks))
+            {
+                DrawTessellationIndexed(submitId, banks, arguments);
+            }
+
+            return;
+        }
         if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
         {
             DbgDrawStats.Record(banks.Context.ShaderStages, !HasValidVertexShader(shader) ? "no-vs" : "unsupported"); // TEMP
-            if (Interlocked.Increment(ref _dbgTessDraws) <= 60) // TEMP
-                Console.Error.WriteLine($"[DBG][TESS] count={arguments.IndexCount} instances={arguments.InstanceCount} index=0x{arguments.IndexAddress:X} type=0x{arguments.IndexTypeAndSize:X} baseVertex={arguments.BaseVertex} firstInstance={arguments.FirstInstance} prim=0x{userConfig.PrimitiveType:X} hsUserAddr=0x{shader.Vertex.HullUserDataAddress:X} gsUserAddr=0x{shader.Vertex.GeometryUserDataAddress:X} hsUser=[{string.Join(',', Enumerable.Range(0, 14).Select(i => $"0x{shader.Vertex.HullUserScalars.Values[i]:X}"))}]");
             return;
         }
         DbgDrawStats.Record(banks.Context.ShaderStages, "ok"); // TEMP
@@ -374,32 +384,38 @@ public sealed partial class RenderExecutor
         DrawAutoCore(submitId, banks, in arguments);
     }
 
-    // Only list and strip topologies draw unchanged from counts the GPU reads; rectangle and
-    // quad lists pick their host draws from the vertex count.
+    // Fans, polygons and legacy rectangle/quad lists are drawn from their vertex counts, so
+    // those read the indirect arguments on the CPU, as merged tessellation does: it counts its
+    // patches from the vertex count. Rectangle lists draw through the host's general
+    // rectangle-list variant, as indexed indirect draws do.
     private static bool CanDrawAutoIndirectOnGpu(RegisterBanks banks) =>
-        (GuestPrimitiveType)banks.UserConfig.PrimitiveType is GuestPrimitiveType.PointList or GuestPrimitiveType.LineList or
-            GuestPrimitiveType.LineStrip or GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleFan or
-            GuestPrimitiveType.TriangleStrip or GuestPrimitiveType.Polygon;
+        !Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages) &&
+        (GuestPrimitiveType)banks.UserConfig.PrimitiveType is
+            GuestPrimitiveType.PointList or GuestPrimitiveType.LineList or GuestPrimitiveType.LineStrip or
+            GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleStrip or GuestPrimitiveType.RectangleList;
 
-    // Reads the indirect arguments now and draws from them, as the interpreter would have.
     private void DrawAutoWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
     {
-        Span<byte> bytes = stackalloc byte[16];
+
+        Span<byte> bytes = stackalloc byte[(int)AutoIndirectArgumentsSize];
         if (!_host.TryReadGuest(arguments.IndirectArgumentsAddress, bytes))
         {
             throw _host.Fatal($"The indirect draw arguments are unreadable: address=0x{arguments.IndirectArgumentsAddress:X16}.");
         }
 
         var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
-        DrawAutoCore(submitId, banks, arguments with
+        var resolved = arguments with
         {
             VertexCount = words[0],
             InstanceCount = words[1],
             FirstVertex = words[2],
             FirstInstance = words[3],
             IndirectArgumentsAddress = 0,
-        });
+        };
+        DrawAutoCore(submitId, banks, in resolved);
     }
+
+    private const ulong AutoIndirectArgumentsSize = 16;
 
     private void DrawAutoCore(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
     {
@@ -430,20 +446,20 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (HasValidVertexShader(shader) && IsTessellationStageMask(banks.Context.ShaderStages))
+        if (Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages))
         {
-            DbgDrawStats.Record(banks.Context.ShaderStages, "tessellated"); // TEMP
-            ValidateDrawRegisters(banks);
-            if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_TESS") != "1") // TEMP
-                DrawTessellated(submitId, banks, arguments.VertexCount, arguments.InstanceCount, arguments.FirstVertex);
+            var tessellationVertexOffset = unchecked((int)arguments.FirstVertex +
+                (arguments.OffsetSource == DrawOffsetSource.IndirectArguments ? 0 : (int)banks.UserConfig.IndexOffset));
+            if (IsSupportedTessellation(banks))
+            {
+                DrawTessellation(submitId, banks, arguments.VertexCount, arguments.InstanceCount, 0, 0, tessellationVertexOffset, arguments.FirstInstance);
+            }
+
             return;
         }
-
         if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
         {
             DbgDrawStats.Record(banks.Context.ShaderStages, !HasValidVertexShader(shader) ? "no-vs" : "unsupported"); // TEMP
-            if (Interlocked.Increment(ref _dbgTessDraws) <= 60) // TEMP
-                Console.Error.WriteLine($"[DBG][TESS] auto count={arguments.VertexCount} instances={arguments.InstanceCount} firstVertex={arguments.FirstVertex} firstInstance={arguments.FirstInstance} prim=0x{userConfig.PrimitiveType:X} hsUser=[{string.Join(',', Enumerable.Range(0, 14).Select(i => $"0x{shader.Vertex.HullUserScalars.Values[i]:X}"))}] gsUser=[{string.Join(',', Enumerable.Range(0, 30).Select(i => $"0x{shader.Vertex.GeometryUserScalars.Values[i]:X}"))}]");
             return;
         }
         DbgDrawStats.Record(banks.Context.ShaderStages, "ok"); // TEMP
@@ -476,6 +492,13 @@ public sealed partial class RenderExecutor
         {
             TraceDrawDisposition(banks, in draw, "no-primitive-topology");
             _host.ResetBindings();
+            return;
+        }
+
+        if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
+        {
+            // A targetless draw may be retained and replayed later; it needs its counts.
+            DrawAutoWithCpuArguments(submitId, banks, in arguments);
             return;
         }
 
@@ -612,6 +635,31 @@ public sealed partial class RenderExecutor
     private static bool IsKnownGeometryOutputPrimitiveType(uint value) => value <= 4;
 
     // Only the plain vertex path and the primitive-shader vertex path with default geometry state run.
+    // A tessellation configuration the bridge cannot express skips the draw, as an
+    // unsupported geometry stage does, instead of stopping the emulator.
+    private static bool IsSupportedTessellation(RegisterBanks banks)
+    {
+        var shaderInterface = banks.Context.ShaderInterface;
+        string? error = null;
+        if (!Gen5TessellationInfo.TryDecode(shaderInterface.TessellationFactorParameter, out var tessellation, out var factorError))
+            error = factorError;
+        else if (tessellation.Spacing == Gen5TessellationSpacing.PowerOfTwo)
+            error = "power-of-two partitioning needs factor conversion";
+        else if (!Gen5TessellationHullInfo.TryDecode(shaderInterface.LocalHullConfiguration, 0, out _, out var hullError))
+            error = hullError;
+        if (error is null)
+            return true;
+
+        if (Interlocked.Exchange(ref _tessellationWarningShown, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"Warning: the title uses an unsupported tessellation configuration; those draw calls are skipped. {error} " +
+                $"tf_param=0x{shaderInterface.TessellationFactorParameter:X8} ls_hs_config=0x{shaderInterface.LocalHullConfiguration:X8}");
+        }
+
+        return false;
+    }
+
     private bool IsUnsupportedGeometryStage(RegisterBanks banks)
     {
         var context = banks.Context;
@@ -632,68 +680,6 @@ public sealed partial class RenderExecutor
         if (!unsupportedStageMask && !unsupportedGeometryStage && !geometryRegisters)
         {
             return false;
-        }
-
-        var dumpDirectory = Environment.GetEnvironmentVariable("SHARPEMU_UNSUPPORTED_SHADER_DUMP_DIR");
-        if (!string.IsNullOrEmpty(dumpDirectory) && _dumpedUnsupportedPrograms.Add((vertex.LocalAddress, vertex.HullAddress, vertex.ExportAddress)))
-        {
-            Directory.CreateDirectory(dumpDirectory);
-            var prefix = Path.Combine(dumpDirectory, $"{stages:X8}-{vertex.HullAddress:X16}-{vertex.ExportAddress:X16}");
-            File.WriteAllText(prefix + ".json", System.Text.Json.JsonSerializer.Serialize(new { Stages = stages, Vertex = vertex, Interface = shaderInterface },
-                new System.Text.Json.JsonSerializerOptions { IncludeFields = true, WriteIndented = true }));
-            for (var slot = 0; slot + 1 < (int)vertex.HullUserScalars.Count; slot++) // TEMP
-            {
-                var candidate = vertex.HullUserScalars.Values[slot] | ((ulong)vertex.HullUserScalars.Values[slot + 1] << 32);
-                if ((candidate >> 32) != 0x80) continue;
-                var code = new byte[0x4000];
-                if (_host.TryReadGuest(candidate, code)) File.WriteAllBytes(prefix + $".hsuser{slot}-{candidate:X}.bin", code);
-            }
-
-            if (vertex.HullUserDataAddress != 0)
-            {
-                var hullCode = new byte[0x4000];
-                if (_host.TryReadGuest(vertex.HullUserDataAddress, hullCode)) File.WriteAllBytes(prefix + ".hulldata.bin", hullCode);
-            }
-
-            foreach (var (label, address) in new[] { ("local", vertex.LocalAddress), ("hull", vertex.HullAddress), ("export", vertex.ExportAddress) })
-            {
-                if (address == 0) continue;
-                if (_pipelines is Pipelines.ShaderPipelineCache shaderCache)
-                {
-                    var registered = shaderCache.ResolveRegisteredShader(address);
-                    File.WriteAllText(prefix + "." + label + ".registered.json", System.Text.Json.JsonSerializer.Serialize(registered));
-                    if (registered.IsFused)
-                    {
-                        var continuation = new byte[registered.ContinuationSizeBytes];
-                        if (_host.TryReadGuest(registered.ContinuationAddress, continuation))
-                            File.WriteAllBytes(prefix + "." + label + ".continuation.bin", continuation);
-                    }
-                }
-                var headerAddress = Agc.AgcExports.GetShaderHeaderAddress(address);
-                var header = new byte[128];
-                if (headerAddress != 0 && _host.TryReadGuest(headerAddress, header))
-                {
-                    File.WriteAllBytes(prefix + "." + label + ".header.bin", header);
-                    if (label == "local")
-                    {
-                        foreach (var region in new[] { headerAddress & ~0xFFFFUL, address > 0x100000 ? (address - 0x100000) & ~0xFFFFUL : address })
-                        {
-                            for (ulong offset = 0; offset < 0x200000; offset += 0x10000)
-                            {
-                                var bytes = new byte[0x10000];
-                                if (_host.TryReadGuest(region + offset, bytes))
-                                    File.WriteAllBytes(prefix + $".region-{region + offset:X16}.bin", bytes);
-                            }
-                        }
-                    }
-                    var size = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0x44));
-                    if (size > 0 && size <= 1024 * 1024)
-                    {
-                        var code = new byte[size];
-                        if (_host.TryReadGuest(address, code)) File.WriteAllBytes(prefix + "." + label + ".bin", code);
-                    }
-                }
-            }
         }
 
         if (Interlocked.Exchange(ref _geometryWarningShown, 1) == 0)
@@ -734,7 +720,8 @@ public sealed partial class RenderExecutor
     {
         var context = banks.Context;
         var shaderInterface = context.ShaderInterface;
-        var hasColorOutput = (context.RenderTargetMask & shaderInterface.ColorShaderMask) != 0;
+        var hasColorOutput = context.ColorControl.Mode != 0 &&
+                             (context.RenderTargetMask & shaderInterface.ColorShaderMask) != 0;
         return banks.Shader.Pixel.Address != 0 && (hasColorOutput || PixelShaderHasDepthOrCoverageSideEffects(shaderInterface));
     }
 

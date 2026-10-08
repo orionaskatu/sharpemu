@@ -3,7 +3,6 @@
 
 namespace SharpEmu.Libs.VideoOut;
 
-using System.Diagnostics;
 using SharpEmu.HLE.GpuMemory;
 using System.Diagnostics;
 using SharpEmu.Libs.Gpu;
@@ -54,7 +53,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public ulong ProfilePixelHash;
             public ulong ProfileComputeHash;
 
-            public bool RectangleList => Description is { StaticParameters.Topology: PrimitiveTopology.PatchList };
+            public bool RectangleList => Description is { Tessellation: null, StaticParameters.Topology: PrimitiveTopology.PatchList };
         }
 
         private readonly Dictionary<ulong, ShaderModule> _shaderModules = new();
@@ -71,6 +70,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private uint _maxUpdateAfterBindSampledImages = uint.MaxValue;
         private uint _maxUpdateAfterBindStorageImages = uint.MaxValue;
         private uint _maxUpdateAfterBindDescriptors = uint.MaxValue;
+        private uint _maxPerStageSamplers = uint.MaxValue;
+        private uint _maxPerStageUpdateAfterBindSamplers = uint.MaxValue;
+        private uint _maxUpdateAfterBindSamplers = uint.MaxValue;
         private SampleCountFlags _noAttachmentSampleCounts;
         private DescriptorHeap _descriptorHeap = null!;
         private BindlessImageHeap? _bindlessImageHeap;
@@ -86,7 +88,6 @@ internal static unsafe partial class VulkanVideoPresenter
         private const uint RdnaSubgroupSize = 32;
 
         // Pipeline creations at least this slow are logged; cached ones take well under 1 ms.
-        private const double SlowPipelineMilliseconds = 500;
         private bool _canRequireComputeSubgroup32;
         private uint _maxComputeWorkgroupSubgroups;
 
@@ -108,56 +109,29 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.UsesBindlessImages => BindlessImageHeapEnabled;
         // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
         bool IShaderPipelineHost.ExecGuardElisionEnabled => _physicalDeviceVendorId != NvidiaVendorId;
+
+        bool IShaderPipelineHost.SupportsDualSourceBlend => _supportsDualSourceBlend;
         bool IShaderPipelineHost.PerVertexPixelInputsSupported => _supportsPerVertexPixelInputs;
         bool IShaderPipelineHost.ClipDistanceEnabled => _supportsShaderClipDistance;
+        private bool _postDepthCoverageEnabled;
+        bool IShaderPipelineHost.PostDepthCoverageSupported => _postDepthCoverageEnabled;
+        public bool NativeTwoSampleMixedSupported => _supportsNativeTwoSampleMixed;
+
+        bool IShaderPipelineHost.NativeHalfConversionExact => NativeHalfConversionExact;
+
+        bool IShaderPipelineHost.ZeroOutOfBoundsBufferReads => ZeroOutOfBoundsBufferReads;
 
         RenderHostLimits IShaderPipelineHost.Limits => _renderHostLimits;
 
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
 
-        private readonly record struct PageHistory(ulong Contents, int Streak, int SinceConfirm);
-        private readonly Dictionary<ulong, PageHistory> _pageHistory = new();
-        private static readonly bool SpeculateReads = Environment.GetEnvironmentVariable("SHARPEMU_SPECULATE_READS") == "1";
-        private const int SpeculationStreak = 4;
-        private const int SpeculationInterval = 8;
-
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
-        // TEMP: SHARPEMU_DBG_SYNC_ZERO_READS=1 waits for the GPU and registers its device-address writes before
-        // accepting a zero word, to test whether zero descriptors are GPU writes the CPU has not seen yet.
-        private static readonly bool DbgSyncZeroReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SYNC_ZERO_READS") == "1";
-        private bool _dbgInZeroSync;
-        private static long _dbgZeroSyncs, _dbgZeroSyncChanged;
-
         public bool TryReadGuestWord(ulong address, out uint word)
-        {
-            var ok = TryReadGuestWordCore(address, out word);
-            if (DbgSyncZeroReads && ok && word == 0 && !_dbgInZeroSync && _bufferCache.DbgFaultProcessPending)
-            {
-                _dbgInZeroSync = true;
-                try
-                {
-                    FlushAndWait();
-                    _bufferCache.ProcessPendingFaultBuffer();
-                    ok = TryReadGuestWordCore(address, out word);
-                    var count = Interlocked.Increment(ref _dbgZeroSyncs);
-                    if (word != 0 && Interlocked.Increment(ref _dbgZeroSyncChanged) <= 20)
-                        Console.Error.WriteLine($"[DBG][ZEROSYNC] address=0x{address:X} became 0x{word:X} after the GPU settled (syncs={count})");
-                }
-                finally
-                {
-                    _dbgInZeroSync = false;
-                }
-            }
-
-            return ok;
-        }
-
-        private bool TryReadGuestWordCore(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
             var synchronized = false;
-            if (IsCleanReadPage(address, sizeof(uint)))
+            if (IsCleanReadPage(address, sizeof(uint), clean: false))
             {
                 if (TryGetAliasPointer(address, sizeof(uint), out var alias))
                 {
@@ -184,47 +158,17 @@ internal static unsafe partial class VulkanVideoPresenter
                         Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
                     }
 
-                    // Opt-in experiment (SHARPEMU_SPECULATE_READS=1): a page the GPU keeps rewriting with the
-                    // same contents costs a full GPU wait per read. One that held its contents across several
-                    // waits is read as last synchronized, and a real read confirms it every few uses, so a
-                    // change shows up within a few draws.
-                    if (SpeculateReads && _pageHistory.TryGetValue(address >> 7, out var history) &&
-                        history.Streak >= SpeculationStreak && history.SinceConfirm < SpeculationInterval)
+                    if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                            SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
                     {
-                        _pageHistory[address >> 7] = history with { SinceConfirm = history.SinceConfirm + 1 };
+                        return false;
                     }
-                    else
-                    {
-                        var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
-                        if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                                SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
-                        {
-                            return false;
-                        }
 
-                        if (Diagnostics.DbgReadbackStats.Enabled) // TEMP
-                            Diagnostics.DbgReadbackStats.Record(address, System.Diagnostics.Stopwatch.GetElapsedTime(dbgStart).TotalMilliseconds);
-                        synchronized = true;
-                        if (SpeculateReads)
-                        {
-                            var pageBytes = new byte[128];
-                            if (_guestMemory.TryRead(address & ~0x7Ful, pageBytes))
-                            {
-                                var contents = System.IO.Hashing.XxHash3.HashToUInt64(pageBytes);
-                                _pageHistory[address >> 7] = _pageHistory.TryGetValue(address >> 7, out var previous) && previous.Contents == contents
-                                    ? new PageHistory(contents, previous.Streak + 1, 0)
-                                    : new PageHistory(contents, 0, 0);
-                                if (_pageHistory.Count > 16384)
-                                {
-                                    _pageHistory.Clear();
-                                }
-                            }
-                        }
-                    }
+                    synchronized = true;
                 }
                 else
                 {
-                    NoteCleanReadPage(address, sizeof(uint));
+                    NoteCleanReadPage(address, sizeof(uint), clean: false);
                 }
             }
 
@@ -243,53 +187,34 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
-        private static readonly bool DbgNoTablePatches = Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_TABLE_PATCHES") == "1"; // TEMP
-
         public bool IsGpuPendingGuestWord(ulong address) =>
-            !DbgNoTablePatches && _bufferCache.IsGpuOwnedWord(address) && !_imageCache.HasGpuModifiedImageBytes(address, sizeof(uint));
+            _bufferCache.IsGpuOwnedWord(address) && !_imageCache.HasGpuModifiedImageBytes(address, sizeof(uint));
 
         // A mapping query only: nothing is read, so nothing the GPU wrote is synchronized.
         public bool IsGuestMapped(ulong address) => _guestMemory.CanRead(address, sizeof(uint));
 
         // Refused while a GPU buffer or image write may still own the range.
-        // Ownership of a 256-byte granule, checked once and shared by the clean reads of one
-        // materialization: nothing is recorded to the GPU in between, so a granule that held no
-        // GPU-owned bytes still holds none.
-        private const ulong CleanGranuleBytes = 256;
-        private const int CleanGranuleSlots = 256;
-        private static readonly bool CleanGranuleCache = Environment.GetEnvironmentVariable("SHARPEMU_CLEAN_GRANULES") != "0";
-        private readonly ulong[] _cleanGranuleTags = new ulong[CleanGranuleSlots];
-        private readonly long[] _cleanGranuleSessions = new long[CleanGranuleSlots];
-        private long _cleanReadSession = 1;
-
-        private bool _materializationSessionsBegun;
-
-        // Reads outside a materialization session (nothing announced one) keep the exact per-word checks.
-        public void BeginMaterializationSession()
-        {
-            _cleanReadSession++;
-            _materializationSessionsBegun = true;
-        }
-
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
-            var granule = address / CleanGranuleBytes;
-            var granuleSlot = (int)(granule & (CleanGranuleSlots - 1));
-            var granuleAligned = (address & (sizeof(uint) - 1)) == 0 && CleanGranuleCache && _materializationSessionsBegun;
-            if (granuleAligned && _cleanGranuleTags[granuleSlot] == granule + 1 && _cleanGranuleSessions[granuleSlot] == _cleanReadSession)
+            if (!_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) && IsCleanReadPage(address, sizeof(uint), clean: true))
             {
-                Span<byte> cached = stackalloc byte[sizeof(uint)];
-                if (!_guestMemory.TryRead(address, cached))
+                if (TryGetAliasPointer(address, sizeof(uint), out var alias))
                 {
-                    return false;
+                    word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
+                    return true;
                 }
 
-                word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cached);
-                return true;
+                Span<byte> resident = stackalloc byte[sizeof(uint)];
+                if (_guestMemory.TryRead(address, resident))
+                {
+                    word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(resident);
+                    return true;
+                }
             }
 
+            CleanReadVerifications++;
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
@@ -298,18 +223,22 @@ internal static unsafe partial class VulkanVideoPresenter
             // A word a previous GPU pass wrote is read once that pass's bytes are back in guest
             // memory, as the command processor would see them: an image's contents go through
             // its buffer view first, then the buffer comes back to guest memory.
-            foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+            if (_imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
             {
-                _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+                foreach (var (imageAddress, imageSize) in _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)))
+                {
+                    _ = _bufferCache.ObtainBuffer(imageAddress, imageSize, isWritten: false, isTexelBuffer: true);
+                }
             }
 
-            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
+            if (_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) || _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
             {
                 _ = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint));
             }
 
-            if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
-                _imageCache.UnsynchronizedGpuImageRanges(address, sizeof(uint)).Count != 0)
+            if ((_bufferCache.MayHaveGpuDirtyPages(address, sizeof(uint)) && _bufferCache.HasGpuDirtyPages(address, sizeof(uint))) ||
+                _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) ||
+                _imageCache.HasUnsynchronizedGpuImage(address, sizeof(uint)))
             {
                 return false;
             }
@@ -320,18 +249,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
+            NoteCleanReadPage(address, sizeof(uint), clean: true);
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
-            if (granuleAligned)
-            {
-                var start = granule * CleanGranuleBytes;
-                if (_guestMemory.CanRead(start, CleanGranuleBytes) && !_bufferCache.HasGpuDirtyBytes(start, CleanGranuleBytes) &&
-                    _imageCache.UnsynchronizedGpuImageRanges(start, CleanGranuleBytes).Count == 0)
-                {
-                    _cleanGranuleTags[granuleSlot] = granule + 1;
-                    _cleanGranuleSessions[granuleSlot] = _cleanReadSession;
-                }
-            }
-
             return true;
         }
 
@@ -339,16 +258,28 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
-            if (clean || !IsCleanReadPage(address, size))
+            if (!_guestMemory.CanRead(address, size))
             {
+                return false;
+            }
+
+            if (_bufferCache.HasGpuDirtyPages(address, size) || !IsCleanReadPage(address, size, clean))
+            {
+                CleanReadVerifications++;
                 if (!_guestMemory.CanRead(address, size) ||
                     _bufferCache.HasGpuDirtyBytes(address, size) ||
-                    (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+                    (clean && _imageCache.HasGpuModifiedImageBytes(address, size)))
                 {
                     return false;
                 }
 
-                NoteCleanReadPage(address, size);
+                // GPU ownership is tracked in bytes, but protection covers whole pages.
+                // Read disjoint CPU-owned bytes through the backing alias so a protected
+                // guest view cannot trigger a download of neighboring GPU-owned bytes.
+                if (clean && _bufferCache.HasGpuDirtyPages(address, size))
+                    return _guestBacking.TryReadBacking(address, destination);
+
+                NoteCleanReadPage(address, size, clean);
             }
 
             if (TryGetAliasPointer(address, size, out var alias))
@@ -359,6 +290,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             return _guestMemory.TryRead(address, destination);
         }
+
+        bool IRenderHost.TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
+            TryReadResidentGuestBytes(address, destination, clean: true);
 
         private const ulong CleanReadPageBytes = 0x1000;
         private const int CleanReadPageSlots = 64;
@@ -371,7 +305,13 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly long[] Versions = new long[CleanReadPageSlots];
             public readonly ulong[] Aliases = new ulong[CleanReadPageSlots];
             public readonly object?[] Snapshots = new object?[CleanReadPageSlots];
+            // A clean read also needs no GPU-dirty page and no GPU-modified image over the page.
+            public readonly bool[] CleanVerified = new bool[CleanReadPageSlots];
+            public readonly long[] ImageVersions = new long[CleanReadPageSlots];
         }
+
+        // Resident reads that had to check GPU ownership instead of trusting a verified page.
+        internal long CleanReadVerifications { get; private set; }
 
         private bool TryGetAliasPointer(ulong address, ulong size, out byte* pointer)
         {
@@ -405,24 +345,30 @@ internal static unsafe partial class VulkanVideoPresenter
             return size != 0 && address + size > address && ((address + size - 1) & ~(CleanReadPageBytes - 1)) == page;
         }
 
-        private bool IsCleanReadPage(ulong address, ulong size) =>
+        private bool IsCleanReadPage(ulong address, ulong size, bool clean) =>
             _cleanReadPages is { } pages &&
             TryGetCleanReadPage(address, size, out var page, out var slot) &&
             pages.Tags[slot] == page + 1 &&
-            pages.Versions[slot] == _bufferCache.GpuModifiedVersion;
+            pages.Versions[slot] == _bufferCache.GpuModifiedVersion &&
+            (!clean || (pages.CleanVerified[slot] && pages.ImageVersions[slot] == CachedImage.GpuWriteVersion));
 
-        private void NoteCleanReadPage(ulong address, ulong size)
+        private void NoteCleanReadPage(ulong address, ulong size, bool clean)
         {
             if (!TryGetCleanReadPage(address, size, out var page, out var slot))
             {
                 return;
             }
 
+            // Read the versions first: a change during the checks then invalidates the entry.
             var version = _bufferCache.GpuModifiedVersion;
+            var imageVersion = CachedImage.GpuWriteVersion;
             if (!_guestMemory.CanRead(page, CleanReadPageBytes) || _bufferCache.HasGpuDirtyBytes(page, CleanReadPageBytes))
             {
                 return;
             }
+
+            var cleanVerified = clean && !_bufferCache.HasGpuDirtyPages(page, CleanReadPageBytes) &&
+                !_imageCache.HasGpuModifiedImageBytes(page, CleanReadPageBytes);
 
             var pages = _cleanReadPages ??= new CleanReadPages();
             if (pages.Tags[slot] != page + 1)
@@ -430,13 +376,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 pages.Tags[slot] = page + 1;
                 pages.Aliases[slot] = 0;
                 pages.Snapshots[slot] = null;
+                pages.CleanVerified[slot] = false;
+            }
+
+            if (pages.Versions[slot] != version)
+            {
+                pages.CleanVerified[slot] = false;
             }
 
             pages.Versions[slot] = version;
+            if (cleanVerified)
+            {
+                pages.CleanVerified[slot] = true;
+                pages.ImageVersions[slot] = imageVersion;
+            }
         }
-
-        bool IRenderHost.TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
-            TryReadResidentGuestBytes(address, destination, clean: true);
 
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {
@@ -458,7 +412,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // The Metal shader compiler can spend seconds on one translated program and the
         // command stream cannot advance while it does, so a slow creation is reported with
         // the SPIR-V size that produced it.
-        private const long SlowPipelineCreationMilliseconds = 250;
+        private const long SlowPipelineCreationMilliseconds = 500;
 
         private int SpirvBytesOf(ulong moduleHandle) =>
             _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
@@ -672,26 +626,32 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private void EnsureBindlessImageHeap(params ShaderProgramInfo?[] programs) =>
-            EnsureBindlessImageHeap(programs.Any(program => program?.Bindings?.UsesBindlessImages == true));
+        private void EnsureBindlessImageHeap(params ShaderProgramInfo?[] programs)
+            => EnsureBindlessImageHeapForMode(programs.Any(program => program?.Bindings?.UsesBindlessImages == true));
 
-        private void EnsureBindlessImageHeap(bool needed)
+        private void EnsureBindlessImageHeapForMode(bool usesBindlessImages)
         {
-            if (_bindlessImageHeap is not null || !needed)
+            if (_bindlessImageHeap is not null)
             {
                 return;
             }
 
-            _bindlessImageHeap = new BindlessImageHeap(
-                _deviceInfo,
-                _scheduler,
+            if (!usesBindlessImages)
+            {
+                return;
+            }
+
+            _bindlessImageHeap = new BindlessImageHeap(_deviceInfo, _scheduler, new BindlessImageHeap.Limits(
                 _maxPerStageSampledImages,
                 _maxPerStageStorageImages,
+                _maxPerStageSamplers,
                 _maxPerStageUpdateAfterBindSampledImages,
                 _maxPerStageUpdateAfterBindStorageImages,
+                _maxPerStageUpdateAfterBindSamplers,
                 _maxUpdateAfterBindSampledImages,
                 _maxUpdateAfterBindStorageImages,
-                _maxUpdateAfterBindDescriptors);
+                _maxUpdateAfterBindSamplers,
+                _maxUpdateAfterBindDescriptors));
             _imageCache.BindlessImageInvalidator = _bindlessImageHeap.InvalidateViews;
             _bindlessImageHeap.SetDefaultSampler(_samplerStore.GetSampler(new SamplerDescriptorWords(stackalloc uint[4]), integerView: false));
         }
@@ -779,7 +739,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 description.PixelStage?.Bindings?.UsesBindlessImages == true;
 
             var bindings = new List<DescriptorSetLayoutBinding>();
-            CollectLayoutBindings(bindings, description.VertexStage, ShaderStage.Vertex);
+            CollectLayoutBindings(bindings, description.VertexStage,
+                description.Tessellation is null ? ShaderStage.Vertex : ShaderStage.TessellationEvaluation);
+            if (description.Tessellation is not null)
+            {
+                var dataBinding = BindingLayout.NativeBindingIndex(ShaderStage.TessellationEvaluation, DescriptorBindingKind.ShaderData);
+                var index = bindings.FindIndex(binding => binding.Binding == dataBinding);
+                if (index < 0) throw SubmissionScheduler.Fatal("The tessellation pipeline has no runtime data binding.");
+                var binding = bindings[index];
+                binding.StageFlags |= ShaderStageFlags.TessellationControlBit;
+                bindings[index] = binding;
+            }
             if (description.PixelStage is { } pixelStage)
             {
                 CollectLayoutBindings(bindings, pixelStage, ShaderStage.Pixel);
@@ -790,7 +760,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SetLayout = setLayout,
                 Demand = demand,
-                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, usesBindlessImages),
+                Layout = CreatePipelineLayout(setLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit |
+                    (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit), usesBindlessImages),
                 UsesPushDescriptors = usesPushDescriptors,
                 UsesBindlessImages = usesBindlessImages,
                 Description = description,
@@ -946,7 +917,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
             {
-                var shaderStages = stackalloc PipelineShaderStageCreateInfo[2];
+                var shaderStages = stackalloc PipelineShaderStageCreateInfo[4];
                 var stageCount = 1u;
                 shaderStages[0] = new PipelineShaderStageCreateInfo
                 {
@@ -955,6 +926,29 @@ internal static unsafe partial class VulkanVideoPresenter
                     Module = vertexModule,
                     PName = entryPoint,
                 };
+                var tessellationState = new PipelineTessellationStateCreateInfo
+                {
+                    SType = StructureType.PipelineTessellationStateCreateInfo,
+                    PatchControlPoints = description.Tessellation?.InputControlPoints ?? 0,
+                };
+                if (description.Tessellation is { } tessellation)
+                {
+                    if (topology != PrimitiveTopology.PatchList || tessellation.InputControlPoints is 0 or > 32 ||
+                        tessellation.Control.Module == 0 || tessellation.Evaluation.Module == 0)
+                        throw SubmissionScheduler.Fatal("Invalid native tessellation pipeline stages or patch size.");
+                    shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationControlBit,
+                        Module = new ShaderModule(tessellation.Control.Module), PName = entryPoint,
+                    };
+                    shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.TessellationEvaluationBit,
+                        Module = new ShaderModule(tessellation.Evaluation.Module), PName = entryPoint,
+                    };
+                }
                 if (pixelModule.Handle != 0)
                 {
                     shaderStages[stageCount++] = new PipelineShaderStageCreateInfo
@@ -993,19 +987,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     };
                 }
 
-                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_BLEND_MUL") is { } dbgMul && dbgMul.Contains($"{description.PixelStage?.Hash ?? 0:X16}") && colorCount > 0) // TEMP
-                {
-                    blends[0].BlendEnable = true;
-                    blends[0].SrcColorBlendFactor = BlendFactor.DstColor;
-                    blends[0].DstColorBlendFactor = BlendFactor.Zero;
-                    blends[0].ColorBlendOp = BlendOp.Add;
-                }
-
                 var colorFormats = new Format[colorCount];
                 Array.Copy(rendering.ColorFormats, colorFormats, colorCount);
-                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PIPE_PS") is { } dbgPs && (dbgPs == "ALL" || dbgPs.Contains($"{description.PixelStage?.Hash ?? 0:X16}"))) // TEMP
-                    for (var index = 0; index < colorCount; index++)
-                        Console.Error.WriteLine($"[DBG][PIPE] ps=0x{description.PixelStage?.Hash ?? 0:X16} att={index} fmt={colorFormats[index]} mask={blends[index].ColorWriteMask} blend={blends[index].BlendEnable.Value} src={blends[index].SrcColorBlendFactor} dst={blends[index].DstColorBlendFactor} op={blends[index].ColorBlendOp} asrc={blends[index].SrcAlphaBlendFactor} adst={blends[index].DstAlphaBlendFactor}");
                 var cullMode = CullModeFlags.None;
                 if (parameters.CullBack)
                 {
@@ -1062,9 +1045,42 @@ internal static unsafe partial class VulkanVideoPresenter
                         FrontFace = parameters.FrontFaceClockwise ? FrontFace.Clockwise : FrontFace.CounterClockwise,
                         LineWidth = 1,
                     };
+                    var nativeMixed = _supportsNativeTwoSampleMixed &&
+                        parameters.Samples == 2 && rendering.DepthSamples == 2 && colorCount > 0 &&
+                        rendering.ColorSamples.Take(colorCount).All(count => count == 1);
+                    var coverageReduction = new PipelineCoverageReductionStateCreateInfoNV
+                    {
+                        SType = StructureType.PipelineCoverageReductionStateCreateInfoNV,
+                        CoverageReductionMode = CoverageReductionModeNV.TruncateNV,
+                    };
+                    var sampleLocationsEnabled = _supportsNativeTwoSampleMixed && parameters.Samples == 2;
+                    var sampleLocations = stackalloc SampleLocationEXT[8];
+                    for (var pixel = 0; pixel < 4; pixel++)
+                        for (var sample = 0; sample < 2; sample++)
+                        {
+                            var word = rendering.SampleLocationWords[pixel * 4] >> (sample * 8);
+                            var x = (int)(word << 28) >> 28;
+                            var y = (int)(word << 24) >> 28;
+                            sampleLocations[pixel * 2 + sample] = new SampleLocationEXT((x + 8) / 16f, (y + 8) / 16f);
+                        }
+                    var sampleLocationState = new PipelineSampleLocationsStateCreateInfoEXT
+                    {
+                        SType = StructureType.PipelineSampleLocationsStateCreateInfoExt,
+                        PNext = nativeMixed ? &coverageReduction : null,
+                        SampleLocationsEnable = true,
+                        SampleLocationsInfo = new SampleLocationsInfoEXT
+                        {
+                            SType = StructureType.SampleLocationsInfoExt,
+                            SampleLocationsPerPixel = SampleCountFlags.Count2Bit,
+                            SampleLocationGridSize = new Extent2D(2, 2),
+                            SampleLocationsCount = 8,
+                            PSampleLocations = sampleLocations,
+                        },
+                    };
                     var multisample = new PipelineMultisampleStateCreateInfo
                     {
                         SType = StructureType.PipelineMultisampleStateCreateInfo,
+                        PNext = sampleLocationsEnabled ? &sampleLocationState : (nativeMixed ? &coverageReduction : null),
                         SampleShadingEnable = parameters.SampleShadingEnable,
                         RasterizationSamples = ImageDescription.VulkanSampleCount(parameters.Samples),
                         MinSampleShading = 1f,
@@ -1100,7 +1116,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     dynamicStates[10] = DynamicState.StencilWriteMask;
                     dynamicStates[11] = DynamicState.BlendConstants;
                     var dynamicStateCount = 12u;
-                    if (depthStencil.DepthBoundsTestEnable)
+                    if (_supportsDepthBounds)
                     {
                         dynamicStates[dynamicStateCount++] = DynamicState.DepthBounds;
                     }
@@ -1125,14 +1141,26 @@ internal static unsafe partial class VulkanVideoPresenter
                         DepthAttachmentFormat = rendering.DepthFormat,
                         StencilAttachmentFormat = rendering.StencilFormat,
                     };
+                    var colorSampleCounts = stackalloc SampleCountFlags[8];
+                    for (var index = 0; index < colorCount; index++)
+                        colorSampleCounts[index] = ImageDescription.VulkanSampleCount(rendering.ColorSamples[index]);
+                    var attachmentSampleCounts = new AttachmentSampleCountInfoNV
+                    {
+                        SType = StructureType.AttachmentSampleCountInfoNV,
+                        PNext = &renderingInfo,
+                        ColorAttachmentCount = (uint)colorCount,
+                        PColorAttachmentSamples = colorSampleCounts,
+                        DepthStencilAttachmentSamples = ImageDescription.VulkanSampleCount(rendering.DepthSamples == 0 ? 1 : rendering.DepthSamples),
+                    };
                     var pipelineInfo = new GraphicsPipelineCreateInfo
                     {
                         SType = StructureType.GraphicsPipelineCreateInfo,
-                        PNext = &renderingInfo,
+                        PNext = nativeMixed ? &attachmentSampleCounts : &renderingInfo,
                         StageCount = stageCount,
                         PStages = shaderStages,
                         PVertexInputState = &vertexInput,
                         PInputAssemblyState = &inputAssembly,
+                        PTessellationState = description.Tessellation is null ? null : &tessellationState,
                         PViewportState = &viewportState,
                         PRasterizationState = &rasterization,
                         PMultisampleState = &multisample,
@@ -1247,7 +1275,6 @@ internal static unsafe partial class VulkanVideoPresenter
             public required PipelineLayout Layout;
             public required DescriptorSetDemand Demand;
             public required bool UsesPushDescriptors;
-            public required bool UsesBindlessImages;
             public required bool RequiresSubgroup32;
             public required ulong Hash;
             public required int SpirvBytes;
@@ -1304,7 +1331,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     SetLayout = pending.SetLayout,
                     Demand = pending.Demand,
                     UsesPushDescriptors = pending.UsesPushDescriptors,
-                    UsesBindlessImages = pending.UsesBindlessImages,
+                    UsesBindlessImages = description.Stage.Bindings!.UsesBindlessImages,
                     ProfileComputeHash = pending.Hash,
                 });
                 return true;
@@ -1331,7 +1358,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 Layout = layout,
                 Demand = demand,
                 UsesPushDescriptors = usesPushDescriptors,
-                UsesBindlessImages = description.Stage.Bindings!.UsesBindlessImages,
                 RequiresSubgroup32 = RequiresComputeSubgroup32(description.Input),
                 Hash = description.Stage.Hash,
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),

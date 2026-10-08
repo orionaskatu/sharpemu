@@ -308,6 +308,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
+        // A compute shader indexes a storage image in guest pixels and its dispatch grid does
+        // not shrink with the host resolution, so a scaled image would be written with holes
+        // (upscale) or redundantly (downscale). Such memory drops back to guest resolution.
+        if (result.IsValid && request.ShaderWrite && _slots[result].IsScaled)
+        {
+            result = ReplaceScaled(result);
+        }
+
         if (!result.IsValid)
         {
             result = InsertImage(request.Description);
@@ -399,6 +407,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             throw SubmissionScheduler.Fatal($"A texture must be found again before its view is acquired: address=0x{image.Description.Data.Address:X16} registered={image.Registered} proxy={image.DepthOwner.IsValid} rebind={image.Binding.NeedsRebind}.");
         }
 
+        if (hasData)
+        {
+            SynchronizeAliases(imageIdentifier);
+        }
+
         if (request.Role == ImageRole.StorageImage)
         {
             image.MarkGpuModified();
@@ -450,6 +463,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         TouchImage(image);
+        SynchronizeAliases(imageIdentifier);
         image.MarkGpuModified();
         image.Uses.RenderTarget = true;
         RefreshFromGuest(imageIdentifier, request);
@@ -496,6 +510,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         TouchImage(image);
+        SynchronizeAliases(imageIdentifier);
         image.MarkGpuModified();
         image.Uses.DepthTarget = true;
         RefreshFromGuest(imageIdentifier, request);
@@ -745,12 +760,83 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return imageIdentifier;
     }
 
+    // Guest ranges a compute shader has written through a storage image; see the storage
+    // branch of FindImage. Every image over such a range keeps its guest resolution.
+    private readonly List<GuestSpan> _unscaledRanges = new();
+
+    private bool IsUnscaledRange(in GuestSpan data)
+    {
+        if (ImageDescription.IsEmptyRange(data))
+        {
+            return false;
+        }
+
+        foreach (var range in _unscaledRanges)
+        {
+            if (GuestRangeOverlap.Bytes(range, data))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Drops one image back to guest resolution for good; later images over the same guest
+    // memory are created unscaled too, so the decision cannot oscillate.
+    public void DemoteRenderScale(ResourceSlotIdentifier imageIdentifier)
+    {
+        using var held = _lock.Hold();
+        if (_slots[imageIdentifier].IsScaled)
+        {
+            ReplaceScaled(imageIdentifier);
+        }
+    }
+
+    private ResourceSlotIdentifier ReplaceScaled(ResourceSlotIdentifier cachedImageIdentifier)
+    {
+        var cached = _slots[cachedImageIdentifier];
+        _unscaledRanges.Add(cached.Description.Data);
+        var replacementImageIdentifier = InsertImage(cached.Description);
+        var replacement = _slots[replacementImageIdentifier];
+        replacement.Uses = cached.Uses;
+        if (cached.Binding.IsBound || cached.Binding.IsTarget)
+        {
+            cached.Binding.NeedsRebind = true;
+        }
+
+        CopyWholeImage(replacementImageIdentifier, cachedImageIdentifier);
+        ReleaseImage(cachedImageIdentifier);
+        return replacementImageIdentifier;
+    }
+
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
         var requiredBytes = (description.Data.Size + 1023) & ~1023UL;
         CollectForAllocation(requiredBytes);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory));
+        var allowScaling = !IsUnscaledRange(description.Data);
+        CachedImage image;
+        try
+        {
+            image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory, allowScaling);
+        }
+        catch (CachedImage.ImageOutOfMemoryException)
+        {
+            // The budget is an estimate: the device can still run out. Free everything that can
+            // go, wait for retired images to be destroyed, and try once more.
+            ReclaimAfterFailedAllocation();
+            try
+            {
+                image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _imageMemoryPool, DescribeImageMemory, allowScaling);
+            }
+            catch (CachedImage.ImageOutOfMemoryException again)
+            {
+                throw SubmissionScheduler.Fatal(again.Message);
+            }
+        }
+
+        var imageIdentifier = _slots.Insert(image);
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);

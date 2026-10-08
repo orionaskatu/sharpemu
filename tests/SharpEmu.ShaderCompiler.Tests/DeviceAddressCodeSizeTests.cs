@@ -33,6 +33,38 @@ public sealed class DeviceAddressCodeSizeTests
         }
         Assert.Equal((int)count * 2, divisions);
     }
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void RepeatedDeviceFormatLoads_ShareFormatDecoding(uint components)
+    {
+        byte[] Compile(int count)
+        {
+            var instructions = new List<Gen5ShaderInstruction>
+            {
+                ReadFirstLane(0, 12, 0), MoveScalar(4, 13, 0),
+                MoveScalar(8, 14, 16), MoveScalar(12, 15, 0),
+                ScalarBufferLoad(16, 12, destination: 20, count: 4),
+            };
+            for (uint index = 0; index < count; index++)
+                instructions.Add(BufferLoad(24 + index * 8, 20,
+                    offset: (int)index * 16, dwords: components, formatted: true));
+            instructions.Add(EndProgram(24 + (uint)count * 8));
+            var request = Request(Program(instructions.ToArray()));
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+            Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
+            return shader.Spirv;
+        }
+
+        var single = Compile(1);
+        var repeated = Compile(16);
+        // Addresses and destination writes vary at every site. The runtime format
+        // catalogue, conversions, swizzles and page walks must not be duplicated.
+        Assert.True(repeated.Length - single.Length < 15 * 1500,
+            $"Additional device formatted loads grew SPIR-V by {repeated.Length - single.Length} bytes.");
+    }
+
     [Fact]
     public void RepeatedRuntimeFormats_DoNotDuplicateTheLayoutCatalogue()
     {

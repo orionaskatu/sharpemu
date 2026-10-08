@@ -332,7 +332,7 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
-                // A scalar buffer load past the V# range returns zero on hardware, bound or not.
+                // Scalar loads outside the descriptor range return zero on hardware, bound or not.
                 // Reads are evaluated up front, including ones in branches the shader skips.
                 return RawAddress.Zero;
             }

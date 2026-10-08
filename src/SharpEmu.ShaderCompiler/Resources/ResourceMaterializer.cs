@@ -151,6 +151,18 @@ public static class ResourceMaterializer
             return false;
         }
 
+        foreach (var source in plan.DescriptorSources)
+        {
+            if (source.ZeroExtentBufferSource is not { } bufferSource) continue;
+            if (!RuntimeValueEvaluator.EvaluateSources(plan, [bufferSource], inputs.WithReader(inputs.ReadCleanMemory), [],
+                    evaluateTable: false, out var descriptors, out _) ||
+                descriptors.Count != 1 || descriptors[0].DwordCount != 4 || ScalarBufferSize(descriptors[0].Dwords) != 0)
+            {
+                SpecializationFailed("a dynamically loaded descriptor requires an empty source buffer");
+                return false;
+            }
+        }
+
         var cursor = 0;
         snapshot.Buffers = new uint[plan.Info.Buffers.Count][];
         for (var index = 0; index < snapshot.Buffers.Length; index++)
@@ -523,6 +535,7 @@ public static class ResourceMaterializer
     {
         ReadOnlySpan<uint> reserved =
         [
+            // GFX10/10.3 word 2 bit 31 is RESOURCE_LEVEL, not reserved.
             0x00000000u, 0x20000000u, 0x70003000u, 0x00000000u,
             0xe000e000u, 0xf9000000u, 0x00007b00u, 0x00000000u,
         ];
@@ -1383,11 +1396,11 @@ public static class ResourceMaterializer
             var storage = baseImage.ResourceClass == ImageResourceClass.Storage;
             var conversionFormat = ImageConversionFormat(format);
             var shaderSwizzle = storage || conversionFormat != GuestImageFormat.Invalid ? descriptor[3] & 0xFFF : image.ShaderSwizzle;
-            var rawSintStorage = storage && GuestImageFormat.SampledNumericClass(format) == ImageNumericClass.Sint && baseImage.Written && !baseImage.Read && !baseImage.Atomic;
+            var rawSintStorage = storage && format == GuestImageFormat.Format32Sint && baseImage.Written && !baseImage.Read && !baseImage.Atomic;
             var numericClass = GuestImageFormat.SampledNumericClass(format);
             if (storage)
             {
-                if ((!rawSintStorage && numericClass == ImageNumericClass.Sint) || numericClass == ImageNumericClass.Unsupported)
+                if (numericClass == ImageNumericClass.Unsupported)
                 {
                     return Fail($"storage image descriptor {index} uses unsupported format {format}");
                 }
@@ -1464,12 +1477,28 @@ public static class ResourceMaterializer
                 }
             }
 
-            if (resourceCount < 2 || exemplar == DescriptorConstants.NoIndex)
+            if (resourceCount < 2)
             {
-                return Fail("indirect image specialization has no typed candidate");
+                return Fail("indirect image specialization has fewer than two candidates");
             }
 
-            var imageClass = images[(int)exemplar];
+            var declaredImage = info.Images[rootIndex];
+            // A bounded table can contain only descriptors from another image family. Keep
+            // the instruction's declared type and bind every candidate as a typed null.
+            var imageClass = exemplar == DescriptorConstants.NoIndex
+                ? images[rootIndex] with
+                {
+                    NumericClass = declaredImage.NumericClass == ImageNumericClass.Unsupported
+                        ? declaredImage.Atomic ? ImageNumericClass.Uint : ImageNumericClass.Float
+                        : declaredImage.NumericClass,
+                    Dimension = declaredDimension,
+                    MipCount = declaredImage.MipCount,
+                    ConversionFormat = declaredImage.ConversionFormat,
+                    ShaderSwizzle = declaredImage.ShaderSwizzle,
+                    Cube = declaredCube,
+                    EmulatedCompareFunction = declaredImage.EmulatedCompareFunction,
+                }
+                : images[(int)exemplar];
             var separateSampledDimensions = info.Images[rootIndex].ResourceClass == ImageResourceClass.Sampled;
             for (var candidate = 0; candidate < images.Count; candidate++)
             {

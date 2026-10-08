@@ -57,6 +57,8 @@ public static class ImageDescriptorBinding
     private const uint SampledCompare2DBinding = 43;
     private const uint SampledCompare2DArrayBinding = 44;
     private const uint SampledCompareCubeBinding = 45;
+    private const uint StorageSintBinding = 46;
+    private const uint StorageCubeSintBinding = 51;
 
     public static DescriptorBindingKind? ForImage(ImageResource image)
     {
@@ -117,6 +119,7 @@ public static class ImageDescriptorBinding
                 {
                     ImageNumericClass.Float => (DescriptorBindingKind)StorageCubeFloatBinding,
                     ImageNumericClass.Uint => (DescriptorBindingKind)StorageCubeUintBinding,
+                    ImageNumericClass.Sint => (DescriptorBindingKind)StorageCubeSintBinding,
                     _ => null,
                 };
             }
@@ -169,6 +172,9 @@ public static class ImageDescriptorBinding
                         break;
                     case ImageNumericClass.Uint:
                         baseBinding = StorageUintBinding;
+                        break;
+                    case ImageNumericClass.Sint:
+                        baseBinding = StorageSintBinding;
                         break;
                     default:
                         return null;
@@ -251,7 +257,7 @@ public static class ImageDescriptorBinding
     public static uint ArrayIndex(DescriptorBindingKind kind) => (uint)kind - BindingLayout.FirstImageBinding;
 
     public static bool IsCube(DescriptorBindingKind kind) =>
-        (uint)kind is >= SampledCubeFloatBinding and <= AtomicCubeUintBinding or SampledCompareCubeBinding;
+        (uint)kind is >= SampledCubeFloatBinding and <= AtomicCubeUintBinding or SampledCompareCubeBinding or StorageCubeSintBinding;
 
     private static readonly ImageDimension[] SampledDimensions =
     [
@@ -313,7 +319,12 @@ public static class ImageDescriptorBinding
             return (ImageResourceClass.Storage, offset / 5 == 0 ? ImageNumericClass.Float : ImageNumericClass.Uint, StorageDimensions[offset % 5], false);
         }
 
-        if (index >= AtomicUintBinding && index < (uint)DescriptorBindingKind.Samplers)
+        if (index >= StorageSintBinding && index < StorageCubeSintBinding)
+            return (ImageResourceClass.Storage, ImageNumericClass.Sint, StorageDimensions[index - StorageSintBinding], false);
+        if (index == StorageCubeSintBinding)
+            return (ImageResourceClass.Storage, ImageNumericClass.Sint, ImageDimension.Dim2DArray, false);
+
+        if (index >= AtomicUintBinding && index < SampledCubeFloatBinding)
         {
             return (ImageResourceClass.Storage, ImageNumericClass.Uint, StorageDimensions[index - AtomicUintBinding], true);
         }
@@ -328,7 +339,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 {
     public const uint FirstImageBinding = 1;
     public const uint FirstStorageImageBinding = 22;
-    public const uint ImageBindingCount = 45;
+    public const uint ImageBindingCount = 51;
     // A bindless shader aliases all sampled image classes through one descriptor
     // binding and all storage classes through another. The local slot table still
     // keeps the guest image classes distinct.
@@ -346,6 +357,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint MemoryOffsetDword { get; init; }
     public uint MemoryOffsetCount { get; init; }
     public bool UsesDispatchThreadLimits { get; init; }
+    public bool UsesTessellationData { get; init; }
 
     // The host writes each buffer's descriptor stride into shader data (two 16-bit halves
     // per dword) and the shader indexes with it, so the stride is not compiled in: one
@@ -354,8 +366,15 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     // Vulkan can put image arrays in one persistent descriptor set. The per-draw
     // flattened table then starts with the local-image -> heap-slot mapping.
     public bool UsesBindlessImages { get; init; }
+
+    // The module reads the internal-resolution dwords: the factor that maps a guest pixel
+    // onto host texels, its reciprocal, the mask of scaled image resources and the factor
+    // the pixel position is divided by.
+    public bool UsesRenderScale { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
+
+    public const uint RenderScaleDwordCount = 5;
 
     public uint BufferStrideDword => MemoryOffsetDword + (MemoryOffsetCount + 3) / 4;
 
@@ -363,7 +382,10 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public uint DispatchThreadLimitsDword => BufferStrideDword + BufferStrideDwordCount;
 
-    public uint ShaderDataDwordCount => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+    public uint TessellationDataDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+    public uint RenderScaleDword => TessellationDataDword + (UsesTessellationData ? Gen5TessellationData.DwordCount : 0u);
+
+    public uint ShaderDataDwordCount => RenderScaleDword + (UsesRenderScale ? RenderScaleDwordCount : 0u);
 
     public static uint ImageSlotTableDwordCount(ShaderResourceInfo info)
     {
@@ -596,16 +618,21 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesShaderBase,
         uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false,
+        bool usesRenderScale = false,
         bool usesBindlessImages = false,
-        bool usesRuntimeBufferStrides = false)
+        bool usesRuntimeBufferStrides = false,
+        bool usesTessellationData = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
         var memoryOffsetCount = (uint)info.Buffers.Count;
         usesRuntimeBufferStrides &= memoryOffsetCount != 0;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 +
-            (usesRuntimeBufferStrides ? (memoryOffsetCount + 1) / 2 : 0u) + (usesDispatchThreadLimits ? 3u : 0u);
-        var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
+            (usesRuntimeBufferStrides ? (memoryOffsetCount + 1) / 2 : 0u) + (usesDispatchThreadLimits ? 3u : 0u) +
+            (usesTessellationData ? Gen5TessellationData.DwordCount : 0u) + (usesRenderScale ? RenderScaleDwordCount : 0u);
+        // The fixed-function control bridge shares the domain stage's runtime
+        // buffer. Keep that ABI independent of per-stage push-data packing.
+        var pushStart = usesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataStartDword, shaderDataDwords);
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
         {
@@ -694,11 +721,13 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             MemoryOffsetDword = memoryOffsetDword,
             MemoryOffsetCount = memoryOffsetCount,
             UsesDispatchThreadLimits = usesDispatchThreadLimits,
+            UsesTessellationData = usesTessellationData,
             UsesRuntimeBufferStrides = usesRuntimeBufferStrides,
             // The set split is a pipeline-wide ABI. A stage without images must
             // still place its buffers on set 1 when another stage uses set 0 for
             // the persistent image heap.
             UsesBindlessImages = usesBindlessImages,
+            UsesRenderScale = usesRenderScale,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -712,15 +741,17 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         MemoryOffsetDword == other.MemoryOffsetDword &&
         MemoryOffsetCount == other.MemoryOffsetCount &&
         UsesDispatchThreadLimits == other.UsesDispatchThreadLimits &&
+        UsesTessellationData == other.UsesTessellationData &&
         UsesRuntimeBufferStrides == other.UsesRuntimeBufferStrides &&
         UsesBindlessImages == other.UsesBindlessImages &&
+        UsesRenderScale == other.UsesRenderScale &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));
 
     public override bool Equals(object? obj) => Equals(obj as BindingLayout);
 
-    public override int GetHashCode() => HashCode.Combine(PushDataStartDword, MemoryOffsetDword, MemoryOffsetCount, Descriptors.Count, UsesDispatchThreadLimits);
+    public override int GetHashCode() => HashCode.Combine(PushDataStartDword, MemoryOffsetDword, MemoryOffsetCount, Descriptors.Count, UsesDispatchThreadLimits, UsesRenderScale);
 }
 
 // Recomputes the layout an emitter was given from the same inputs and the same push
@@ -742,7 +773,7 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a compute shader can use dispatch thread limits.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesBindlessImages, layout.UsesRuntimeBufferStrides);
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesRenderScale, layout.UsesBindlessImages, layout.UsesRuntimeBufferStrides, layout.UsesTessellationData);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

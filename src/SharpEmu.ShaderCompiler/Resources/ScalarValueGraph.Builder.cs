@@ -426,7 +426,14 @@ public sealed partial class ScalarValueGraph
             {
                 case Gen5ShaderEncoding.Sop1:
                 case Gen5ShaderEncoding.Sop2:
+                    ApplyScalarAlu(instruction, state);
+                    return;
                 case Gen5ShaderEncoding.Sopk:
+                    if (instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
+                    {
+                        ApplyScalarCompareK(instruction, state);
+                        return;
+                    }
                     ApplyScalarAlu(instruction, state);
                     return;
                 case Gen5ShaderEncoding.Sopc:
@@ -685,6 +692,17 @@ public sealed partial class ScalarValueGraph
                 case "SFF1I32B32":
                     state.WriteScalar(destinationRegister, _graph.FindLowestSetBit(left, instruction.Pc));
                     return;
+                case "SFlbitI32B32":
+                {
+                    // RDNA returns -1 for zero; otherwise this is the number of
+                    // zeros before the most significant set bit.
+                    var high = Unary(ScalarOperation.FindHighestBit32, left);
+                    var leading = Binary(ScalarOperation.ISub32, _graph.Constant(31u), high);
+                    state.WriteScalar(destinationRegister,
+                        _graph.Select(Bool(ScalarOperation.IEqual32, left, _graph.Constant(0u)),
+                            _graph.Constant(uint.MaxValue), leading));
+                    return;
+                }
                 case "SBitset0B32":
                 {
                     var bit = Binary(ScalarOperation.ShiftLeft32, _graph.Constant(1u), Binary(ScalarOperation.And32, left, _graph.Constant(31u)));
@@ -1092,6 +1110,28 @@ public sealed partial class ScalarValueGraph
             }
 
             state.Scc = Compare(opcode["SCmp".Length..], left, right);
+        }
+
+        private void ApplyScalarCompareK(Gen5ShaderInstruction instruction, RegisterState state)
+        {
+            if (instruction.Destinations.Count != 1 ||
+                instruction.Destinations[0] is not { Kind: Gen5OperandKind.ScalarRegister, Value: < ScalarRegisterCount } source ||
+                instruction.Words.Count == 0)
+            {
+                state.Scc = _graph.Undefined(ScalarValueType.Bool);
+                return;
+            }
+
+            var simm16 = instruction.Words[0] & 0xFFFF;
+            var immediate = instruction.Opcode.EndsWith("I32", StringComparison.Ordinal) &&
+                !instruction.Opcode.EndsWith("U32", StringComparison.Ordinal)
+                ? unchecked((uint)(int)(short)simm16)
+                : simm16;
+
+            // SOPK compare instructions encode the source SGPR in the SDST field.
+            // They update SCC and leave that SGPR unchanged.
+            state.Scc = Compare(instruction.Opcode["SCmp".Length..],
+                state.Scalars[source.Value], _graph.Constant(immediate));
         }
 
         private ScalarValue Compare(string suffix, ScalarValue left, ScalarValue right) => suffix switch

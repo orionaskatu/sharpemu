@@ -232,6 +232,24 @@ public sealed partial class RenderExecutor
         }
 
         DbgVcullWatch(program, input); // TEMP
+        if (program.Hash == 0x25FCDA2A90D50DD4UL && Environment.GetEnvironmentVariable("SHARPEMU_DBG_TABLESTAT") == "1" && input.Stage.Resources.Buffers.Length > 1 && input.Stage.Resources.Buffers[1].Length >= 4) // TEMP
+        {
+            var tableDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[1]);
+            var tableBytes = new byte[Math.Min(tableDescriptor.Footprint() ?? 0, 4UL << 20)];
+            if (tableBytes.Length >= 32 && _host.TryReadGuest(tableDescriptor.Address, tableBytes))
+            {
+                var used = 0; ulong triSum = 0;
+                for (var rec = 0; rec + 32 <= tableBytes.Length; rec += 32)
+                {
+                    var instances = BitConverter.ToUInt32(tableBytes, rec + 4);
+                    var tris = BitConverter.ToUInt32(tableBytes, rec + 8);
+                    if (instances != 0 && tris != 0) { used++; triSum += (ulong)instances * tris; }
+                }
+
+                Console.Error.WriteLine($"[DBG][TABLE] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} addr=0x{tableDescriptor.Address:X} bytes=0x{tableBytes.Length:X} usedRecords={used} triSum={triSum} groups={groupsX}");
+            }
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_STRUCTS") == "1" && program.Hash is 0x25FCDA2A90D50DD4UL or 0x525A55D3242304C9UL or 0xB7DF200E29FEE750UL && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds > 70 && DbgStructQuota(program.Hash)) // TEMP
         {
             var dbgUd = input.Stage.Resources.UserData;
@@ -619,7 +637,9 @@ public sealed partial class RenderExecutor
     {
         var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
         var resources = input.Stage.Resources;
-        if (program.ConstantStoreValue is not { } value ||
+        if (program.ConstantStoreValue is not { } value || program.ImmediateConstantFill is not { } fill ||
+            program.UserDataBase != 0 || fill.GroupScalarRegister != (uint)input.WorkgroupRegister ||
+            fill.DestinationScalarResource + 4 > resources.UserData.Length ||
             program.Buffers.Length != 1 || resources.Buffers.Length != 1 || resources.Buffers[0].Length != 4 ||
             program.Images.Length != 0 || program.SamplerCount != 0 || program.UsesDeviceAddresses)
         {
@@ -628,6 +648,8 @@ public sealed partial class RenderExecutor
 
         var info = program.Buffers[0];
         var descriptor = BufferDescriptorWords.From(resources.Buffers[0]);
+        if (!resources.UserData.AsSpan((int)fill.DestinationScalarResource, 4).SequenceEqual(resources.Buffers[0]))
+            return null;
         var threads = (ulong)groupsX * input.ThreadsX;
         if (!info.Formatted || !info.Written || info.Read || info.Atomic || info.Scalar || info.MaxByteExtent != sizeof(uint) ||
             descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
@@ -650,7 +672,10 @@ public sealed partial class RenderExecutor
     {
         var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
         var resources = input.Stage.Resources;
-        if (program.Buffers.Length != 2 || resources.Buffers.Length != 2 || program.Images.Length != 0 || program.SamplerCount != 0 ||
+        if (program.ConstantFill is not { } fill || program.UserDataBase != 0 ||
+            fill.GroupScalarRegister != (uint)input.WorkgroupRegister ||
+            fill.DestinationScalarResource + 4 > resources.UserData.Length || fill.SourceScalarResource + 4 > resources.UserData.Length ||
+            program.Buffers.Length != 2 || resources.Buffers.Length != 2 || program.Images.Length != 0 || program.SamplerCount != 0 ||
             program.UsesDeviceAddresses || resources.Images.Length != 0 || resources.Samplers.Length != 0 ||
             resources.Buffers[0].Length != 4 || resources.Buffers[1].Length != 4)
         {
@@ -678,6 +703,9 @@ public sealed partial class RenderExecutor
 
         var descriptor = BufferDescriptorWords.From(resources.Buffers[target]);
         var valueDescriptor = BufferDescriptorWords.From(resources.Buffers[source]);
+        if (!resources.UserData.AsSpan((int)fill.DestinationScalarResource, 4).SequenceEqual(resources.Buffers[target]) ||
+            !resources.UserData.AsSpan((int)fill.SourceScalarResource, 4).SequenceEqual(resources.Buffers[source]))
+            return null;
         var threads = (ulong)groupsX * input.ThreadsX;
         if (descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
             descriptor.IndexStride != 0 || descriptor.AddThreadId || descriptor.RecordCount == 0 ||

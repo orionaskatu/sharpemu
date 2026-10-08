@@ -145,6 +145,123 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         });
     }
 
+    // A runtime descriptor read from registers may name memory that is not mapped (a lane whose
+    // result is unused, or a range the title has since freed). It stays out of the table, so the
+    // shader keeps reading the null descriptor, instead of creating an image over no memory.
+    [Fact]
+    public void RuntimeImageMissOverUnbackedMemory_StaysOutOfTheTable()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var (_, hole, _) = presenter.Harness.MapBackedSandwich();
+        var words = RegisterWords.Texture(hole, GuestPixelFormat.Bits32UInt, 1, 1);
+        var program = new ShaderProgramInfo { Stage = ShaderStageKind.Compute, Hash = 0x53 };
+        presenter.Run(() =>
+        {
+            var descriptors = presenter.InvokeMethod("RuntimeDescriptorsFor", program)!;
+            var misses = (System.Collections.Concurrent.ConcurrentQueue<(bool Image, uint[] Key)>)GetFieldValue(descriptors, "Misses");
+            misses.Enqueue((true, [RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Uint), .. words]));
+            var preparedType = PresenterType.GetNestedType("PreparedStageBindings", BindingFlags.NonPublic)!;
+            var stage = new ShaderStageResources(program, new ResourceSnapshot());
+            var prepared = Activator.CreateInstance(preparedType, InstanceMembers, null, [stage, program], null)!;
+
+            presenter.InvokeMethod("PrepareRuntimeDescriptors", prepared);
+
+            Assert.Empty((IList)prepared.GetType().GetProperty("RuntimeImages")!.GetValue(prepared)!);
+            presenter.InvokeMethod("DestroyRuntimeDescriptors");
+        });
+    }
+
+    // A runtime descriptor that describes no valid view reads as the null texture on the
+    // hardware: it stays out of the table instead of stopping the emulator.
+    [Fact]
+    public void RuntimeImageMissWithoutAValidView_StaysOutOfTheTable()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var address = presenter.Harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Texture(address, GuestPixelFormat.Bits32UInt, 1, 1);
+        words[3] &= 0x0FFF_FFFFu;
+        var program = new ShaderProgramInfo { Stage = ShaderStageKind.Compute, Hash = 0x55 };
+        presenter.Run(() =>
+        {
+            var descriptors = presenter.InvokeMethod("RuntimeDescriptorsFor", program)!;
+            var misses = (System.Collections.Concurrent.ConcurrentQueue<(bool Image, uint[] Key)>)GetFieldValue(descriptors, "Misses");
+            misses.Enqueue((true, [RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Uint), .. words]));
+            var preparedType = PresenterType.GetNestedType("PreparedStageBindings", BindingFlags.NonPublic)!;
+            var stage = new ShaderStageResources(program, new ResourceSnapshot());
+            var prepared = Activator.CreateInstance(preparedType, InstanceMembers, null, [stage, program], null)!;
+
+            presenter.InvokeMethod("PrepareRuntimeDescriptors", prepared);
+
+            Assert.Empty((IList)prepared.GetType().GetProperty("RuntimeImages")!.GetValue(prepared)!);
+            presenter.InvokeMethod("DestroyRuntimeDescriptors");
+        });
+    }
+
+    // A registered runtime entry outlives the memory it names when the title frees it. The next
+    // draw drops the entry instead of creating its image over memory that no longer exists.
+    [Fact]
+    public void RuntimeImageEntryOverFreedMemory_LeavesTheTable()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var address = presenter.Harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Texture(address, GuestPixelFormat.Bits32UInt, 1, 1);
+        var program = new ShaderProgramInfo { Stage = ShaderStageKind.Compute, Hash = 0x54 };
+        presenter.Run(() =>
+        {
+            var descriptors = presenter.InvokeMethod("RuntimeDescriptorsFor", program)!;
+            var misses = (System.Collections.Concurrent.ConcurrentQueue<(bool Image, uint[] Key)>)GetFieldValue(descriptors, "Misses");
+            misses.Enqueue((true, [RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Uint), .. words]));
+            var preparedType = PresenterType.GetNestedType("PreparedStageBindings", BindingFlags.NonPublic)!;
+            var stage = new ShaderStageResources(program, new ResourceSnapshot());
+            var prepared = Activator.CreateInstance(preparedType, InstanceMembers, null, [stage, program], null)!;
+            presenter.InvokeMethod("PrepareRuntimeDescriptors", prepared);
+            Assert.Single((IList)prepared.GetType().GetProperty("RuntimeImages")!.GetValue(prepared)!);
+
+            presenter.Harness.ImageStore.Unregister(address, 0x10000);
+            Assert.True(presenter.Harness.Memory.TryUnmapBacked(address, 0x10000));
+            var next = Activator.CreateInstance(preparedType, InstanceMembers, null, [stage, program], null)!;
+            presenter.InvokeMethod("PrepareRuntimeDescriptors", next);
+
+            Assert.Empty((IList)next.GetType().GetProperty("RuntimeImages")!.GetValue(next)!);
+            Assert.Empty((IDictionary)GetFieldValue(descriptors, "Images"));
+            presenter.InvokeMethod("DestroyRuntimeDescriptors");
+        });
+    }
+
+    // A runtime descriptor whose base level lies past its mips reads as the null texture, which
+    // the shader fetches through its unsigned heap array: the placeholder must be unsigned too.
+    [Fact]
+    public void RuntimeImageLoadMissPastTheLastLevel_BindsAnUnsignedNullTexture()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var address = presenter.Harness.MapBacked(0x10000, ReadWrite);
+        var words = RegisterWords.Texture(address, GuestPixelFormat.Bits32UInt, 1, 1);
+        words[3] |= 1u << 12;
+        var program = new ShaderProgramInfo { Stage = ShaderStageKind.Compute, Hash = 0x52 };
+        presenter.Run(() =>
+        {
+            var descriptors = presenter.InvokeMethod("RuntimeDescriptorsFor", program)!;
+            var misses = (System.Collections.Concurrent.ConcurrentQueue<(bool Image, uint[] Key)>)GetFieldValue(descriptors, "Misses");
+            misses.Enqueue((true, [RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Uint), .. words]));
+            var preparedType = PresenterType.GetNestedType("PreparedStageBindings", BindingFlags.NonPublic)!;
+            var stage = new ShaderStageResources(program, new ResourceSnapshot());
+            var prepared = Activator.CreateInstance(preparedType, InstanceMembers, null, [stage, program], null)!;
+
+            presenter.InvokeMethod("PrepareRuntimeDescriptors", prepared);
+
+            var images = (IList)prepared.GetType().GetProperty("RuntimeImages")!.GetValue(prepared)!;
+            var binding = Assert.Single(images.Cast<object>());
+            var request = (ImageRequest)GetFieldValue(binding, "Request");
+            Assert.Equal(Format.R32Uint, request.View.Format);
+            presenter.InvokeMethod("DestroyRuntimeDescriptors");
+        });
+    }
+
     [Theory]
     [InlineData(GuestPixelFormat.Bits16UNorm, Format.D16Unorm)]
     [InlineData(GuestPixelFormat.Bits32Float, Format.D32Sfloat)]

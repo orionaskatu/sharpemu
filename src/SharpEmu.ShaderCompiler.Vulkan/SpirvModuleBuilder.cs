@@ -185,6 +185,7 @@ public enum SpirvOp : ushort
 public enum SpirvCapability : uint
 {
     Shader = 1,
+    Tessellation = 3,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
     ClipDistance = 32,
@@ -192,6 +193,7 @@ public enum SpirvCapability : uint
     SampledImageArrayDynamicIndexing = 29,
     StorageImageArrayDynamicIndexing = 31,
     SampleRateShading = 35,
+    SampleMaskPostDepthCoverage = 4447,
     Sampled1D = 43,
     Image1D = 44,
     Float16 = 9,
@@ -221,6 +223,12 @@ public enum SpirvCapability : uint
     PhysicalStorageBufferAddresses = 5347,
 }
 
+public enum SpirvFunctionControl : uint
+{
+    None = 0,
+    DontInline = 2,
+}
+
 public enum SpirvStorageClass : uint
 {
     UniformConstant = 0,
@@ -239,13 +247,27 @@ public enum SpirvStorageClass : uint
 public enum SpirvExecutionModel : uint
 {
     Vertex = 0,
+    TessellationControl = 1,
+    TessellationEvaluation = 2,
     Fragment = 4,
     GLCompute = 5,
 }
 
 public enum SpirvExecutionMode : uint
 {
+    SpacingEqual = 1,
+    SpacingFractionalEven = 2,
+    SpacingFractionalOdd = 3,
+    VertexOrderCw = 4,
+    VertexOrderCcw = 5,
+    PointMode = 10,
+    Triangles = 22,
+    Quads = 24,
+    Isolines = 25,
+    OutputVertices = 26,
     OriginUpperLeft = 7,
+    EarlyFragmentTests = 9,
+    PostDepthCoverage = 4446,
     DepthReplacing = 12,
     LocalSize = 17,
     DenormPreserve = 4459,
@@ -261,8 +283,11 @@ public enum SpirvDecoration : uint
     BuiltIn = 11,
     NoPerspective = 13,
     Flat = 14,
+    Sample = 17,
     PerVertexKhr = 5285,
+    Patch = 15,
     Location = 30,
+    Index = 32,
     Binding = 33,
     DescriptorSet = 34,
     Offset = 35,
@@ -280,6 +305,12 @@ public enum SpirvBuiltIn : uint
     ViewportIndex = 10,
     VertexIndex = 42,
     InstanceIndex = 43,
+    PrimitiveId = 7,
+    InvocationId = 8,
+    TessLevelOuter = 11,
+    TessLevelInner = 12,
+    TessCoord = 13,
+    PatchVertices = 14,
     FragCoord = 15,
     BaryCoordKhr = 5286,
     BaryCoordNoPerspKhr = 5287,
@@ -381,7 +412,7 @@ public sealed class SpirvModuleBuilder
         uint> _imageTypes = [];
     private readonly Dictionary<uint, uint> _sampledImageTypes = [];
     private readonly Dictionary<(SpirvStorageClass Storage, uint Type), uint> _pointerTypes = [];
-    private readonly Dictionary<(uint Element, uint Count), uint> _arrayTypes = [];
+    private readonly Dictionary<(uint Element, uint Count, uint? Stride), uint> _arrayTypes = [];
     private readonly Dictionary<uint, uint> _runtimeArrayTypes = [];
     private readonly Dictionary<string, uint> _functionTypes = [];
     private readonly Dictionary<(uint Type, ulong Value), uint> _constants = [];
@@ -610,9 +641,12 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
-    public uint TypeArray(uint elementType, uint count)
+    public uint TypeArray(uint elementType, uint count, uint? arrayStride = null)
     {
-        var key = (elementType, count);
+        // Explicit block layout belongs to the type. Sharing it with an array
+        // in Workgroup storage would also share ArrayStride, which is invalid
+        // without the explicit workgroup layout extension.
+        var key = (elementType, count, arrayStride);
         if (_arrayTypes.TryGetValue(key, out var existing))
         {
             return existing;
@@ -621,6 +655,10 @@ public sealed class SpirvModuleBuilder
         var length = Constant(TypeInt(32, false), count);
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.TypeArray, id, elementType, length);
+        if (arrayStride is { } stride)
+        {
+            AddDecoration(id, SpirvDecoration.ArrayStride, stride);
+        }
         _arrayTypes.Add(key, id);
         return id;
     }
@@ -791,17 +829,22 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
+    private readonly List<uint> _functionVariables = [];
+    private int _functionVariableOffset = -1;
+
     public uint BeginFunction(uint returnType, uint functionType)
     {
         var id = AllocateId();
+        _functionVariableOffset = -1;
         Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
         return id;
     }
 
     // Begins a function whose id was allocated earlier, so it can be called before it is emitted.
-    public uint BeginFunction(uint returnType, uint functionType, uint id)
+    public uint BeginFunction(uint returnType, uint functionType, uint id, SpirvFunctionControl functionControl = SpirvFunctionControl.None)
     {
-        Emit(_functions, SpirvOp.Function, returnType, id, 0, functionType);
+        _functionVariableOffset = -1;
+        Emit(_functions, SpirvOp.Function, returnType, id, (uint)functionControl, functionType);
         return id;
     }
 
@@ -812,6 +855,7 @@ public sealed class SpirvModuleBuilder
     {
         var result = id ?? AllocateId();
         Emit(_functions, SpirvOp.Label, result);
+        if (_functionVariableOffset < 0) _functionVariableOffset = _functions.Count;
         return result;
     }
 
@@ -821,7 +865,7 @@ public sealed class SpirvModuleBuilder
         if (initializer.HasValue)
         {
             Emit(
-                _functions,
+                _functionVariables,
                 SpirvOp.Variable,
                 pointerType,
                 id,
@@ -831,7 +875,7 @@ public sealed class SpirvModuleBuilder
         else
         {
             Emit(
-                _functions,
+                _functionVariables,
                 SpirvOp.Variable,
                 pointerType,
                 id,
@@ -986,7 +1030,20 @@ public sealed class SpirvModuleBuilder
     public void AddStatement(SpirvOp opcode, params uint[] operands) =>
         Emit(_functions, opcode, operands);
 
-    public void EndFunction() => Emit(_functions, SpirvOp.FunctionEnd);
+    public void EndFunction()
+    {
+        // Registers are discovered while emitting the body. SPIR-V requires every
+        // Function variable to precede the entry block's executable instructions.
+        if (_functionVariables.Count != 0)
+        {
+            if (_functionVariableOffset < 0)
+                throw new InvalidOperationException("Function variables require an entry block.");
+            _functions.InsertRange(_functionVariableOffset, _functionVariables);
+            _functionVariables.Clear();
+        }
+        _functionVariableOffset = -1;
+        Emit(_functions, SpirvOp.FunctionEnd);
+    }
 
     public byte[] Build()
     {

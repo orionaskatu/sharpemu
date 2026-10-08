@@ -13,8 +13,7 @@ path = [
     "_logs/**",
     ".github/images/**",
     ".github/pull_request_template.md",
-    "assets/images/**",
-    "tools/pipebench/samples/**"
+    "assets/images/**"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "SharpEmu Emulator Project"

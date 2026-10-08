@@ -25,42 +25,6 @@ public sealed class ResourceMaterializationCache
     private byte[] _scratch = new byte[256];
     private ReadRecorder? _spareRecorder;
 
-    // A plan whose draws read different words every time (per-draw constant pointers in a
-    // ring) never hits; recording its reads and storing entries is then pure overhead. Such
-    // plans materialize directly, recording one miss in BypassSampling so that a plan whose
-    // inputs start repeating builds entries again and returns to full caching.
-    private const int BypassWarmup = 128;
-    private const int BypassHitDivisor = 16;
-    private const int BypassSampling = 16;
-    private const int StatsDecayAttempts = 4096;
-    private readonly Dictionary<ShaderResourcePlan, PlanStats> _planStats = new(ReferenceEqualityComparer.Instance);
-
-    private sealed class PlanStats
-    {
-        public int Attempts;
-        public int Hits;
-    }
-
-    private PlanStats StatsOf(ShaderResourcePlan plan)
-    {
-        if (!_planStats.TryGetValue(plan, out var stats))
-        {
-            stats = new PlanStats();
-            _planStats.Add(plan, stats);
-        }
-
-        if (++stats.Attempts >= StatsDecayAttempts)
-        {
-            stats.Attempts /= 2;
-            stats.Hits /= 2;
-        }
-
-        return stats;
-    }
-
-    private static bool BypassesRecording(PlanStats stats) =>
-        stats.Attempts >= BypassWarmup && stats.Hits * BypassHitDivisor < stats.Attempts && stats.Attempts % BypassSampling != 0;
-
     public ResourceMaterializationCache(int generationCapacity = 16384)
     {
         _generationCapacity = Math.Max(1, generationCapacity);
@@ -73,6 +37,7 @@ public sealed class ResourceMaterializationCache
     private static long _totalStale;
     private static long _totalStaleUnreadable;
     private static long _totalRefreshes;
+    private static long _totalBypassed;
 
     [ThreadStatic]
     private static bool _readingTable;
@@ -83,6 +48,11 @@ public sealed class ResourceMaterializationCache
         private set => _readingTable = value;
     }
 
+    private const int ProbationLookups = 64;
+    // A plan keeps using the cache while at least one lookup in this many hits.
+    private const int MinimumHitShare = 8;
+
+    public long Bypassed { get; private set; }
     public long Hits { get; private set; }
     public long Misses { get; private set; }
     public long Uncacheable { get; private set; }
@@ -97,9 +67,10 @@ public sealed class ResourceMaterializationCache
         var stale = Interlocked.Exchange(ref _totalStale, 0);
         var staleUnreadable = Interlocked.Exchange(ref _totalStaleUnreadable, 0);
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
+        var bypassed = Interlocked.Exchange(ref _totalBypassed, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} bypassed={bypassed} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()}");
     }
 
     public bool Materialize(
@@ -110,9 +81,19 @@ public sealed class ResourceMaterializationCache
         ref ResourceSpecialization specialization,
         out ResourceMaterializationFailure failure)
     {
+        // Most draws of a plan whose user data points at per-draw constants never repeat their
+        // inputs; recording their reads and storing entries then costs more than a plain walk.
+        // Such a plan materializes directly and probes the cache again on every 64th draw.
+        var lookups = ++plan.CacheLookups;
+        if (lookups > ProbationLookups && plan.CacheHits * MinimumHitShare < lookups && (lookups & 63) != 0)
+        {
+            Bypassed++;
+            Interlocked.Increment(ref _totalBypassed);
+            // The result is not cached, so a recently probed large descriptor table may be reused.
+            return ResourceMaterializer.Materialize(plan, inputs with { AllowTransientTableReuse = true }, ref snapshot, ref specialization, out failure);
+        }
+
         var key = KeyOf(plan, inputs);
-        var stats = StatsOf(plan);
-        var dbgReason = 0; // TEMP
         var found = TryFind(key, plan, inputs, out var cached);
         if (found)
         {
@@ -131,9 +112,8 @@ public sealed class ResourceMaterializationCache
                         Store(key, variant);
                     }
 
-                    DbgCacheReason(plan, 9); // TEMP
-                    stats.Hits++;
                     Hits++;
+                    plan.CacheHits++;
                     Interlocked.Increment(ref _totalHits);
                     snapshot = variant.Snapshot;
                     specialization = variant.Specialization;
@@ -144,12 +124,10 @@ public sealed class ResourceMaterializationCache
                 unreadable |= variantUnreadable;
             }
 
-            dbgReason = 3; // TEMP: the entry's bytes changed or the GPU owns a range
             if (MappingsHold(cached, inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
             {
-                DbgCacheReason(plan, 8); // TEMP
-                stats.Hits++;
                 TableRefreshes++;
+                plan.CacheHits++;
                 Interlocked.Increment(ref _totalRefreshes);
                 snapshot = refreshed.Snapshot;
                 specialization = refreshed.Specialization;
@@ -164,12 +142,6 @@ public sealed class ResourceMaterializationCache
 
         Misses++;
         Interlocked.Increment(ref _totalMisses);
-        DbgCacheReason(plan, BypassesRecording(stats) ? 4 : dbgReason); // TEMP
-        if (BypassesRecording(stats))
-        {
-            return ResourceMaterializer.Materialize(plan, inputs with { AllowTransientTableReuse = !DbgFlags.Disabled("memo") }, ref snapshot, ref specialization, out failure);
-        }
-
         var recorder = TakeRecorder();
         try
         {
@@ -364,26 +336,6 @@ public sealed class ResourceMaterializationCache
             return false;
         offset = entry.RangeOffsets[found] + (int)delta;
         return true;
-    }
-
-    // TEMP: SHARPEMU_DBG_CACHE=1 reports why materializations missed, per plan.
-    private static readonly bool _dbgCache = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CACHE") == "1";
-    private static readonly Dictionary<(ulong, int), int> _dbgCacheCounts = new();
-    private static long _dbgCacheLast = Environment.TickCount64;
-    private static void DbgCacheReason(ShaderResourcePlan plan, int reason)
-    {
-        if (!_dbgCache) return;
-        lock (_dbgCacheCounts)
-        {
-            _dbgCacheCounts.TryGetValue((plan.Hash, reason), out var count);
-            _dbgCacheCounts[(plan.Hash, reason)] = count + 1;
-            if (Environment.TickCount64 - _dbgCacheLast < 10000) return;
-            _dbgCacheLast = Environment.TickCount64;
-            Console.Error.WriteLine("[DBG][CACHE] reasons: 0=no entry/user data differs 3=bytes changed/GPU-owned 4=bypass 8=table refresh hit 9=hit");
-            foreach (var group in _dbgCacheCounts.GroupBy(x => x.Key.Item1).OrderByDescending(g => g.Where(x => x.Key.Item2 != 9 && x.Key.Item2 != 8).Sum(x => x.Value)).Take(10))
-                Console.Error.WriteLine($"[DBG][CACHE]   0x{group.Key:X16} " + string.Join(" ", group.OrderBy(x => x.Key.Item2).Select(x => $"r{x.Key.Item2}={x.Value}")));
-            _dbgCacheCounts.Clear();
-        }
     }
 
     private static ulong KeyOf(ShaderResourcePlan plan, ResourceRuntimeInputs inputs)

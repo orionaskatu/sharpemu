@@ -1,184 +1,154 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers.Binary;
+using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.GpuCommands;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
-using SharpEmu.Libs.Gpu.Images;
+using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.ShaderCompiler;
+using SharpEmu.ShaderCompiler.Vulkan;
+using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Rendering;
 
-// Tessellated draws (local + hull + domain stages). The merged local+hull program runs as
-// compute workgroups that write the control points and factors to the guest rings, as the
-// hardware does; the domain program then runs as a vertex shader over a uniform grid per patch.
 public sealed partial class RenderExecutor
 {
-    private const uint TessellationStageMask = 0x0200210D;
-    private const uint WaveSizeStageBits = (1u << 21) | (1u << 22) | (1u << 23);
-
-    // The off-chip slot of one hull workgroup: the domain program addresses its patch
-    // constants from the end of this slot.
-    private const uint OffchipBytesPerGroup = 0x8000;
-
-    // The off-chip ring holds this many workgroup slots; larger draws run in chunks.
-    private const uint OffchipRingGroups = 256;
-
-    private const uint QuadDomain = 2;
-    private const uint TriangleClockwiseTopology = 2;
-
-    private static readonly uint? TessellationSegmentsOverride =
-        uint.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TESSELLATION_SEGMENTS"), out var segments) ? segments : null;
-
-    private static int _tessellationWarningShown;
-
-    private static bool IsTessellationStageMask(uint stages) => (stages & ~WaveSizeStageBits) == TessellationStageMask;
-
-    private void DrawTessellated(ulong submitId, RegisterBanks banks, uint vertexCount, uint instanceCount, uint firstVertex)
+    private void DrawTessellationIndexed(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
-        var shaderInterface = banks.Context.ShaderInterface;
-        var configuration = shaderInterface.LocalHullConfiguration;
-        var maxPatchesPerGroup = configuration & 0xFF;
-        var inputControlPoints = (configuration >> 8) & 0x3F;
-        var outputControlPoints = (configuration >> 14) & 0x3F;
-        var factorParameter = shaderInterface.TessellationFactorParameter;
-        var domainType = factorParameter & 0x3;
-        var outputTopology = (factorParameter >> 5) & 0x7;
-        if (inputControlPoints == 0 || outputControlPoints == 0 || outputControlPoints > 64 || inputControlPoints > 64 ||
-            domainType != QuadDomain || vertexCount < inputControlPoints)
+        var count = arguments.IndexCount;
+        var instances = arguments.InstanceCount;
+        var vertexOffset = unchecked(arguments.BaseVertex +
+            (arguments.OffsetSource == DrawOffsetSource.IndirectArguments ? 0 : (int)banks.UserConfig.IndexOffset));
+        var firstInstance = arguments.FirstInstance;
+        var address = arguments.IndexAddress;
+        var size = arguments.IndexTypeAndSize switch
         {
-            WarnTessellation($"configuration=0x{configuration:X8} factors=0x{factorParameter:X8} vertices={vertexCount}");
-            return;
-        }
-
-        var patchesPerGroup = Math.Max(1, Math.Min(Math.Max(maxPatchesPerGroup, 1), 64 / Math.Max(inputControlPoints, outputControlPoints)));
-        var patchesPerInstance = vertexCount / inputControlPoints;
-        var totalPatches = (ulong)patchesPerInstance * instanceCount;
-        if (totalPatches == 0)
+            (uint)GuestIndexType.Index8 => 1u, (uint)GuestIndexType.Index16 => 2u, (uint)GuestIndexType.Index32 => 4u,
+            _ => throw _host.Fatal("The tessellation index format is unsupported."),
+        };
+        if (arguments.IndirectArgumentsAddress != 0)
         {
-            return;
+            Span<byte> data = stackalloc byte[20];
+            if (!_host.TryReadGuest(arguments.IndirectArgumentsAddress, data))
+                throw _host.Fatal("The tessellation indirect draw arguments are unreadable.");
+            count = BinaryPrimitives.ReadUInt32LittleEndian(data);
+            instances = BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
+            var firstIndex = BinaryPrimitives.ReadUInt32LittleEndian(data[8..]);
+            if (!arguments.UnboundedIndexBuffer && (ulong)firstIndex + count > arguments.IndexCount)
+                throw _host.Fatal("The tessellation indirect draw exceeds the supplied index buffer.");
+            address = checked(address + (ulong)firstIndex * size);
+            vertexOffset = BinaryPrimitives.ReadInt32LittleEndian(data[12..]);
+            firstInstance = BinaryPrimitives.ReadUInt32LittleEndian(data[16..]);
         }
-
-        var maxLevel = BitConverter.UInt32BitsToSingle(shaderInterface.MaxTessellationLevel);
-        var segments = TessellationSegmentsOverride ??
-            (uint)Math.Clamp(float.IsFinite(maxLevel) ? MathF.Ceiling(maxLevel) : 1f, 1f, 16f);
-        var hull = new Gen5HullDispatch(patchesPerGroup, inputControlPoints, outputControlPoints, OffchipBytesPerGroup, 6 * sizeof(float));
-        var domain = new Gen5DomainGrid(patchesPerGroup, OffchipBytesPerGroup, segments, Triangles: false,
-            Clockwise: outputTopology == TriangleClockwiseTopology);
-
-        var vertex = banks.Shader.Vertex;
-        var hullUserCount = Math.Max(vertex.HullResource2.UserScalarCount, vertex.HullUserScalars.Count);
-        var chunkPatches = (ulong)OffchipRingGroups * patchesPerGroup;
-        for (var firstPatch = 0ul; firstPatch < totalPatches; firstPatch += chunkPatches)
-        {
-            var patches = (uint)Math.Min(chunkPatches, totalPatches - firstPatch);
-            var userData = new uint[8 + hullUserCount];
-            userData[0] = (uint)vertex.HullUserDataAddress;
-            userData[1] = (uint)(vertex.HullUserDataAddress >> 32);
-            userData[2] = (uint)firstPatch;
-            userData[3] = patches;
-            userData[4] = patchesPerInstance;
-            userData[5] = firstVertex;
-            Array.Copy(vertex.HullUserScalars.Values, 0, userData, 8, hullUserCount);
-            if (!DispatchHull(vertex, hull, userData, (patches + patchesPerGroup - 1) / patchesPerGroup))
-            {
-                return;
-            }
-
-            DrawDomainGrid(submitId, banks, domain, patches);
-        }
+        DrawTessellation(submitId, banks, count, instances, address, size, vertexOffset, firstInstance);
     }
 
-    private bool DispatchHull(VertexStageRegisters vertex, Gen5HullDispatch hull, uint[] userData, uint groups)
+    private void DrawTessellation(ulong submitId, RegisterBanks banks, uint count, uint instances,
+        ulong indexAddress, uint indexSize, int vertexOffset, uint firstInstance)
     {
-        var hullProgram = _pipelines.GetHullProgram(vertex, hull, userData);
-        if (hullProgram is not { Available: true })
-        {
-            WarnTessellation(hullProgram is null
-                ? $"the hull program has no registered continuation: local=0x{vertex.LocalAddress:X16}"
-                : $"the hull program could not be built: local=0x{vertex.LocalAddress:X16}");
-            return false;
-        }
-
-        var input = hullProgram.Input;
-        var program = input.Stage.Program ?? throw _host.Fatal($"The hull program is missing: local=0x{vertex.LocalAddress:X16}.");
-        _host.EndRendering();
-        using (_host.BeginPreparation())
-        {
-            var pipeline = _pipelines.CreateComputePipeline(input, hullProgram.Program);
-            var bindings = _host.PrepareBindings(input.Stage);
-            if (program.UsesDeviceAddresses)
-            {
-                _host.PrepareDeviceAddresses();
-            }
-
-            _host.BindResources(bindings);
-            Span<IPreparedBindings> stages = [bindings];
-            _host.CommitBindings(PipelineBindPoint.Compute, in pipeline, stages);
-            _host.ShaderWriteHazardBarrier();
-            _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
-            _host.Dispatch(groups, 1, 1);
-            _host.ShaderAccessBarrier();
-        }
-
-        _host.ResetBindings();
-        return true;
-    }
-
-    private void DrawDomainGrid(ulong submitId, RegisterBanks banks, Gen5DomainGrid domain, uint patches)
-    {
-        var draw = new DrawCall("DrawTessellated", RecordedOperation.DrawIndexAuto, 6 * domain.Segments * domain.Segments, patches, 0);
+        if (count == 0 || instances == 0) return;
+        ValidateDrawRegisters(banks);
+        var draw = new DrawCall("DrawTessellation", RecordedOperation.DrawIndexAuto, count, instances, firstInstance);
         var state = DrawState.Create();
-        if (!TryResolveDrawTargets(banks, in draw, ref state))
-        {
-            _host.ResetBindings();
-            return;
-        }
-
-        var context = banks.Context;
-        Span<ColorComponentMapArray> mappingStorage = stackalloc ColorComponentMapArray[1];
-        Span<ColorComponentMap> targetExportMapping = mappingStorage[0];
-        targetExportMapping.Fill(ColorComponentMap.Identity);
-        foreach (ref readonly var color in BoundColors(ref state))
-        {
-            targetExportMapping[(int)color.Slot] = color.Resolution.ExportMapping;
-        }
-
-        var programs = _pipelines.GetDomainPrograms(
-            banks.Shader.Vertex, banks.Shader.Pixel, context.ShaderInterface, context, targetExportMapping,
-            state.PixelActive, state.Depth.HasTarget, domain);
-        if (programs is not { Available: true })
-        {
-            WarnTessellation($"the domain program could not be built: export=0x{banks.Shader.Vertex.ExportAddress:X16}");
-            _host.ResetBindings();
-            return;
-        }
-
-        state.Programs = programs;
-        TraceDrawState(submitId, banks, in draw, in state);
-        var emission = new DrawEmission(false, 0, 0, 0);
-        // The grid is a triangle list; the guest primitive type names the patches.
-        var primitiveType = banks.UserConfig.PrimitiveType;
-        banks.UserConfig.PrimitiveType = (uint)GuestPrimitiveType.TriangleList;
+        if (!TryResolveDrawTargets(banks, draw, ref state)) { _host.ResetBindings(); return; }
+        ResolveShaderPrograms(banks, ref state);
+        var tessellation = state.Programs.Tessellation ?? throw _host.Fatal("The draw has no prepared tessellation programs.");
+        var hull = tessellation.Hull;
+        var input = hull.Input;
+        var layout = tessellation.HullConfiguration;
+        var patches = count / layout.InputControlPoints;
+        if (patches == 0) { _host.ResetBindings(); return; }
+        var factorIndex = input.Stage.Program!.TessellationFactorBuffer;
+        if (factorIndex < 0 || factorIndex >= input.Stage.Resources.Buffers.Length)
+            throw _host.Fatal("The tessellation factor buffer is missing from the hull resources.");
+        var descriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[factorIndex]);
+        var factorSize = descriptor.Footprint() ?? throw _host.Fatal("The tessellation factor-ring footprint overflows.");
+        var patchFactorBytes = Gen5TessellationBridge.FactorCount(tessellation.Configuration.Domain) * 4;
+        var groupFactorBytes = layout.PatchesPerGroup * patchFactorBytes;
+        var factorBytes = Math.Min(patches, layout.PatchesPerGroup) * patchFactorBytes;
+        if (descriptor.Address == 0 || factorSize < factorBytes || descriptor.SwizzleEnabled || descriptor.AddThreadId)
+            throw _host.Fatal("The tessellation factor ring has an invalid address, extent or addressing mode.");
+        // Groups that run together take their own off-chip buffer and their own run of the
+        // factor ring. Without the guest's off-chip configuration, one group runs at a time.
+        var (offchipBuffers, offchipSlotBytes) = Gpu.TessellationOffchip.Configuration;
+        var groupsPerBatch = offchipBuffers == 0 ? 1u : (uint)Math.Clamp(Math.Min(offchipBuffers, factorSize / groupFactorBytes), 1, uint.MaxValue);
+        var batchCapacity = groupsPerBatch * layout.PatchesPerGroup;
+        var originalHullStage = input.Stage;
+        var originalDomainStage = state.Programs.VertexInput.Stage;
+        var pipeline = _pipelines.CreateComputePipeline(input, hull.Program);
+        Span<GuestSpan> ranges = stackalloc GuestSpan[2];
         try
         {
-            RecordDraw(submitId, banks, in draw, ref state, PrimitiveTopology.TriangleList, in emission, default,
-                primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
+            for (uint instance = 0; instance < instances; instance++)
+                for (uint firstPatch = 0; firstPatch < patches;)
+                {
+                    var batchPatches = Math.Min(batchCapacity, patches - firstPatch);
+                    var groups = (batchPatches + layout.PatchesPerGroup - 1) / layout.PatchesPerGroup;
+                    var data = new uint[Gen5TessellationData.DwordCount];
+                    data[Gen5TessellationData.FirstPatch] = firstPatch;
+                    data[Gen5TessellationData.PatchCount] = batchPatches;
+                    data[Gen5TessellationData.VertexOffset] = unchecked((uint)vertexOffset);
+                    data[Gen5TessellationData.InstanceId] = checked(firstInstance + instance);
+                    data[Gen5TessellationData.IndexSize] = indexSize;
+                    data[Gen5TessellationData.FactorBytes] = batchPatches * patchFactorBytes;
+                    data[Gen5TessellationData.GroupPatches] = offchipBuffers == 0 ? 0 : layout.PatchesPerGroup;
+                    data[Gen5TessellationData.OffchipSlotBytes] = offchipSlotBytes;
+                    data[Gen5TessellationData.FactorGroupBytes] = groupFactorBytes;
+                    data[Gen5TessellationData.MinimumLevel] = banks.Context.ShaderInterface.MinTessellationLevel;
+                    data[Gen5TessellationData.MaximumLevel] = banks.Context.ShaderInterface.MaxTessellationLevel;
+                    using (_host.BeginPreparation())
+                    {
+                        _host.EndRendering();
+                        input.Stage = originalHullStage with { TessellationData = data };
+                        var bindings = _host.PrepareBindings(input.Stage);
+                        ranges[0] = new(descriptor.Address, factorSize);
+                        var rangeCount = 1;
+                        if (indexSize != 0)
+                        {
+                            if (indexAddress == 0) throw _host.Fatal("The tessellation indexed draw has no index buffer.");
+                            ranges[rangeCount++] = new(indexAddress, (ulong)count * indexSize);
+                        }
+                        _host.PrepareBufferAllocations(ranges[..rangeCount]);
+                        if (input.Stage.Program!.UsesDeviceAddresses) _host.PrepareDeviceAddresses();
+                        void Address(uint word, ulong address)
+                        {
+                            data[word] = (uint)address; data[word + 1] = (uint)(address >> 32);
+                        }
+                        Address(Gen5TessellationData.FactorAddress, _host.ObtainBufferDeviceAddress(descriptor.Address, factorSize, true));
+                        if (indexSize != 0)
+                        {
+                            var bias = (uint)(indexAddress & 3);
+                            var bytes = ((ulong)count * indexSize + bias + 3) & ~3ul;
+                            Address(Gen5TessellationData.IndexAddress, _host.ObtainBufferDeviceAddress(indexAddress - bias, bytes, false));
+                            data[Gen5TessellationData.IndexByteOffset] = bias;
+                        }
+                        _host.UpdateTessellationData(bindings, data);
+                        // Binding uploads shader data. Populate physical pointers
+                        // before that upload, rather than only before descriptor commit.
+                        _host.BindResources(bindings);
+                        _host.CommitBindings(PipelineBindPoint.Compute, pipeline, [bindings]);
+                        _host.BindPipeline(PipelineBindPoint.Compute, pipeline);
+                        _host.Dispatch(groups, 1, 1);
+                        _host.ShaderWriteBarrier(PipelineStageFlags.ComputeShaderBit);
+                    }
+                    state.Programs.VertexInput.Stage = originalDomainStage with { TessellationData = data };
+                    var batch = draw with { Count = batchPatches * layout.InputControlPoints, InstanceCount = 1 };
+                    var emission = new DrawEmission(false, 0, 0, 0);
+                    RecordDraw(submitId, banks, batch, ref state, PrimitiveTopology.PatchList, emission, default, false, false, false);
+                    _host.EndRendering();
+                    // The next batch reuses relative patch IDs in the guest rings.
+                    _host.ShaderWriteHazardBarrier();
+                    firstPatch += batchPatches;
+                }
         }
         finally
         {
-            banks.UserConfig.PrimitiveType = primitiveType;
-        }
-
-        _host.ResetBindings();
-    }
-
-    private static void WarnTessellation(string detail)
-    {
-        if (Interlocked.Exchange(ref _tessellationWarningShown, 1) == 0)
-        {
-            Console.Error.WriteLine($"[GPU][WARN] A tessellated draw was skipped: {detail}.");
+            input.Stage = originalHullStage;
+            state.Programs.VertexInput.Stage = originalDomainStage;
+            _host.ResetBindings();
         }
     }
 }

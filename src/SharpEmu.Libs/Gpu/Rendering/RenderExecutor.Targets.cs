@@ -24,36 +24,18 @@ public sealed partial class RenderExecutor
             return false;
         }
 
-        for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            if (Diagnostics.DbgTargetWatch.Enabled && Diagnostics.DbgTargetWatch.Addresses.Contains(context.ColorTargets[slot].BaseAddress)) // TEMP
+            ResolveTargetImages(context, ref state);
+            if (!TryDemoteMismatchedRenderScales(ref state))
             {
-                var dbgSlot = slot;
-                Diagnostics.DbgTargetWatch.Log($"slot {slot} {context.ColorTargets[slot].BaseAddress:X} {context.RenderTargetMask:X} {context.ShaderInterface.ColorShaderMask:X}", () =>
-                    $"slot={dbgSlot} base=0x{context.ColorTargets[dbgSlot].BaseAddress:X} info=0x{context.ColorTargets[dbgSlot].Info:X8} targetMask=0x{context.RenderTargetMask:X8} shaderMask=0x{context.ShaderInterface.ColorShaderMask:X8} slotMask=0x{context.RenderTargetMaskForSlot(dbgSlot):X} ps=0x{banks.Shader.Pixel.Address:X}");
-            }
-            if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
-            {
-                continue;
+                break;
             }
 
-            if (ColorTargetResolver.Resolve(context, slot, DrawLayerOffset, ignoreTargetMask: false, out var resolvedSlot) is not { } resolution)
-            {
-                continue;
-            }
-
-            var request = resolution.Request;
-            var image = _host.FindImage(ref request, exactFormat: false);
-            _host.BindRenderTarget(image);
-            state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image);
-        }
-
-        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _host.Fatal) is { } depthTarget)
-        {
-            var request = depthTarget.Target.Request;
-            var image = _host.FindImage(ref request, exactFormat: false);
-            _host.BindRenderTarget(image);
-            state.Depth = new DepthAttachmentState(in depthTarget, image);
+            // Every attachment is back at guest resolution now; resolve them again so the
+            // draw sees the replacements instead of the images that were just released.
+            state.ColorCount = 0;
+            state.Depth = default;
         }
 
         state.PixelActive = HasActivePixelShader(banks);
@@ -68,7 +50,7 @@ public sealed partial class RenderExecutor
             return true;
         }
 
-        if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive &&
+        if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive && Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_PIXSTORE") != "1" && // TEMP
             PixelStageWritesMemory(banks, ref state))
         {
             // A pixel shader can be used as a rasterized producer for a later
@@ -89,6 +71,73 @@ public sealed partial class RenderExecutor
             }
 
             return false;
+        }
+
+        return true;
+    }
+
+    private void ResolveTargetImages(ContextRegisters context, ref DrawState state)
+    {
+        for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
+        {
+            if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
+            {
+                continue;
+            }
+
+            if (ColorTargetResolver.Resolve(context, slot, DrawLayerOffset, ignoreTargetMask: false, out var resolvedSlot) is not { } resolution)
+            {
+                continue;
+            }
+
+            var request = resolution.Request;
+            var image = _host.FindImage(ref request, exactFormat: false);
+            _host.BindRenderTarget(image);
+            state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image, _host.GetRenderScale(image));
+        }
+
+        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _host.Fatal) is { } depthTarget)
+        {
+            var request = depthTarget.Target.Request;
+            var image = _host.FindImage(ref request, exactFormat: false);
+            _host.BindRenderTarget(image);
+            state.Depth = new DepthAttachmentState(in depthTarget, image, _host.GetRenderScale(image));
+        }
+    }
+
+    // One rendering scope has one render area, one viewport and one scissor, so its
+    // attachments have to agree on a host resolution. They disagree when one of them cannot
+    // be scaled at all, and then the whole pass goes back to guest resolution.
+    private bool TryDemoteMismatchedRenderScales(ref DrawState state)
+    {
+        if (!RenderScalePolicy.Enabled)
+        {
+            return false;
+        }
+
+        var scale = AttachmentRenderScale(in state);
+        var mismatched = state.Depth.HasTarget && state.Depth.RenderScale != scale;
+        for (var i = 0; i < state.ColorCount && !mismatched; i++)
+        {
+            mismatched = state.Colors[i].RenderScale != scale;
+        }
+
+        if (!mismatched)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < state.ColorCount; i++)
+        {
+            if (state.Colors[i].RenderScale != 1f)
+            {
+                _host.DemoteRenderScale(state.Colors[i].Image);
+            }
+        }
+
+        if (state.Depth.HasTarget && state.Depth.RenderScale != 1f)
+        {
+            _host.DemoteRenderScale(state.Depth.Image);
         }
 
         return true;
@@ -210,7 +259,12 @@ public sealed partial class RenderExecutor
             readRequest.View.LevelCount,
             readRequest.View.BaseLayer,
             readRequest.View.LayerCount);
-        var extent = new Extent3D(write.Width, write.Height, 1);
+        // The copy moves host texels, so the guest extent crosses into the images' resolution.
+        var copyScale = _host.GetRenderScale(destination);
+        var extent = new Extent3D(
+            RenderScalePolicy.ScaleLength(write.Width, copyScale),
+            RenderScalePolicy.ScaleLength(write.Height, copyScale),
+            1);
         var aspects = (depthCopy ? ImageAspectFlags.DepthBit : 0) | (stencilCopy ? ImageAspectFlags.StencilBit : 0);
         _host.MarkGpuWritten(destination);
         _host.CopyDepthStencilImage(source, destination, in range, in extent, aspects);
@@ -227,7 +281,7 @@ public sealed partial class RenderExecutor
         var request = resolution.Request;
         var image = _host.FindImage(ref request, exactFormat: true);
         _host.BindRenderTarget(image);
-        return image.IsValid ? new ColorTargetState(in resolution, resolvedSlot, image) : null;
+        return image.IsValid ? new ColorTargetState(in resolution, resolvedSlot, image, _host.GetRenderScale(image)) : null;
     }
 
     private static bool IsSupportedSampleCount(uint samples) => samples is 1 or 2 or 4 or 8;
@@ -276,7 +330,7 @@ public sealed partial class RenderExecutor
         ((pixelColorExportMasks >> (int)(slot * 4)) & 0xFu) == 0;
 
     // Acquires every attachment through the host and assembles the rendering scope.
-    private RenderingState AcquireAttachments(ref DrawState state)
+    private RenderingState AcquireAttachments(ref DrawState state, ContextRegisters context)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawAttachmentPreparation);
         var rendering = new RenderingState
@@ -314,8 +368,10 @@ public sealed partial class RenderExecutor
             }
 
             var view = target.Resolution.Request.View;
-            rendering.Width = Math.Min(rendering.Width, target.Resolution.Extent.Width);
-            rendering.Height = Math.Min(rendering.Height, target.Resolution.Extent.Height);
+            // The render area covers host texels, which a scaled attachment has more or fewer of.
+            var hostExtent = target.HostExtent;
+            rendering.Width = Math.Min(rendering.Width, hostExtent.Width);
+            rendering.Height = Math.Min(rendering.Height, hostExtent.Height);
             rendering.Layers = Math.Min(rendering.Layers, view.LayerCount);
             var clear = acquired.MetadataClear ? acquired.MetadataClearValue : target.Resolution.ColorClearValue;
             rendering.ColorAttachments[i] = new RenderingAttachment(
@@ -351,17 +407,27 @@ public sealed partial class RenderExecutor
             }
             else if (attachmentSamples != target.Samples)
             {
-                throw _host.Fatal($"Mixed color and depth sample counts are not supported: color={attachmentSamples} depth={target.Samples}.");
+                if (_host.NativeTwoSampleMixedSupported && context.AntialiasingConfig.SampleCountLog2 == 1 && attachmentSamples == 1 && target.Samples == 2)
+                {
+                    attachmentSamples = target.Samples;
+                }
+                else
+                    throw _host.Fatal($"Mixed color and depth sample counts are not supported: color={attachmentSamples} depth={target.Samples}.");
             }
 
             var loadState = depth.LoadState;
-            var layout = _host.SamplesDepthAttachment(in depth)
-                ? loadState.AttachmentLayout(target.Format)
-                : DepthStencilState.WritableAttachmentLayout(target.Format);
-            _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
+            var layout = DepthStencilState.AttachmentLayoutFor(
+                loadState,
+                target.Format,
+                _host.SamplesDepthAttachment(in depth),
+                _host.DepthAttachmentLayout(in depth));
+            if (_host.NativeTwoSampleMixedSupported && target.Samples == 2)
+                _host.ConfigureDepthSampleLocations(in depth, context.SampleLocations.Locations, layout, loadState.AttachmentWriteAspects(target.Format));
+            else
+                _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
             var view = target.Request.View;
-            rendering.Width = Math.Min(rendering.Width, target.Width);
-            rendering.Height = Math.Min(rendering.Height, target.Height);
+            rendering.Width = Math.Min(rendering.Width, depth.HostWidth);
+            rendering.Height = Math.Min(rendering.Height, depth.HostHeight);
             rendering.Layers = Math.Min(rendering.Layers, view.LayerCount);
             var aspects = ViewFormatRules.DepthAspects(target.Format);
             rendering.DepthStencilAttachment = new RenderingAttachment(

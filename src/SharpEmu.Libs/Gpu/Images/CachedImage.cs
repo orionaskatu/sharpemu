@@ -49,6 +49,7 @@ public sealed class ImageBacking
     public ImageCreateFlags Flags;
     public Image Handle;
     public ImageAccessState State = ImageAccessState.Initial;
+    public SampleLocationEXT[]? SampleLocations;
     public List<ImageAccessState>? SubresourceStates;
     public DeviceMemory Memory;
     public ulong AllocationSize;
@@ -76,6 +77,11 @@ public sealed unsafe partial class CachedImage : IDisposable
     private bool _bufferHoldsGpuContents;
 
     public ImageDescription Description;
+
+    // The host resolution multiplier of this image. Guest geometry in Description never
+    // changes; only the backing is larger or smaller, and guest bytes move through a
+    // guest-resolution twin (CachedImage.Transfers).
+    public readonly float RenderScale = 1.0f;
     public readonly ImageBacking Backing = new();
     public readonly List<CachedImageView> Views = new();
     private readonly Dictionary<(uint Width, uint Height), CachedImage> _stencilStorageImages = new();
@@ -90,7 +96,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     public int RecencyEntryIndex;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
-        ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null, Func<string>? memoryDiagnostics = null)
+        ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null, Func<string>? memoryDiagnostics = null,
+        bool allowScaling = true)
     {
         _device = device;
         _scheduler = scheduler;
@@ -100,6 +107,7 @@ public sealed unsafe partial class CachedImage : IDisposable
         _memoryDiagnostics = memoryDiagnostics;
         Description = description;
         Description.Validate();
+        RenderScale = allowScaling ? RenderScalePolicy.ScaleFor(Description) : 1.0f;
         _cpuDirty = !ImageDescription.IsEmptyRange(Description.Data) && Description.Metadata.Compression == DisplayCompression.Uncompressed;
         if (Description.PixelFormat == Format.Undefined)
         {
@@ -108,12 +116,13 @@ public sealed unsafe partial class CachedImage : IDisposable
 
         Backing.Format = Description.PixelFormat;
         Backing.ImageType = HostImageType(Description.Type);
-        Backing.Extent = Description.FirstLevel == 0
+        var guestExtent = Description.FirstLevel == 0
             ? Description.Extent
             : new Extent3D(
                 Math.Max(Description.Extent.Width >> (int)Description.FirstLevel, 1u),
                 Math.Max(Description.Extent.Height >> (int)Description.FirstLevel, 1u),
                 Description.Extent.Depth);
+        Backing.Extent = RenderScalePolicy.ScaleExtent(guestExtent, RenderScale);
         Backing.GuestPitch = Description.Pitch;
         Backing.Layers = Description.IsVolume ? 1 : Description.Resources.Layers;
         Backing.MipLevels = Description.Resources.Levels;
@@ -211,6 +220,9 @@ public sealed unsafe partial class CachedImage : IDisposable
             ReleaseMemory();
             Backing.Handle = default;
             Backing.Memory = default;
+            // Running out of memory is recoverable: the cache can free images and try again.
+            if (allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
+                throw new ImageOutOfMemoryException(CreateFailureMessage(create, "vkAllocateMemory", allocated, requirements.Size));
             throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
         }
 
@@ -235,14 +247,19 @@ public sealed unsafe partial class CachedImage : IDisposable
     }
 
     private Exception CreateFailure(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
-        SubmissionScheduler.Fatal(
+        SubmissionScheduler.Fatal(CreateFailureMessage(create, operation, result, requiredBytes));
+
+    private string CreateFailureMessage(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
             $"The image could not be created: operation={operation} result={result} required_bytes={requiredBytes} " +
             $"extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={create.Format}({(int)create.Format}) " +
             $"layers={create.ArrayLayers} levels={create.MipLevels} usage=0x{(uint)create.Usage:X} flags=0x{(uint)create.Flags:X} " +
             $"live_allocations={_device.LiveAllocations} allocation_limit={_device.MaxMemoryAllocationCount} " +
             $"image_pool_allocated={_memoryPool?.AllocatedBytes ?? 0} image_pool_placed={_memoryPool?.PlacedBytes ?? 0} " +
             $"last_failed_allocation_bytes={_device.LastFailedAllocationBytes} guest_address=0x{Description.Data.Address:X16} " +
-            (_memoryDiagnostics?.Invoke() ?? string.Empty));
+            (_memoryDiagnostics?.Invoke() ?? string.Empty);
+
+    // The device ran out of memory for the image's backing. Nothing was left allocated.
+    internal sealed class ImageOutOfMemoryException(string message) : Exception(message);
 
     internal static bool TrySelectSupportedImageConfiguration(IImageFormatSupport device, ref ImageCreateInfo configuration, bool allowCompressedImageFallback)
     {
@@ -297,9 +314,12 @@ public sealed unsafe partial class CachedImage : IDisposable
         _ => throw SubmissionScheduler.Fatal($"The image type is not a base type: type={(uint)type}."),
     };
 
-    private static ImageCreateFlags CreateFlags(in ImageDescription description)
+    private ImageCreateFlags CreateFlags(in ImageDescription description)
     {
         ImageCreateFlags flags = 0;
+        if (_device.CustomTwoSampleLocationsSupported && description.Samples == 2 &&
+            DepthFormatRule.AspectTransferFormat(description.PixelFormat) != Format.Undefined)
+            flags |= ImageCreateFlags.CreateSampleLocationsCompatibleDepthBitExt;
         if (DepthFormatRule.AspectTransferFormat(description.PixelFormat) == Format.Undefined)
         {
             flags |= ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit;
@@ -365,6 +385,13 @@ public sealed unsafe partial class CachedImage : IDisposable
 
         return usage;
     }
+
+    public bool IsScaled => RenderScale != 1.0f;
+
+    // Host-owned helpers - feedback snapshots, the stencil proxy, the guest-resolution twin -
+    // carry no guest placement and are created to match the image they mirror, so a copy
+    // between them and that image never crosses a resolution.
+    internal bool IsGuestPlaced => !ImageDescription.IsEmptyRange(Description.Data);
 
     public void AssociateDepth(ResourceSlotIdentifier depthImage) => DepthOwner = depthImage;
 
@@ -473,10 +500,19 @@ public sealed unsafe partial class CachedImage : IDisposable
         _gpuModified = true;
         _bufferHoldsGpuContents = false;
         GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
+        ContentSequence = GpuWriteSequence;
         _guestPieceHashes = null;
     }
 
+    // The GPU write the image contents reflect. A copy from a same-layout alias takes the
+    // source's sequence, so the alias is not copied back while neither image is written again.
+    public long ContentSequence { get; set; }
+
     public void ClearGpuModified() => _gpuModified = false;
+
+    // Advances whenever any image becomes GPU-modified, the only way an image starts to own
+    // guest bytes the CPU must not read.
+    public static long GpuWriteVersion => Interlocked.Read(ref _gpuWriteCounter);
 
     public bool IsBufferModified => _bufferModified;
 
@@ -683,6 +719,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     {
         foreach (var storage in _stencilStorageImages.Values) storage.Dispose();
         _stencilStorageImages.Clear();
+        _guestSizedTwin?.Dispose();
+        _guestSizedTwin = null;
         foreach (var cached in Views)
         {
             _device.Vk.DestroyImageView(_device.Device, cached.View, null);

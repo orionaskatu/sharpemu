@@ -20,6 +20,39 @@ public sealed class AudioOut2PortGetStateExportsTests
     }
 
     [Fact]
+    public void ContextPush_NonblockingWithoutPcmDoesNotPaceSilentGrains()
+    {
+        var ctx = CreateContext(out var memory);
+        Span<byte> parameters = stackalloc byte[0x40];
+        parameters.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(parameters[0x0C..], 4);
+        BinaryPrimitives.WriteUInt32LittleEndian(parameters[0x10..], 0x4000);
+        Assert.True(memory.TryWrite(MemoryBase, parameters));
+        ctx[CpuRegister.Rdi] = MemoryBase;
+        ctx[CpuRegister.Rsi] = MemoryBase + 0x400;
+        ctx[CpuRegister.Rdx] = 0x100;
+        ctx[CpuRegister.Rcx] = StateAddress;
+        Assert.Equal(0, AudioOut2Exports.AudioOut2ContextCreate(ctx));
+        Span<byte> handleBytes = stackalloc byte[8];
+        Assert.True(memory.TryRead(StateAddress, handleBytes));
+        var handle = BinaryPrimitives.ReadUInt64LittleEndian(handleBytes);
+        try
+        {
+            ctx[CpuRegister.Rdi] = handle;
+            ctx[CpuRegister.Rsi] = 0;
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            for (var i = 0; i < 4; i++)
+                Assert.Equal(0, AudioOut2Exports.AudioOut2ContextPush(ctx));
+            // Incorrectly pacing these grains adds over a second of sleep.
+            Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            ctx[CpuRegister.Rdi] = handle;
+            Assert.Equal(0, AudioOut2Exports.AudioOut2ContextDestroy(ctx));
+        }
+    }
+    [Fact]
     public void PortGetState_WritesExactlySizeofPortStateIgnoringPollutedR9()
     {
         var ctx = CreateContext(out var memory);
@@ -39,14 +72,16 @@ public sealed class AudioOut2PortGetStateExportsTests
         Assert.Equal(0, result);
         Span<byte> state = stackalloc byte[0x100];
         Assert.True(memory.TryRead(StateAddress, state));
-        // SceAudioOut2PortState: output@0, active@2, channels@3, volume@4.
+        // SceAudioOut2PortState: output@0, active@2, numChannels@3, volume@4.
         Assert.Equal(1, BinaryPrimitives.ReadUInt16LittleEndian(state));
-        // Yotei waits for the output to become active: +2 is 1, the decoded channel count follows at +3.
         Assert.Equal(1, state[2]);
         Assert.Equal(2, state[3]);
-        Assert.Equal(-1, BinaryPrimitives.ReadInt16LittleEndian(state[4..]));
+        Assert.Equal(127, BinaryPrimitives.ReadInt16LittleEndian(state[4..]));
+        Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(state[6..]));
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state[8..]));
-        // sizeof(SceAudioOut2PortState) is 0x40; nothing past it may be touched.
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(state[0x0C..]));
+        Assert.All(state[0x10..0x40].ToArray(), value => Assert.Equal(0, value));
+        // Bytes past sizeof(SceAudioOut2PortState), 0x40, must remain untouched.
         Assert.Equal(0xAB, state[0x40]);
         Assert.Equal(0xAB, state[0x7F]);
     }
@@ -104,15 +139,19 @@ public sealed class AudioOut2PortGetStateExportsTests
         Assert.Equal(0, result);
         Span<byte> info = stackalloc byte[0x80];
         Assert.True(memory.TryRead(StateAddress, info));
-        // type@0 = SPEAKER_TYPE_TV, availableBits@4 = FRONT_LEFT | FRONT_RIGHT.
         Assert.Equal(0, info[0]);
-        Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(info[4..]));
+        Assert.Equal(0, info[1]);
+        Assert.Equal(0, BinaryPrimitives.ReadInt16LittleEndian(info[2..]));
+        Assert.Equal(0x3u, BinaryPrimitives.ReadUInt32LittleEndian(info[4..]));
         Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(info[8..]));
-        // aSpeakerAngle[0..1] = { -30, 0 }, { +30, 0 } degrees.
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(info[0x0C..]));
         Assert.Equal(-30, BinaryPrimitives.ReadInt16LittleEndian(info[0x10..]));
+        Assert.Equal(0, BinaryPrimitives.ReadInt16LittleEndian(info[0x12..]));
         Assert.Equal(30, BinaryPrimitives.ReadInt16LittleEndian(info[0x14..]));
-        // sizeof(SceAudioOut2SpeakerInfo) is 0x50.
+        Assert.Equal(0, BinaryPrimitives.ReadInt16LittleEndian(info[0x16..]));
+        Assert.All(info[0x18..0x50].ToArray(), value => Assert.Equal(0, value));
         Assert.Equal(0xCD, info[0x50]);
+        Assert.Equal(0xCD, info[0x7F]);
     }
 
     [Fact]

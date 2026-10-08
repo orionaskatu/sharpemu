@@ -166,6 +166,8 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
 
     // Metal has no 64-bit workgroup atomics here; keep the non-atomic 32-bit pair.
     bool IShaderPipelineHost.SharedInt64AtomicsEnabled => false;
+    // The Metal backend runs no f16 conversion probe, so it keeps the exact emulation.
+    bool IShaderPipelineHost.NativeHalfConversionExact => false;
 
     RenderHostLimits IShaderPipelineHost.Limits => new(MaxDimension, MaxDimension, MaxDimension, MaxDimension);
 
@@ -280,6 +282,18 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
         _ = image;
     }
 
+    // The Metal backend never scales an image, so its attachments always agree.
+    void IRenderHost.DemoteRenderScale(ResourceSlotIdentifier image)
+    {
+        _ = image;
+    }
+
+    float IRenderHost.GetRenderScale(ResourceSlotIdentifier image)
+    {
+        _ = image;
+        return 1f;
+    }
+
     // The records of one draw or dispatch live until the executor resets; the submitted copy owns its bytes.
     void IRenderHost.ResetBindings()
     {
@@ -313,6 +327,9 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
     }
 
     BufferBinding IRenderHost.NullBuffer => new(0, 0);
+
+    // Metal bindings retain guest ranges directly; acquiring another range never replaces a handle.
+    void IRenderHost.PrepareBufferAllocations(ReadOnlySpan<SharpEmu.HLE.GpuMemory.GuestSpan> ranges) { }
 
     BufferBinding IRenderHost.ObtainBuffer(ulong address, ulong size, bool isWritten)
     {

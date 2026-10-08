@@ -111,7 +111,8 @@ public static class Videodec2Exports
         return SetReturn(ctx, Ok);
     }
 
-    // An output info with isValid clear tells the player "no buffered pictures remain".
+    // A decoded picture fills the whole output info; without one only the ready flag at
+    // offset 8 is cleared and the caller's size prefix and other fields are preserved.
     [SysAbiExport(
         Nid = "l1hXwscLuCY",
         ExportName = "sceVideodec2Flush",
@@ -121,7 +122,7 @@ public static class Videodec2Exports
     {
         var handle = ctx[CpuRegister.Rdi];
         var outputInfoAddress = ctx[CpuRegister.Rdx];
-        if (outputInfoAddress == 0 || !WriteOutputInfo(ctx, outputInfoAddress, valid: false, 0, 0))
+        if (outputInfoAddress == 0 || !ctx.Memory.TryWrite(outputInfoAddress + 0x08, NoPicture))
         {
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
@@ -169,8 +170,8 @@ public static class Videodec2Exports
         return SetReturn(ctx, Ok);
     }
 
-    // rcx is the SceVideodec2OutputInfo; its isValid flag lives in uninitialized
-    // stack and must always be written explicitly.
+    // rcx is the SceVideodec2OutputInfo: a picture fills it, no picture clears only the
+    // ready flag at offset 8 and preserves the size prefix and the other fields.
     [SysAbiExport(
         Nid = "852F5+q6+iM",
         ExportName = "sceVideodec2Decode",
@@ -183,7 +184,7 @@ public static class Videodec2Exports
         var outputSlotObj = ctx[CpuRegister.Rdx];
         var outputInfoAddress = ctx[CpuRegister.Rcx];
 
-        if (outputInfoAddress == 0 || !WriteOutputInfo(ctx, outputInfoAddress, valid: false, 0, 0))
+        if (outputInfoAddress == 0 || !ctx.Memory.TryWrite(outputInfoAddress + 0x08, NoPicture))
         {
             return SetReturn(ctx, VideodecErrorInvalidArg);
         }
@@ -227,6 +228,10 @@ public static class Videodec2Exports
 
     // SceVideodec2OutputInfo after the caller's thisSize: isValid +0x08, isErrorFrame +0x09,
     // pictureCount +0x0A, codecType +0x0C, frameWidth +0x10, framePitch +0x14, frameHeight +0x18.
+    // frameWidth (+0x10) and frameHeight (+0x18) are 32-bit fields; framePitch (+0x14) lies between them.
+    internal static bool TryWritePictureDimensions(CpuContext ctx, ulong address, uint width, uint height) =>
+        ctx.TryWriteUInt32(address + 0x10, width) && ctx.TryWriteUInt32(address + 0x18, height);
+
     private static bool WriteOutputInfo(CpuContext ctx, ulong address, bool valid, ulong width, ulong height)
     {
         Span<byte> info = stackalloc byte[0x18];
@@ -242,6 +247,8 @@ public static class Videodec2Exports
 
         return ctx.Memory.TryWrite(address + 0x08, info);
     }
+
+    private static readonly byte[] NoPicture = [0];
 
     private static int SetReturn(CpuContext ctx, int result)
     {

@@ -65,7 +65,11 @@ public sealed class ResourceSnapshotStorageTests
         Assert.Equal((uint)range.Size, first.FlattenedResourceTable[rangeOffset + 2]);
         var mappingOffset = checked((int)specialization.Images[0].IndirectMappingOffset);
         Assert.Equal(plan.FlattenedTableReservedCount, mappingOffset);
-        Assert.Equal(new uint[] { 2, 0, 0, 1, 1 }, first.FlattenedResourceTable[mappingOffset..]);
+        // The mapping reserves a power-of-two capacity (at least 16 keys); the unused tail stays zero.
+        var mappingWords = first.FlattenedResourceTable[mappingOffset..];
+        Assert.Equal(1 + 16 * 2, mappingWords.Length);
+        Assert.Equal(new uint[] { 2, 0, 0, 1, 1 }, mappingWords[..5]);
+        Assert.All(mappingWords[5..], word => Assert.Equal(0u, word));
         Assert.Equal(2, first.Images.Length);
 
         var originalTable = first.FlattenedResourceTable.ToArray();

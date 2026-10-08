@@ -722,4 +722,40 @@ public sealed unsafe partial class GuestImageCacheTests
         Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07 }, Stencil(depthId));
         harness.Shutdown();
     }
+
+    // Another depth buffer with a larger stencil plane at the same address replaces the first
+    // one's association. A plane the GPU changed reaches guest memory first, and the new depth
+    // buffer loads it from there.
+    [Fact]
+    public void LargerStencilPlaneAtTheSameAddress_WritesTheReplacedPlaneBack()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var stencilFormat = SupportedStencilFormat(_vulkan, SampleCountFlags.Count1Bit);
+        if (stencilFormat == Format.Undefined) return;
+        using var fatal = new SharpEmu.Libs.Tests.Gpu.Scheduling.FatalScope();
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var plane = address + 0xd000;
+        harness.Write(plane, [0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22]);
+        ImageRequest Bind(ulong depthAddress, uint width)
+        {
+            var request = LinearRequest(depthAddress, width * 2, stencilFormat, GuestPixelFormat.Bits16UNorm, GuestImageType.Color2D, new Extent3D(width, 1, 1), 1, 2, 1);
+            request = AsDepthTarget(request, stencilFormat);
+            request.Description.Stencil = new GuestSpan(plane, width);
+            request.View = request.View with { Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+            return request;
+        }
+
+        var small = Bind(address + 0xa000, 4);
+        harness.Acquire(ref small);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(plane, 4, 0x07070707)));
+
+        var large = Bind(address + 0xb000, 8);
+        var largeId = harness.Acquire(ref large);
+        harness.Worker.Run(() => harness.Scheduler.Finish());
+        Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07, 0x22, 0x22, 0x22, 0x22 }, harness.Read(plane, 8));
+        Assert.Equal(new byte[] { 0x07, 0x07, 0x07, 0x07, 0x22, 0x22, 0x22, 0x22 },
+            harness.ReadImageBytes(harness.Image(largeId), ImageAspectFlags.StencilBit)[..8]);
+        harness.Shutdown();
+    }
 }

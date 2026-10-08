@@ -86,6 +86,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ShaderStageKind.Vertex => ShaderStage.Vertex,
             ShaderStageKind.Pixel => ShaderStage.Pixel,
             ShaderStageKind.Compute => ShaderStage.Compute,
+            ShaderStageKind.TessellationEvaluation => ShaderStage.TessellationEvaluation,
             _ => throw SubmissionScheduler.Fatal($"The stage kind is unknown: stage={program.Stage} hash=0x{program.Hash:X16}."),
         };
 
@@ -235,24 +236,17 @@ internal static unsafe partial class VulkanVideoPresenter
             };
         }
 
-        // Render-state discovery for one shader image; the view is acquired later with the draw.
-        // TEMP: SHARPEMU_DBG_TEX_REDIRECT=from:to binds the texture at "to" wherever a descriptor names "from".
-        private static readonly bool DbgGfxStores = Environment.GetEnvironmentVariable("SHARPEMU_DBG_GFX_STORES") == "1"; // TEMP
-        private uint[]? _dbgRedirectWords;
-        private static readonly (ulong From, ulong To)? DbgTextureRedirect =
-            Environment.GetEnvironmentVariable("SHARPEMU_DBG_TEX_REDIRECT") is { Length: > 0 } dbgRedirectText && dbgRedirectText.Split(':') is { Length: 2 } dbgParts
-                ? (Convert.ToUInt64(dbgParts[0], 16), Convert.ToUInt64(dbgParts[1], 16))
-                : null;
-
         private readonly struct TextureBindingKey : IEquatable<TextureBindingKey>
         {
             private readonly ulong _words0, _words1, _words2, _words3;
             private readonly int _length;
             private readonly ShaderImageShape _shape;
             private readonly bool _storage;
+            // Whether the shader writes through the view; it is part of the image request.
+            private readonly bool _shaderWrite;
             private readonly int _hash;
 
-            public TextureBindingKey(uint[] words, ShaderImageShape shape, bool storage)
+            public TextureBindingKey(uint[] words, ShaderImageShape shape, bool storage, bool shaderWrite)
             {
                 _words0 = Pack(words, 0);
                 _words1 = Pack(words, 2);
@@ -261,14 +255,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 _length = words.Length;
                 _shape = shape;
                 _storage = storage;
+                _shaderWrite = shaderWrite;
                 var mixed = (_words0 * 0x9E3779B97F4A7C15UL) ^ (_words1 * 0xC2B2AE3D27D4EB4FUL) ^ (_words2 * 0x165667B19E3779F9UL) ^
-                            (_words3 * 0x27D4EB2F165667C5UL) ^ (ulong)_length ^ (storage ? 0x8000UL : 0UL);
+                            (_words3 * 0x27D4EB2F165667C5UL) ^ (ulong)_length ^ (storage ? 0x8000UL : 0UL) ^ (shaderWrite ? 0x4000UL : 0UL);
                 _hash = (int)(mixed ^ (mixed >> 32));
             }
 
             public bool Equals(TextureBindingKey other) =>
                 _hash == other._hash && _words0 == other._words0 && _words1 == other._words1 && _words2 == other._words2 &&
-                _words3 == other._words3 && _length == other._length && _storage == other._storage && _shape.Equals(other._shape);
+                _words3 == other._words3 && _length == other._length && _storage == other._storage && _shaderWrite == other._shaderWrite && _shape.Equals(other._shape);
 
             public override bool Equals(object? obj) => obj is TextureBindingKey other && Equals(other);
 
@@ -299,8 +294,6 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool BoundSetsEnabled = Environment.GetEnvironmentVariable("SHARPEMU_BOUND_SETS") != "0";
         private delegate TextureResource ResolveOne(int index);
         private readonly List<int> _setChanged = new();
-        private static long _dbgSetDeltas; // TEMP
-        private static long _dbgSetHits, _dbgSetMisses, _dbgMissResident, _dbgMissLog, _dbgMissOverlap, _dbgMissContent, _dbgMissNoSet; // TEMP
         private readonly Dictionary<ShaderResourceInfo, BoundImageSet> _boundSets = new(ReferenceEqualityComparer.Instance);
 
         // The resolved bindings of one bindless table, reusable while the table's descriptors,
@@ -393,17 +386,18 @@ internal static unsafe partial class VulkanVideoPresenter
         }
         private int _textureMark;
         private readonly HashSet<(ResourceSlotIdentifier, bool)> _preparedImages = new();
-        private static long _dbgTexHits, _dbgTexMisses, _dbgTexClears, _dbgTexRevalFail, _dbgTexNotStored; // TEMP
 
-        private CachedTextureBinding ResolveTextureBinding(uint[] words, ShaderImageShape shape)
+        private CachedTextureBinding ResolveTextureBinding(uint[] words, ShaderImageShape shape, bool shaderWrite)
         {
             var resolution = ImageRequestBuilders.Texture(words, shape);
             var binding = new CachedTextureBinding { Request = resolution.Request };
+            binding.Request.ShaderWrite = shaderWrite;
             binding.Image = _imageCache.FindImage(ref binding.Request, resolution.ExactFormat);
             binding.Image = ImageRequestBuilders.ValidateTextureOwner(_imageCache, binding.Image, resolution with { Request = binding.Request });
             return binding;
         }
 
+        // Render-state discovery for one shader image; the view is acquired later with the draw.
         [System.Runtime.CompilerServices.SkipLocalsInit]
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
@@ -426,15 +420,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            if (DbgTextureRedirect is { } dbgRedirect && words.Length >= 8) // TEMP
-            {
-                var dbgBase = new TextureDescriptorWords(words).BaseAddress;
-                if (dbgBase == dbgRedirect.To && !image.ResourceClass.Equals(ShaderCompiler.Resources.ImageResourceClass.Storage) && _dbgRedirectWords is null)
-                    _dbgRedirectWords = (uint[])words.Clone();
-                else if (dbgBase == dbgRedirect.From && _dbgRedirectWords is not null)
-                    words = (uint[])_dbgRedirectWords.Clone(); // the whole T# of the real surface, as its other readers use it
-            }
-
             var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
             var shape = ShapeOf(image);
             _ = BeginBatchedGuestCommands();
@@ -443,11 +428,11 @@ internal static unsafe partial class VulkanVideoPresenter
             var structureVersion = _imageCache.StructureVersion;
             if (_textureBindings.Count > MaxTextureBindings)
             {
-                _dbgTexClears++; // TEMP
                 _textureBindings.Clear();
             }
 
-            var key = new TextureBindingKey(words, shape, storage);
+            var shaderWrite = storage && (image.Written || image.Atomic);
+            var key = new TextureBindingKey(words, shape, storage, shaderWrite);
             var found = _textureBindings.TryGetValue(key, out var known);
             if (found && known!.Version != structureVersion)
             {
@@ -459,14 +444,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 else
                 {
                     found = false;
-                    _dbgTexRevalFail++; // TEMP
                 }
             }
 
             if (!found)
             {
-                _dbgTexMisses++; // TEMP
-                known = ResolveTextureBinding(words, shape);
+                known = ResolveTextureBinding(words, shape, shaderWrite);
                 if (_imageCache.StructureVersion == structureVersion)
                 {
                     known.Version = structureVersion;
@@ -484,14 +467,6 @@ internal static unsafe partial class VulkanVideoPresenter
                     known.RangeEnd = end;
                     _textureBindings[key] = known;
                 }
-                else
-                {
-                    _dbgTexNotStored++; // TEMP
-                }
-            }
-            else
-            {
-                _dbgTexHits++; // TEMP
             }
 
             var imageIdentifier = known.Image;
@@ -510,10 +485,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 BindImage(imageIdentifier, storage);
             }
-            if (Diagnostics.DbgTargetWatch.Addresses.Count != 0 && _imageCache.TryGetImage(imageIdentifier, out var dbgImage) && Diagnostics.DbgTargetWatch.Addresses.Contains(dbgImage.Description.Data.Address)) // TEMP
-                Diagnostics.DbgTargetWatch.Log($"resolve {program.Hash:X} {index} {storage}", () => $"resolved image 0x{dbgImage.Description.Data.Address:X} stage={program.Stage} hash=0x{program.Hash:X16} slot={index} storage={storage} (runtime={index < 0})");
             var descriptor = new TextureDescriptorWords(words);
-            CaptureNoteTexture(program, index, imageIdentifier, known.Request, descriptor.BaseAddress, words); // TEMP
             if (ShouldTraceTextureBindings())
             {
                 var cached = _imageCache.GetImage(imageIdentifier);
@@ -629,46 +601,7 @@ internal static unsafe partial class VulkanVideoPresenter
             return textures;
         }
 
-        // TEMP: SHARPEMU_DBG_PREP_STATS=1 prints, every 10 s, the programs that cost the most in PrepareBindings.
-        private static readonly bool DbgPrepStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PREP_STATS") == "1";
-        private static readonly Dictionary<(ulong, ShaderStageKind), (int Count, long Ticks, long Images, long BindTicks)> _dbgPrep = new();
-        private static long _dbgPrepLast = Environment.TickCount64;
-
         public IPreparedBindings PrepareBindings(ShaderStageResources stage)
-        {
-            if (!DbgPrepStats)
-                return PrepareBindingsCore(stage);
-            var start = System.Diagnostics.Stopwatch.GetTimestamp();
-            var result = PrepareBindingsCore(stage);
-            var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
-            var program = ((PreparedStageBindings)result).Program;
-            var key = (program.Hash, program.Stage);
-            _dbgPrep.TryGetValue(key, out var entry);
-            _dbgPrep[key] = (entry.Count + 1, entry.Ticks + elapsed, entry.Images + ((PreparedStageBindings)result).Descriptors.Images.Length, entry.BindTicks);
-            if (Environment.TickCount64 - _dbgPrepLast >= 10000)
-            {
-                _dbgPrepLast = Environment.TickCount64;
-                Console.Error.WriteLine($"[DBG][PREP] texbinding hits={_dbgTexHits} misses={_dbgTexMisses} clears={_dbgTexClears} revalfail={_dbgTexRevalFail} notstored={_dbgTexNotStored} entries={_textureBindings.Count}");
-                var dbgF = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-                Console.Error.WriteLine($"[DBG][PREP] sections(ms) resident={_dbgSections[0] * dbgF:F0} images={_dbgSections[1] * dbgF:F0} unique={_dbgSections[2] * dbgF:F0} tail={_dbgSections[3] * dbgF:F0} buffers={_dbgSections[4] * dbgF:F0} | bindBuffers={_dbgSections[5] * dbgF:F0} devRanges={_dbgSections[6] * dbgF:F0} bindImages={_dbgSections[7] * dbgF:F0} flattened={_dbgSections[8] * dbgF:F0}");
-                Array.Clear(_dbgSections);
-                Console.Error.WriteLine($"[DBG][PREP] boundsets hits={_dbgSetHits} deltas={_dbgSetDeltas} misses={_dbgSetMisses}");
-                _dbgSetHits = _dbgSetMisses = _dbgSetDeltas = 0;
-                if (_dbgUniqueOps != 0)
-                    Console.Error.WriteLine($"[DBG][PREP] bulk draws={_dbgUniqueOps} avg unique textures={_dbgUniqueSum / _dbgUniqueOps} distinct images={_dbgDistinctSum / _dbgUniqueOps} resident={_dbgResidentSum / _dbgUniqueOps}");
-                _dbgUniqueSum = _dbgUniqueOps = _dbgDistinctSum = _dbgResidentSum = 0;
-                _dbgTexHits = _dbgTexMisses = _dbgTexClears = _dbgTexRevalFail = _dbgTexNotStored = 0;
-                var total = _dbgPrep.Values.Sum(v => v.Ticks + v.BindTicks);
-                Console.Error.WriteLine($"[DBG][PREP] programs={_dbgPrep.Count} total_ms={total * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} ops={_dbgPrep.Values.Sum(v => v.Count)}");
-                foreach (var (k, v) in _dbgPrep.OrderByDescending(x => x.Value.Ticks + x.Value.BindTicks).Take(14))
-                    Console.Error.WriteLine($"[DBG][PREP]   {k.Item2} 0x{k.Item1:X16} n={v.Count} ms={v.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0} us/op={v.Ticks * 1e6 / System.Diagnostics.Stopwatch.Frequency / v.Count:F0} images/op={v.Images / (double)v.Count:F1} bind_us/op={v.BindTicks * 1e6 / System.Diagnostics.Stopwatch.Frequency / v.Count:F0}");
-                _dbgPrep.Clear();
-            }
-
-            return result;
-        }
-
-        private IPreparedBindings PrepareBindingsCore(ShaderStageResources stage)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var preparation = RequirePreparation();
@@ -691,9 +624,7 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Images = Scratch.Images.Rent(info.Images.Count);
             var movieCandidates = _hostMovieFramePixels is null ? null : MovieCandidates(resources, snapshot);
             var hostMovie = movieCandidates is null ? HostMovieTextureBindings.None : FindHostMovieTextureBindings(movieCandidates);
-            var dbgS0 = DbgSec(); // TEMP
             var residentImages = layout.UsesBindlessImages ? FindResidentBindlessImages(info, snapshot.FlattenedResourceTable) : null;
-            DbgSecEnd(0, ref dbgS0); // TEMP
             _preparedImages.Clear();
             _prepareEpoch++;
             _nullTextures.Clear();
@@ -749,12 +680,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     descriptors.UniqueTextures = UniqueTextures(descriptors.Images);
-                    _dbgSetDeltas++; // TEMP
                 }
                 else
                 {
                     descriptors.UniqueTextures = boundSet.Unique ??= UniqueTextures(boundSet.Images);
-                    _dbgSetHits++; // TEMP
                 }
 
                 foreach (var texture in descriptors.UniqueTextures)
@@ -764,14 +693,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             else
             {
-                if (setEligible) _dbgSetMisses++; // TEMP
                 for (var index = 0; index < info.Images.Count; index++)
                 {
                     descriptors.Images[index] = resolveOne(index);
                 }
             }
 
-            DbgSecEnd(1, ref dbgS0); // TEMP
             if (boundSet is null && _prepareMemoActive)
             {
                 descriptors.UniqueTextures = UniqueTextures(descriptors.Images);
@@ -793,25 +720,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Unique = descriptors.UniqueTextures,
                     };
                 }
-
-                if (DbgPrepStats && info.Images.Count >= 4000)
-                {
-                    _dbgUniqueSum += descriptors.UniqueTextures.Length;
-                    _dbgUniqueOps++;
-                    var dbgDistinctImages = new HashSet<ResourceSlotIdentifier>();
-                    var dbgResident = 0;
-                    for (var i = 0; i < descriptors.Images.Length; i++)
-                    {
-                        dbgDistinctImages.Add(descriptors.Images[i].ImageIdentifier);
-                        if (residentImages is null || residentImages[i]) dbgResident++;
-                    }
-
-                    _dbgDistinctSum += dbgDistinctImages.Count;
-                    _dbgResidentSum += dbgResident;
-                }
             }
 
-            DbgSecEnd(2, ref dbgS0); // TEMP
 
             _prepareMemoActive = false;
             if (layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
@@ -847,16 +757,31 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             stage.WriteDispatchThreadLimits(shaderData);
+            stage.WriteTessellationData(shaderData);
+            if (layout.UsesRenderScale)
+            {
+                ulong scaledImages = 0;
+                var scaledCount = Math.Min(info.Images.Count, 64);
+                for (var index = 0; index < scaledCount; index++)
+                {
+                    var identifier = descriptors.Images[index].ImageIdentifier;
+                    if (identifier.IsValid && _imageCache.GetImage(identifier).IsScaled)
+                    {
+                        scaledImages |= 1UL << index;
+                    }
+                }
+
+                stage.WriteRenderScale(shaderData, scaledImages, RenderScalePolicy.Scale);
+            }
+
             prepared.ShaderData = shaderData;
             if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
             {
                 descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
             }
 
-            DbgSecEnd(3, ref dbgS0); // TEMP
             FindDeviceAddressBuffers(prepared);
             FindBuffers(prepared);
-            DbgSecEnd(4, ref dbgS0); // TEMP
             ValidateDrawImageTypes(prepared);
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
@@ -868,18 +793,13 @@ internal static unsafe partial class VulkanVideoPresenter
             return prepared;
         }
 
-        // Reject incompatible draw views before buffer writes or image transitions are recorded.
-        // TEMP: SHARPEMU_DBG_IMAGE_USE=addr,addr logs every shader that binds those images.
-        private static readonly HashSet<ulong>? DbgImageUseAddresses =
-            Environment.GetEnvironmentVariable("SHARPEMU_DBG_IMAGE_USE") is { Length: > 0 } dbgText
-                ? dbgText.Split(',').Select(text => Convert.ToUInt64(text.Trim(), 16)).ToHashSet()
-                : null;
-        private static readonly HashSet<(ulong, ulong, bool, Format)> DbgImageUseSeen = new();
-        // TEMP: SHARPEMU_DBG_PROGRAM_IMAGES=hash,... logs every image those programs bind.
-        private static readonly bool DbgOnePixel = Environment.GetEnvironmentVariable("SHARPEMU_DBG_ONEPX") == "1"; // TEMP
-        private static readonly HashSet<ulong> DbgProgramImageHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROGRAM_IMAGES") ?? "")
-            .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+        public void UpdateTessellationData(IPreparedBindings prepared, uint[] data)
+        {
+            var stage = (PreparedStageBindings)prepared;
+            (stage.Stage with { TessellationData = data }).WriteTessellationData(stage.ShaderData);
+        }
 
+        // Reject incompatible draw views before buffer writes or image transitions are recorded.
         private void ValidateDrawImageTypes(PreparedStageBindings prepared)
         {
             if (prepared.Program.Stage == ShaderStageKind.Compute)
@@ -903,72 +823,10 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        // TEMP: SHARPEMU_DBG_BUF_WRITERS=addr:size,... logs each program (once per binding) that
-        // binds a written buffer or device-address range overlapping one of the ranges.
-        private static readonly (ulong Address, ulong Size)[] DbgBufferWriterRanges =
-            (Environment.GetEnvironmentVariable("SHARPEMU_DBG_BUF_WRITERS") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(item => item.Split(':')).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToUInt64(parts[1].Replace("0x", ""), 16))).ToArray();
-        private static readonly HashSet<(ulong, int, ulong, bool)> DbgBufferWritersSeen = new();
-
-        // TEMP: SHARPEMU_DBG_ARGS_WRITER_VS=vsHash,... reports the last program that wrote the
-        // indirect arguments of those vertex shaders' draws.
-        internal static readonly HashSet<ulong> DbgArgsWriterVertexHashes =
-            (Environment.GetEnvironmentVariable("SHARPEMU_DBG_ARGS_WRITER_VS") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
-        private readonly Dictionary<ulong, (ulong Hash, int Slot, ulong Address, ulong Size, ulong Tick)> _dbgPageWriters = new();
-        private readonly Dictionary<(ulong, ulong), int> _dbgArgsReports = new();
-
-        public void DebugReportArgsWriter(ulong vertexHash, ulong argsAddress) // TEMP
-        {
-            if (!DbgArgsWriterVertexHashes.Contains(vertexHash))
-                return;
-            var found = _dbgPageWriters.TryGetValue(argsAddress >> 12, out var writer);
-            var key = (vertexHash, found ? writer.Hash : 0);
-            var seen = _dbgArgsReports.GetValueOrDefault(key);
-            _dbgArgsReports[key] = seen + 1;
-            if ((seen & (seen - 1)) == 0)
-                Console.Error.WriteLine(found
-                    ? $"[DBG][ARGSWRITER] vs=0x{vertexHash:X16} args=0x{argsAddress:X} writer=0x{writer.Hash:X16} slot={writer.Slot} range=0x{writer.Address:X}+0x{writer.Size:X} writer_tick={writer.Tick} now={_scheduler.CurrentTick} n={seen + 1}"
-                    : $"[DBG][ARGSWRITER] vs=0x{vertexHash:X16} args=0x{argsAddress:X} writer=none n={seen + 1}");
-        }
-
-        // TEMP: SHARPEMU_DBG_READS_WRITER=programHash,... reports the last writer of each buffer those programs read.
-        private static readonly HashSet<ulong> DbgReadsWriterHashes =
-            (Environment.GetEnvironmentVariable("SHARPEMU_DBG_READS_WRITER") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
-
-        private void DbgNoteBufferWriter(ShaderProgramInfo program, int slot, ulong address, ulong size, bool written)
-        {
-            if (written && Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0)
-                Diagnostics.DbgTargetWatch.CheckPhysical("buffer", address, size, () => $"hash=0x{program.Hash:X16} slot={slot}");
-            if (DbgReadsWriterHashes.Contains(program.Hash))
-            {
-                var found = _dbgPageWriters.TryGetValue(address >> 12, out var writer);
-                var key = (program.Hash, (ulong)(uint)slot * 0x10000 + (found ? writer.Hash & 0xFFFF : 0));
-                var seen = _dbgArgsReports.GetValueOrDefault(key);
-                _dbgArgsReports[key] = seen + 1;
-                if ((seen & (seen - 1)) == 0)
-                    Console.Error.WriteLine($"[DBG][READSWRITER] reader=0x{program.Hash:X16} slot={slot} range=0x{address:X}+0x{size:X} written={written} " +
-                        (found ? $"writer=0x{writer.Hash:X16} wslot={writer.Slot} wrange=0x{writer.Address:X}+0x{writer.Size:X} wtick={writer.Tick} now={_scheduler.CurrentTick}" : "writer=none") + $" n={seen + 1}");
-            }
-            if (written && (DbgArgsWriterVertexHashes.Count != 0 || DbgReadsWriterHashes.Count != 0) && size <= 64UL << 20)
-            {
-                for (var page = address >> 12; page <= (address + size - 1) >> 12; page++)
-                    _dbgPageWriters[page] = (program.Hash, slot, address, size, _scheduler.CurrentTick);
-            }
-
-            foreach (var (watch, watchSize) in DbgBufferWriterRanges)
-            {
-                if (address < watch + watchSize && watch < address + size && DbgBufferWritersSeen.Add((program.Hash, slot, address, written)))
-                    Console.Error.WriteLine($"[DBG][BUFWRITER] stage={program.Stage} hash=0x{program.Hash:X16} slot={slot} range=0x{address:X}+0x{size:X} written={written} tick={_scheduler.CurrentTick}");
-            }
-        }
-
         private void FindDeviceAddressBuffers(PreparedStageBindings prepared)
         {
             foreach (var range in prepared.Stage.Resources.DeviceAddressRanges)
             {
-                if ((DbgBufferWriterRanges.Length != 0 || DbgArgsWriterVertexHashes.Count != 0 || DbgReadsWriterHashes.Count != 0 || Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0) && range.Planned && range.Size != 0) DbgNoteBufferWriter(prepared.Program, -1 - (int)range.Handle, range.Base, range.Size, range.Written); // TEMP
                 if (!range.Planned || range.Size == 0 ||
                     range.Base >= PageOwnerTable.AddressSpaceSize || range.Size > PageOwnerTable.AddressSpaceSize - range.Base ||
                     (!range.Written && !_guestMemory.CanRead(range.Base, 1)))
@@ -1095,52 +953,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void BindResources(IPreparedBindings prepared)
         {
-            if (!DbgPrepStats)
-            {
-                BindResourcesCore(prepared);
-                return;
-            }
-
-            var start = System.Diagnostics.Stopwatch.GetTimestamp();
-            BindResourcesCore(prepared);
-            var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
-            var program = ((PreparedStageBindings)prepared).Program;
-            var key = (program.Hash, program.Stage);
-            _dbgPrep.TryGetValue(key, out var entry);
-            _dbgPrep[key] = (entry.Count, entry.Ticks, entry.Images, entry.BindTicks + elapsed);
-        }
-
-        private void BindResourcesCore(IPreparedBindings prepared)
-        {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var stage = (PreparedStageBindings)prepared;
-            var dbgS0 = DbgSec(); // TEMP
             BindBuffers(stage);
-            DbgSecEnd(5, ref dbgS0); // TEMP
             ObtainDeviceAddressRanges(stage);
-            DbgSecEnd(6, ref dbgS0); // TEMP
             BindImages(stage);
-            DbgSecEnd(7, ref dbgS0); // TEMP
             if (stage.Layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
             {
                 BindRuntimeDescriptors(stage);
             }
 
             BindFlattenedResourceTable(stage);
-            DbgSecEnd(8, ref dbgS0); // TEMP
             _preparedTextures.Add(stage.Textures);
-        }
-
-        // TEMP: section timers for the heaviest bindless pixel shader (SHARPEMU_DBG_PREP_STATS=1).
-        private static readonly long[] _dbgSections = new long[9];
-        private static long _dbgSectionOps, _dbgUniqueSum, _dbgUniqueOps, _dbgDistinctSum, _dbgResidentSum;
-        private static long DbgSec() => DbgPrepStats ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-        private static void DbgSecEnd(int index, ref long start)
-        {
-            if (!DbgPrepStats) return;
-            var now = System.Diagnostics.Stopwatch.GetTimestamp();
-            _dbgSections[index] += now - start;
-            start = now;
         }
 
         // Only host movie planes own a staging buffer that must outlive the submission. Keeping
@@ -1195,6 +1019,12 @@ internal static unsafe partial class VulkanVideoPresenter
             return false;
         }
 
+        ImageLayout? IRenderHost.DepthAttachmentLayout(in DepthAttachmentState depth)
+        {
+            var view = depth.Target.Target.Request.View;
+            return _imageCache.GetImage(depth.Image).UniformLayout(new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount));
+        }
+
         private BufferView NullStorageBuffer() => new(_bufferCache.GetBuffer(GuestBufferCache.NullBufferId).Handle, 0, NullStorageBufferBytes);
 
         // A storage buffer view on the cache buffer, aligned down with the adjustment carried in the memory offsets.
@@ -1222,7 +1052,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"A storage buffer range or the device alignment is unsupported: buffer={slot} size=0x{size:X} alignment={alignment} hash=0x{program.Hash:X16}.");
             }
 
-            DbgNoteBufferWriter(program, slot, address, size, resource.Written); // TEMP
             var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier);
             var alignedOffset = offset - offset % alignment;
             var adjustment = offset - alignedOffset;
@@ -1237,6 +1066,10 @@ internal static unsafe partial class VulkanVideoPresenter
             if (resource.Formatted && resource.Written)
             {
                 _imageCache.InvalidateMemoryFromGpu(address, size);
+            }
+            else if (resource.Written)
+            {
+                _imageCache.InvalidateMemoryCopiesFromGpu(address, size);
             }
 
             return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
@@ -1451,12 +1284,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (range.Written)
                 {
                     _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true);
+                    _imageCache.InvalidateMemoryCopiesFromGpu(range.Base, size);
                 }
                 else
                 {
                     // Stream buffers do not populate the device-address page table.
                     _ = _bufferCache.FindBuffer(range.Base, size);
-                    _bufferCache.SynchronizeBuffersInRange(range.Base, size);
+                    _bufferCache.SynchronizeDeviceAddressRange(range.Base, size);
                 }
             }
         }
@@ -1609,39 +1443,6 @@ internal static unsafe partial class VulkanVideoPresenter
                     _imageCache.ApplyPendingDccClear(binding.ImageIdentifier, descriptor.MetadataAddress << 8);
                 }
 
-                if (DbgImageUseAddresses is { } dbgA && dbgA.Contains(image.Description.Data.Address) && Diagnostics.DbgTargetWatch.Addresses.Count != 0) // TEMP
-                {
-                    var dbgWords = snapshot.Images[index];
-                    Diagnostics.DbgTargetWatch.Log($"tsharp {program.Hash:X} {index} {string.Join(",", dbgWords.Select(w => w.ToString("X8")))}", () =>
-                        $"tsharp hash=0x{program.Hash:X16} slot={index} words=[{string.Join(",", dbgWords.Select(w => w.ToString("X8")))}] metaCompress={descriptor.MetadataCompress} meta=0x{descriptor.MetadataAddress << 8:X} cleared={_imageCache.IsMetadataCleared(descriptor.MetadataAddress << 8, 0, out var dbgFill)} fill=0x{dbgFill:X}");
-                }
-                if ((DbgImageUseAddresses is { } dbgAddresses && dbgAddresses.Contains(image.Description.Data.Address)) || DbgProgramImageHashes.Contains(program.Hash)) // TEMP
-                {
-                    var dbgKey = (program.Hash ^ image.Backing.Handle.Handle ^ (DbgProgramImageHashes.Contains(program.Hash) ? (_scheduler.CurrentTick / 2000) << 40 : 0), image.Description.Data.Address, binding.IsStorage, view.Format);
-                    lock (DbgImageUseSeen)
-                    {
-                        if (DbgImageUseSeen.Add(dbgKey))
-                            Console.Error.WriteLine($"[DBG][IMGUSE] words=[{string.Join(",", snapshot.Images[index].Select(w => w.ToString("X8")))}] size=0x{image.Description.Data.Size:X} hash=0x{program.Hash:X16} slot={index} addr=0x{image.Description.Data.Address:X} extent={image.Description.Extent.Width}x{image.Description.Extent.Height} storage={binding.IsStorage} written={resource.Written} view={view.Format} backing={image.Description.PixelFormat} mip={view.BaseLevel} image=0x{image.Backing.Handle.Handle:X}");
-                    }
-                }
-
-                if (DbgOnePixel && image.Backing.Extent.Width == 1 && image.Backing.Extent.Height == 1) // TEMP
-                {
-                    var dbgOneKey = (program.Hash, image.Description.Data.Address, binding.IsStorage, view.Format);
-                    lock (DbgImageUseSeen)
-                    {
-                        if (DbgImageUseSeen.Add(dbgOneKey))
-                            Console.Error.WriteLine($"[DBG][ONEPX] hash=0x{program.Hash:X16} stage={prepared.Program.Stage} slot={index} addr=0x{image.Description.Data.Address:X} storage={binding.IsStorage} written={resource.Written} fmt={view.Format} words=[{string.Join(",", snapshot.Images[index].Select(w => w.ToString("X8")))}]");
-                    }
-                }
-
-                if (binding.IsStorage && resource.Written && DbgGfxStores && prepared.Program.Stage != ShaderStageKind.Compute) // TEMP
-                    Diagnostics.DbgTargetWatch.Log($"gfxstore {program.Hash:X} {image.Description.Data.Address:X}", () => $"gfxstore stage={prepared.Program.Stage} hash=0x{program.Hash:X16} slot={index} image=0x{image.Description.Data.Address:X} extent={image.Description.Extent.Width}x{image.Description.Extent.Height} fmt={view.Format}");
-                if (binding.IsStorage && resource.Written && Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0) // TEMP
-                    Diagnostics.DbgTargetWatch.CheckPhysical("storage", image.Description.Data.Address, image.Description.Data.Size, () => $"hash=0x{program.Hash:X16} slot={index} fmt={view.Format}");
-                if (binding.IsStorage && resource.Written)
-                    CaptureNoteStorage(image, binding.Request.View, image.Description.Data.Address, program.Hash, index); // TEMP
-
                 image.Uses.Storage |= binding.IsStorage;
                 image.Uses.Texture |= !binding.IsStorage;
                 binding.CachedImage = image;
@@ -1717,7 +1518,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var stage = (PreparedStageBindings)prepared;
                 var stageFlag = DescriptorWriter.ShaderStageFlag(StageOf(stage.Program));
-                if ((bindPoint == PipelineBindPoint.Graphics && (stageFlag & (ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit)) == 0) ||
+                if ((bindPoint == PipelineBindPoint.Graphics && (stageFlag & (ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.TessellationEvaluationBit)) == 0) ||
                     (bindPoint == PipelineBindPoint.Compute && stageFlag != ShaderStageFlags.ComputeBit))
                 {
                     throw SubmissionScheduler.Fatal($"A stage does not belong to the bind point: stage={stage.Program.Stage} bindPoint={bindPoint}.");
@@ -1782,7 +1583,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var bufferIndex = 0;
             var imageIndex = 0;
             var writeIndex = 0;
-            var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
+            var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.AllGraphicsBit;
             TextureResource[] textures = textureCount == 0 ? [] : new TextureResource[textureCount];
             var textureIndex = 0;
             fixed (DescriptorBufferInfo* bufferInfoPointer = bufferInfos)
@@ -1951,7 +1752,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (hasPushData)
                 {
-                    var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit : ShaderStageFlags.ComputeBit;
+                    var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit |
+                        (entry.Description?.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit) : ShaderStageFlags.ComputeBit;
                     _vk.CmdPushConstants(command, entry.Layout, pushStages, 0, PushData.ByteSize, pushData);
                 }
 

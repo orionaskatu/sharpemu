@@ -22,7 +22,7 @@ internal static partial class RegisterWriters
     private static readonly uint[] IgnoredShaderOffsets =
     [
         SpiShaderPaceIdPs, SpiGraphicsShaderControlPs, SpiShaderPaceIdGs, SpiShaderPgmRsrc4Gs, SpiGraphicsShaderControlGs,
-        SpiShaderPgmChksumHs, SpiShaderPgmRsrc4Hs, SpiGraphicsShaderControlHs,
+        SpiShaderUserDataAddrLoGs, SpiShaderUserDataAddrHiGs, SpiShaderPgmChksumHs, SpiShaderPgmRsrc4Hs, SpiGraphicsShaderControlHs,
     ];
 
     public static void FillShader(RegisterPacketWriter?[] direct, RegisterWriter?[] indirect)
@@ -74,10 +74,13 @@ internal static partial class RegisterWriters
         direct[SpiShaderUserDataAddrLoHs] = ForwardShaderPacket;
         direct[SpiShaderUserDataAddrHiHs] = ForwardShaderPacket;
 
-        indirect[SpiShaderUserDataAddrLoHs] = static (banks, _, value) => banks.Shader.Vertex.HullUserDataAddress = (banks.Shader.Vertex.HullUserDataAddress & ~0xFFFF_FFFFUL) | value;
-        indirect[SpiShaderUserDataAddrHiHs] = static (banks, _, value) => banks.Shader.Vertex.HullUserDataAddress = (banks.Shader.Vertex.HullUserDataAddress & 0xFFFF_FFFFUL) | ((ulong)value << 32);
-        indirect[SpiShaderUserDataAddrLoGs] = static (banks, _, value) => banks.Shader.Vertex.GeometryUserDataAddress = (banks.Shader.Vertex.GeometryUserDataAddress & ~0xFFFF_FFFFUL) | value;
-        indirect[SpiShaderUserDataAddrHiGs] = static (banks, _, value) => banks.Shader.Vertex.GeometryUserDataAddress = (banks.Shader.Vertex.GeometryUserDataAddress & 0xFFFF_FFFFUL) | ((ulong)value << 32);
+        // Unlike program addresses, these registers contain byte-address
+        // bits 0..31 and 32..47, consumed directly by merged LS/HS s0:s1.
+        indirect[SpiShaderUserDataAddrLoHs] = static (banks, _, value) =>
+            banks.Shader.Vertex.HullUserDataAddress = (banks.Shader.Vertex.HullUserDataAddress & 0xFFFF_0000_0000ul) | value;
+        indirect[SpiShaderUserDataAddrHiHs] = static (banks, _, value) =>
+            banks.Shader.Vertex.HullUserDataAddress = (banks.Shader.Vertex.HullUserDataAddress & uint.MaxValue) | ((ulong)(value & 0xFFFFu) << 32);
+
         indirect[SpiShaderPgmLoHs] = static (banks, _, value) => banks.Shader.Vertex.HullAddress = RegisterField.WithLowAddress(banks.Shader.Vertex.HullAddress, value);
         indirect[SpiShaderPgmHiHs] = static (banks, _, value) => banks.Shader.Vertex.HullAddress = RegisterField.WithHighAddress(banks.Shader.Vertex.HullAddress, value);
         indirect[SpiShaderPgmRsrc1Hs] = static (banks, _, value) => banks.Shader.Vertex.HullResource1 = HullResource1.Decode(value);

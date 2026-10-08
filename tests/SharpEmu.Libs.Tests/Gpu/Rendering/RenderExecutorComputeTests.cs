@@ -224,18 +224,22 @@ public sealed class RenderExecutorComputeTests : IDisposable
     }
 
     // AGC's fill kernel: s_buffer_load_dword the value from a one-record buffer, store it per thread.
-    private void ConfigureLoadedValueFill(uint records, ulong valueAddress, uint value)
+    private void ConfigureLoadedValueFill(uint records, ulong valueAddress, uint value, bool recognized = true)
     {
         Span<byte> bytes = stackalloc byte[sizeof(uint)];
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
         Assert.True(_host.GuestMemory.TryWrite(valueAddress, bytes));
         var target = BufferDescriptor(MetadataAddress, 4, records, format: BufferDescriptorWords.Format32UInt);
         var source = BufferDescriptor(valueAddress, 0, 1);
-        var program = Program(ShaderStageKind.Compute, buffers:
-        [
+        var program = new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Compute,
+            ConstantFill = recognized ? new SharpEmu.Libs.Gpu.Pipelines.ConstantFill(0, 0, 4) : null,
+            Buffers = [
             new BufferResourceInfo(Read: true, Written: false, Atomic: false, Formatted: false, Scalar: true, MaxByteExtent: 4, PackedStride: 0),
             ClearResource(maxByteExtent: 4, packedStride: 4),
-        ]);
+            ],
+        };
         _pipelines.Compute = ComputeProgram(Stage(program, buffers: [source, target], userData: [.. target, .. source]));
     }
 
@@ -252,6 +256,27 @@ public sealed class RenderExecutorComputeTests : IDisposable
         // The dispatch must cover exactly one record per thread.
         Assert.Null(_executor.TryDecodeImageClear(_pipelines.Compute.Input, 127, 1, 1, 0x41));
         Assert.Null(_executor.TryDecodeImageClear(_pipelines.Compute.Input, 128, 2, 1, 0x41));
+    }
+
+    [Fact]
+    public void BufferUsageAlone_DoesNotProveAConstantFill()
+    {
+        ConfigureLoadedValueFill(128 * 64, RecordingRenderHost.MemoryBase + 0x70_0000, 0x4040_4040, recognized: false);
+        Assert.Null(_executor.TryDecodeImageClear(_pipelines.Compute.Input, 128, 1, 1, 0x41));
+    }
+
+    [Fact]
+    public void ConstantStoreValueAlone_DoesNotProveEveryRecordIsWritten()
+    {
+        var descriptor = BufferDescriptor(MetadataAddress, 4, 128 * 64, format: BufferDescriptorWords.Format32UInt);
+        var program = new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Compute,
+            ConstantStoreValue = 0,
+            Buffers = [ClearResource(maxByteExtent: 4, packedStride: 4)],
+        };
+        var input = ComputeProgram(Stage(program, buffers: [descriptor])).Input;
+        Assert.Null(_executor.TryDecodeImageClear(input, 128, 1, 1, 0x41));
     }
 
     [Fact]

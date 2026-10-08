@@ -34,10 +34,6 @@ public static partial class Gen5SpirvTranslator
             "dispatcher",
             StringComparison.OrdinalIgnoreCase);
 
-        private static readonly bool TraceControlFlow = string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_CONTROL_FLOW"),
-            "1",
-            StringComparison.Ordinal);
 
         private enum TerminatorKind
         {
@@ -98,31 +94,23 @@ public static partial class Gen5SpirvTranslator
         private void PrepareControlFlow(IReadOnlyList<ShaderBlock> blocks)
         {
             var reason = "forced";
-            var forced = ForceDispatcher || _request.ForceDispatcher;
+            var forced = ForceDispatcher || _request.ForceDispatcher || _request.CooperativeWave64Workgroup;
             if (!forced && TryPlanStructuredControlFlow(blocks, out var plan, out reason))
             {
                 _structuredPlan = plan;
                 _structuredBody = _module.AllocateId();
-                if (TraceControlFlow)
-                {
-                    Console.Error.WriteLine(
-                        $"[SHADER][CFG] structured address=0x{_request.Program.Address:X16} blocks={blocks.Count} loops={plan.LoopsByHeader.Count}");
-                }
-
                 return;
             }
 
-            if (TraceControlFlow)
-            {
-                Console.Error.WriteLine(
-                    $"[SHADER][CFG] dispatcher address=0x{_request.Program.Address:X16} blocks={blocks.Count} reason={reason}");
-            }
+            if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_STRUCT_REASON") == "1") // TEMP
+                Console.Error.WriteLine($"[DBG][STRUCT] dispatcher fallback hash=0x{_request.Hash:X16} blocks={blocks.Count} reason={reason}");
 
         }
 
         private bool TryEmitControlFlow(IReadOnlyList<ShaderBlock> blocks, out string error)
         {
             error = string.Empty;
+            if (_request.CooperativeWave64Workgroup) return TryEmitCooperativeDispatcher(blocks, out error);
             if (_structuredPlan is null) return TryEmitDispatcher(blocks, out error);
             _module.AddInstruction(SpirvOp.FunctionCall, _voidType, _structuredBody);
             return true;

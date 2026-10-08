@@ -18,6 +18,27 @@ public static partial class Gen5SpirvTranslator
     public static bool TryCompileProgram(ShaderCompileRequest request, out Gen5SpirvShader shader, out string error)
     {
         shader = default!;
+        if (request.CooperativeWave64Workgroup && (request.Stage != ShaderStage.Compute || request.WaveSize != 64 ||
+            (ulong)request.LocalSizeX * request.LocalSizeY * request.LocalSizeZ is 0 or > 256 ||
+            (request.LocalSizeX * request.LocalSizeY * request.LocalSizeZ) % 64 != 0))
+        {
+            error = "Cooperative wave64 requires a compute workgroup containing one to four complete waves.";
+            return false;
+        }
+        if (request.TessellationHull is not null &&
+            (request.Stage != ShaderStage.Compute || !request.CooperativeWave64Workgroup || !request.Bindings.UsesTessellationData))
+        {
+            error = "A merged hull program requires cooperative compute execution and tessellation runtime data.";
+            return false;
+        }
+        if (request.Stage == ShaderStage.TessellationEvaluation &&
+            (request.Tessellation is not { } tessellation ||
+             !Enum.IsDefined(tessellation.Domain) || !Enum.IsDefined(tessellation.Spacing) ||
+             tessellation.Spacing == Gen5TessellationSpacing.PowerOfTwo))
+        {
+            error = "Tessellation evaluation requires a supported tessellation configuration; power-of-two partitioning needs factor conversion.";
+            return false;
+        }
         try
         {
             BindingLayoutValidator.Validate(
@@ -44,16 +65,20 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            // A dual-source second output shares location 0 with index 1; every other output
+            // has index 0 and its own location.
+            var targets = request.PixelOutputs.Count(output => output.Index == 0);
             if (request.PixelOutputs.Select(output => output.GuestSlot).Distinct().Count() != request.PixelOutputs.Count ||
-                request.PixelOutputs.Select(output => output.HostLocation).Distinct().Count() != request.PixelOutputs.Count)
+                request.PixelOutputs.Select(output => (output.HostLocation, output.Index)).Distinct().Count() != request.PixelOutputs.Count)
             {
                 error = "pixel output guest slots and host locations must be unique";
                 return false;
             }
 
-            if (request.PixelOutputs.Any(output => output.HostLocation >= request.PixelOutputs.Count))
+            if (request.PixelOutputs.Any(output => output.HostLocation >= targets || output.Index > 1 ||
+                    (output.Index == 1 && (output.HostLocation != 0 || targets != 1))))
             {
-                error = "pixel output host locations must be dense in the 0..N-1 range";
+                error = "pixel output host locations must be dense in the 0..N-1 range, with a second source only at location 0 of one target";
                 return false;
             }
         }
@@ -76,7 +101,10 @@ public static partial class Gen5SpirvTranslator
         private uint _runtimeDescriptorMisses;
         private uint _runtimeSamplerArray;
         private uint _runtimeSamplerPointer;
-        private readonly Dictionary<ImageDimension, (uint Variable, uint ImageType, uint ElementPointer, SpirvImageDim Dimension, bool Arrayed)> _runtimeImageArrays = [];
+        private readonly Dictionary<(ImageDimension Dimension, ImageNumericClass NumericClass),
+            (uint Variable, uint ImageType, uint ElementPointer, uint ComponentType, uint VectorType,
+                ImageComponentKind Kind, SpirvImageDim Dimension, bool Arrayed)> _runtimeImageArrays = [];
+        private uint _runtimeImageNumericClassTable;
         private uint _globalDataShare;
         private uint _samplerArray;
         private uint _samplerType;
@@ -143,6 +171,7 @@ public static partial class Gen5SpirvTranslator
             {
                 ShaderStage.Vertex => Gen5SpirvStage.Vertex,
                 ShaderStage.Pixel => Gen5SpirvStage.Pixel,
+                ShaderStage.TessellationEvaluation => Gen5SpirvStage.TessellationEvaluation,
                 _ => Gen5SpirvStage.Compute,
             };
             _pixelOutputBindings = request.PixelOutputs;
@@ -150,12 +179,15 @@ public static partial class Gen5SpirvTranslator
                 _stage == Gen5SpirvStage.Pixel &&
                 request.Program.Instructions.Any(static instruction => instruction.Control is Gen5ExportControl { ValidMask: true });
             _enableGraphicsSubgroupOperations = _stage == Gen5SpirvStage.Compute || request.EnableGraphicsSubgroupOperations;
+            _nativeHalfConversionExact = request.NativeHalfConversionExact;
+            _zeroOutOfBoundsBufferReads = request.ZeroOutOfBoundsBufferReads;
             _waveLaneCount = request.WaveSize == 64 ? 64u : 32u;
             _localSizeX = Math.Max(request.LocalSizeX, 1);
             _localSizeY = Math.Max(request.LocalSizeY, 1);
             _localSizeZ = Math.Max(request.LocalSizeZ, 1);
             _physicalAxisOfLogical = ComputeWorkgroupAxisOrder(_localSizeX, _localSizeY, _localSizeZ);
-            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 && (ulong)_localSizeX * _localSizeY * _localSizeZ == 64;
+            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 &&
+                ((ulong)_localSizeX * _localSizeY * _localSizeZ == 64 || request.CooperativeWave64Workgroup);
             _requiredVertexOutputCount = request.RequiredVertexOutputCount;
             _pixelInputEnable = request.PixelInputEnable;
             _pixelInputAddress = request.PixelInputAddress;
@@ -217,6 +249,7 @@ public static partial class Gen5SpirvTranslator
                         break;
                     case DescriptorBindingKind.ShaderData:
                         _shaderData = DeclareWordBlock("shaderData", number, request.Bindings.UsesBindlessImages ? 1u : 0u);
+                        _module.AddDecoration(_shaderData, SpirvDecoration.NonWritable);
                         break;
                     case DescriptorBindingKind.RuntimeDescriptorTable:
                         _runtimeDescriptorTable = DeclareWordBlock("runtimeDescriptorTable", number, 1u);
@@ -232,8 +265,7 @@ public static partial class Gen5SpirvTranslator
 
             if (layout.UsesPushData)
             {
-                var arrayType = _module.TypeArray(_uintType, PushData.DwordCount);
-                _module.AddDecoration(arrayType, SpirvDecoration.ArrayStride, sizeof(uint));
+                var arrayType = _module.TypeArray(_uintType, PushData.DwordCount, sizeof(uint));
                 var block = _module.TypeStruct(arrayType);
                 _module.AddDecoration(block, SpirvDecoration.Block);
                 _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
@@ -296,12 +328,24 @@ public static partial class Gen5SpirvTranslator
                 _deviceStoreBytesScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
                 _module.AddName(_deviceStoreBytesScratch, "deviceStoreBytes");
                 _interfaces.Add(_deviceStoreBytesScratch);
-                if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor))
+                if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor) ||
+                    request.Program.Instructions.Any(instruction => IsFormatBufferLoad(instruction.Opcode)))
                 {
                     _deviceBufferWordScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
                     _module.AddName(_deviceBufferWordScratch, "deviceBufferWord");
                     _interfaces.Add(_deviceBufferWordScratch);
                 }
+            }
+            else if (layout.UsesTessellationData)
+            {
+                _module.AddCapability(SpirvCapability.PhysicalStorageBufferAddresses);
+                _module.SetPhysicalStorageBuffer64MemoryModel();
+                _physicalUintPointer = _module.TypePointer(SpirvStorageClass.PhysicalStorageBuffer, _uintType);
+            }
+            if (request.TessellationHull is not null)
+            {
+                _tessellationVertexIndexScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _interfaces.Add(_tessellationVertexIndexScratch);
             }
 
             foreach (var memoryIndex in request.IndirectKeyMemoryIndices)
@@ -504,10 +548,11 @@ public static partial class Gen5SpirvTranslator
 
         // ---- runtime descriptors ----
 
-        // A sampled access whose descriptors have no plan-time source: the image and sampler
-        // words in its registers are looked up in the host's table (RuntimeDescriptorTable),
-        // and the access samples the persistent heap through the slots found. A missing
-        // descriptor samples slot 0 (null) and is recorded for the host.
+        // An access whose image descriptor has no plan-time source looks its words up in the
+        // host's table (RuntimeDescriptorTable). Sampling accesses retain the historical float
+        // view key. Image loads derive their numeric view from the descriptor format, then fetch
+        // through the matching bindless image array. A missing descriptor reads slot 0 and is
+        // recorded for the host.
         private bool TryEmitRuntimeDescriptorImage(Gen5ShaderInstruction instruction, Gen5ImageControl image, MemoryAccessInfo entry, out string error)
         {
             if (_runtimeDescriptorTable == 0 || _runtimeDescriptorMisses == 0)
@@ -516,21 +561,53 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            var view = RuntimeImageArray(entry.ImageDimension);
             var imageKey = new uint[1 + RuntimeDescriptorTable.ImageWordCount];
-            imageKey[0] = UInt(RuntimeDescriptorTable.ViewClass(entry.ImageDimension));
             for (uint word = 0; word < RuntimeDescriptorTable.ImageWordCount; word++)
             {
                 // A 128-bit descriptor has four words; the rest of the key is zero.
                 imageKey[1 + word] = entry.ImageR128 && word >= 4 ? UInt(0) : LoadS(image.ScalarResource + word);
             }
 
+            if (!entry.NeedsSampler)
+            {
+                // The PS5 descriptor controls the numeric interpretation of an image load.
+                // Keep its format-driven class in the key so an R32_UINT and an R32_SINT view
+                // of the same image cannot alias each other in the table.
+                var numericClass = RuntimeImageNumericClass(imageKey[2]);
+                imageKey[0] = BitwiseOr(
+                    UInt(RuntimeDescriptorTable.ViewClass(entry.ImageDimension)),
+                    ShiftLeftLogical(numericClass, UInt(RuntimeDescriptorTable.ViewClassNumericShift)));
+                var runtimeImageSlot = LookupRuntimeDescriptor(imageKey, image: true);
+                _module.AddCapability(SpirvCapability.ShaderNonUniform);
+                _module.AddCapability(SpirvCapability.SampledImageArrayNonUniformIndexing);
+                _module.AddDecoration(runtimeImageSlot, SpirvDecoration.NonUniform);
+
+                string? branchError = null;
+                // A descriptor array element has one numeric view. Fetch only from the array
+                // matching that view rather than issuing invalid loads through the other typed
+                // declarations. Unknown formats use float and remain absent from the host table.
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, numericClass, UInt(0)), () =>
+                    branchError ??= EmitRuntimeDescriptorFetch(instruction, image, entry, runtimeImageSlot, ImageNumericClass.Float));
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, numericClass, UInt(1)), () =>
+                    branchError ??= EmitRuntimeDescriptorFetch(instruction, image, entry, runtimeImageSlot, ImageNumericClass.Uint));
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, numericClass, UInt(2)), () =>
+                    branchError ??= EmitRuntimeDescriptorFetch(instruction, image, entry, runtimeImageSlot, ImageNumericClass.Sint));
+                error = branchError ?? string.Empty;
+                return branchError is null;
+            }
+
+            var view = RuntimeImageArray(entry.ImageDimension, ImageNumericClass.Float);
+            imageKey[0] = UInt(RuntimeDescriptorTable.ViewClass(entry.ImageDimension));
             var samplerKey = new uint[RuntimeDescriptorTable.SamplerWordCount];
             for (uint word = 0; word < samplerKey.Length; word++)
             {
                 samplerKey[word] = LoadS(image.ScalarSampler + word);
             }
 
+            if ((entry.ImageSampleFlags & ImageSampleFlags.Adjust) != 0)
+            {
+                samplerKey[3] = BitwiseAnd(samplerKey[3], UInt(~DescriptorConstants.SamplerDword3ReservedMask));
+            }
             var imageSlot = LookupRuntimeDescriptor(imageKey, image: true);
             var samplerSlot = LookupRuntimeDescriptor(samplerKey, image: false);
 
@@ -553,9 +630,9 @@ public static partial class Gen5SpirvTranslator
                 imagePointer,
                 view.ImageType,
                 objectType,
-                _floatType,
-                _module.TypeVector(_floatType, 4),
-                ImageComponentKind.Float,
+                view.ComponentType,
+                view.VectorType,
+                view.Kind,
                 IsStorage: false,
                 view.Arrayed,
                 Dimension: view.Dimension,
@@ -563,10 +640,39 @@ public static partial class Gen5SpirvTranslator
             return EmitImageOperation(instruction, image, resource, imageObject, DescriptorConstants.IdentityImageSwizzle, UInt(0), out error);
         }
 
-        // The heap's sampled float images of one view class, declared once per module.
-        private (uint Variable, uint ImageType, uint ElementPointer, SpirvImageDim Dimension, bool Arrayed) RuntimeImageArray(ImageDimension dimension)
+        private string? EmitRuntimeDescriptorFetch(Gen5ShaderInstruction instruction, Gen5ImageControl image,
+            MemoryAccessInfo entry, uint imageSlot, ImageNumericClass numericClass)
         {
-            if (_runtimeImageArrays.TryGetValue(dimension, out var declared))
+            var view = RuntimeImageArray(entry.ImageDimension, numericClass);
+            var imagePointer = _module.AddInstruction(SpirvOp.AccessChain, view.ElementPointer, view.Variable, imageSlot);
+            var imageValue = Load(view.ImageType, imagePointer);
+            _module.AddDecoration(imagePointer, SpirvDecoration.NonUniform);
+            _module.AddDecoration(imageValue, SpirvDecoration.NonUniform);
+            var resource = new SpirvImageResource(
+                imagePointer,
+                view.ImageType,
+                view.ImageType,
+                view.ComponentType,
+                view.VectorType,
+                view.Kind,
+                IsStorage: false,
+                view.Arrayed,
+                Dimension: view.Dimension,
+                ShaderSwizzle: DescriptorConstants.IdentityImageSwizzle);
+            var mipLevel = instruction.Opcode == "ImageLoadMip"
+                ? LoadImageIntegerAddress(image, (int)ImageCoordinateComponentCount(resource))
+                : UInt(0);
+            return EmitImageOperation(instruction, image, resource, imageValue,
+                DescriptorConstants.IdentityImageSwizzle, mipLevel, out var error) ? null : error;
+        }
+
+        // The heap's sampled images of one dimension and numeric view, declared once per module.
+        private (uint Variable, uint ImageType, uint ElementPointer, uint ComponentType, uint VectorType,
+            ImageComponentKind Kind, SpirvImageDim Dimension, bool Arrayed) RuntimeImageArray(
+                ImageDimension dimension, ImageNumericClass numericClass)
+        {
+            var key = (dimension, numericClass);
+            if (_runtimeImageArrays.TryGetValue(key, out var declared))
             {
                 return declared;
             }
@@ -583,18 +689,59 @@ public static partial class Gen5SpirvTranslator
             }
 
             var arrayed = dimension is ImageDimension.Dim1DArray or ImageDimension.Dim2DArray;
-            var imageType = _module.TypeImage(_floatType, spirvDimension, depth: false, arrayed, multisampled: false, sampled: 1u, SpirvImageFormat.Unknown);
+            var kind = numericClass switch
+            {
+                ImageNumericClass.Uint => ImageComponentKind.Uint,
+                ImageNumericClass.Sint => ImageComponentKind.Sint,
+                _ => ImageComponentKind.Float,
+            };
+            var componentType = kind switch
+            {
+                ImageComponentKind.Uint => _uintType,
+                ImageComponentKind.Sint => _intType,
+                _ => _floatType,
+            };
+            var vectorType = _module.TypeVector(componentType, 4);
+            var imageType = _module.TypeImage(componentType, spirvDimension, depth: false, arrayed, multisampled: false, sampled: 1u, SpirvImageFormat.Unknown);
             _module.AddCapability(SpirvCapability.RuntimeDescriptorArray);
             var arrayType = _module.TypeRuntimeArray(imageType);
             var elementPointer = _module.TypePointer(SpirvStorageClass.UniformConstant, imageType);
             var variable = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.UniformConstant, arrayType), SpirvStorageClass.UniformConstant);
-            _module.AddName(variable, $"runtimeImages{dimension}");
+            _module.AddName(variable, $"runtimeImages{dimension}{numericClass}");
             _module.AddDecoration(variable, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(variable, SpirvDecoration.Binding, BindingLayout.BindlessSampledImageBinding);
             _interfaces.Add(variable);
-            declared = (variable, imageType, elementPointer, spirvDimension, arrayed);
-            _runtimeImageArrays.Add(dimension, declared);
+            declared = (variable, imageType, elementPointer, componentType, vectorType, kind, spirvDimension, arrayed);
+            _runtimeImageArrays.Add(key, declared);
             return declared;
+        }
+
+        // Runtime descriptors are intentionally not specialized to the format observed while a
+        // pipeline is compiled. Use the same format classification as the host's descriptor
+        // materializer, represented compactly as float=0, uint=1 and sint=2.
+        private uint RuntimeImageNumericClass(uint descriptorWord1)
+        {
+            if (_runtimeImageNumericClassTable == 0)
+            {
+                var entries = new uint[GuestImageFormat.MaxFormat + 1];
+                for (uint tableFormat = 0; tableFormat < entries.Length; tableFormat++)
+                {
+                    entries[tableFormat] = RuntimeDescriptorTable.NumericClassCode(GuestImageFormat.SampledNumericClass(tableFormat));
+                }
+
+                var type = _module.TypeArray(_uintType, (uint)entries.Length);
+                _runtimeImageNumericClassTable = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, type), SpirvStorageClass.Private,
+                    _module.ConstantComposite(type, entries.Select(UInt).ToArray()));
+                _module.AddName(_runtimeImageNumericClassTable, "runtimeImageNumericClasses");
+                _interfaces.Add(_runtimeImageNumericClassTable);
+            }
+
+            var descriptorFormat = BitwiseAnd(ShiftRightLogical(descriptorWord1, UInt(20)), UInt(0x1ff));
+            var inRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, descriptorFormat, UInt(GuestImageFormat.MaxFormat + 1));
+            var safeFormat = _module.AddInstruction(SpirvOp.Select, _uintType, inRange, descriptorFormat, UInt(0));
+            return Load(_uintType, _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer,
+                _runtimeImageNumericClassTable, safeFormat));
         }
 
         private uint RuntimeSamplerArray()
@@ -651,7 +798,9 @@ public static partial class Gen5SpirvTranslator
             }
 
             var missing = _module.AddInstruction(SpirvOp.IEqual, _boolType, slotPlusOne, UInt(0));
-            EmitConditional(missing, () => RecordRuntimeDescriptorMiss(key, image));
+            // Only an active lane reads its descriptor; an inactive one may hold anything.
+            EmitConditional(_module.AddInstruction(SpirvOp.LogicalAnd, _boolType, missing, Load(_boolType, _exec)),
+                () => RecordRuntimeDescriptorMiss(key, image));
             return _module.AddInstruction(SpirvOp.Select, _uintType, missing, UInt(0),
                 _module.AddInstruction(SpirvOp.ISub, _uintType, slotPlusOne, UInt(1)));
         }
@@ -678,6 +827,11 @@ public static partial class Gen5SpirvTranslator
         // A bounds-checked dword of a storage block; outside the block reads zero.
         private uint LoadBlockWord(uint block, uint dwordIndex)
         {
+            if (_zeroOutOfBoundsBufferReads)
+            {
+                return Load(_uintType, BlockWordPointer(block, dwordIndex));
+            }
+
             var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, block, 0);
             var inRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, dwordIndex, length);
             var safeIndex = _module.AddInstruction(SpirvOp.Select, _uintType, inRange, dwordIndex, UInt(0));
@@ -722,11 +876,12 @@ public static partial class Gen5SpirvTranslator
                 return LoadFlattenedWord(UInt(slot));
             }
 
-            // The bindless image slots precede the planned words in the table.
-            var bias = _request.Bindings.UsesBindlessImages
+            // Reserved slots address guest words, after the bindless image indices
+            // that the host prepends to the same buffer.
+            var prefix = _request.Bindings.UsesBindlessImages
                 ? BindingLayout.ImageSlotTableDwordCount(_request.Resources.Info)
-                : 0u;
-            return Load(_uintType, BlockWordPointer(_flattenedTable, UInt(bias + slot)));
+                : 0;
+            return Load(_uintType, BlockWordPointer(_flattenedTable, UInt(prefix + slot)));
         }
 
         // The shader base the host pushes for this draw, as two dwords.
@@ -792,6 +947,7 @@ public static partial class Gen5SpirvTranslator
         // Resolves a guest address through the page table. A missing page records a
         // fault and resolves to an invalid pointer; an address past the table reads as unmapped.
         private uint _deviceAddressInstructionPc;
+        private uint? _deviceAddressInstructionPcValue;
 
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
@@ -838,7 +994,7 @@ public static partial class Gen5SpirvTranslator
                     EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
                     {
                         uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)),
-                            UInt(_deviceAddressInstructionPc), Narrow(address64),
+                            _deviceAddressInstructionPcValue ?? UInt(_deviceAddressInstructionPc), Narrow(address64),
                             Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, address64, ULong(32))),
                             UInt((uint)_request.Stage), UInt(0)];
                         for (var index = 0; index < values.Length; index++)
@@ -1926,7 +2082,8 @@ public static partial class Gen5SpirvTranslator
                 _module.AddDecoration(imageValue, SpirvDecoration.NonUniform);
             }
             uint objectType;
-            if (UsesSampler(instruction.Opcode))
+            // A multisample image is never sampled through a sampler (see EmitImageOperation).
+            if (UsesSampler(instruction.Opcode) && !imageClass.Multisampled)
             {
                 if (_samplerArray == 0)
                 {
@@ -1972,7 +2129,8 @@ public static partial class Gen5SpirvTranslator
                 imageClass.Dimension,
                 imageInfo.ConversionFormat,
                 imageInfo.ShaderSwizzle,
-                imageInfo.EmulatedCompareFunction);
+                imageInfo.EmulatedCompareFunction,
+                (uint)resourceIndex);
             dstSelect = imageInfo.ShaderSwizzle;
             return true;
         }

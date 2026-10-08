@@ -326,8 +326,6 @@ public sealed class Gen5ShaderTranslatorTests
         Gen5ShaderTranslator.RegisterFusedProgram(context, entryAddress, entryHeader, continuationAddress, continuationHeader);
         Assert.True(Gen5ShaderTranslator.TryDecodeProgram(context, entryAddress, out var program, out var error), error);
         var getPc = Assert.Single(program.Instructions, instruction => instruction.Opcode == "SGetpcB64");
-        // A continuation that is not directly after the entry is relocated to the next 256-byte
-        // boundary of the fused program; S_GETPC still reports its guest address.
         Assert.Equal(0x100u, getPc.Pc);
         Assert.Equal(continuationAddress + 4,
             unchecked(program.Address + program.InstructionAddressOffset(getPc.Pc) + 4));
