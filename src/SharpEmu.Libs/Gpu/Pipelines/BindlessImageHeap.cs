@@ -102,31 +102,41 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     private readonly uint[] _capacity = new uint[BindingCount];
     private readonly DescriptorSetLayout _layout;
 
-    public BindlessImageHeap(
-        GpuDeviceInfo device,
-        SubmissionScheduler scheduler,
-        uint maxPerStageSampledImages,
-        uint maxPerStageStorageImages,
-        uint maxPerStageUpdateAfterBindSampledImages,
-        uint maxPerStageUpdateAfterBindStorageImages,
-        uint maxUpdateAfterBindSampledImages,
-        uint maxUpdateAfterBindStorageImages,
-        uint maxUpdateAfterBindDescriptors)
+    // The device's descriptor limits that bound the persistent heap. Samplers have their
+    // own per-stage and per-set limits and count against the pool-wide total too.
+    public readonly record struct Limits(
+        uint MaxPerStageSampledImages,
+        uint MaxPerStageStorageImages,
+        uint MaxPerStageSamplers,
+        uint MaxPerStageUpdateAfterBindSampledImages,
+        uint MaxPerStageUpdateAfterBindStorageImages,
+        uint MaxPerStageUpdateAfterBindSamplers,
+        uint MaxUpdateAfterBindSampledImages,
+        uint MaxUpdateAfterBindStorageImages,
+        uint MaxUpdateAfterBindSamplers,
+        uint MaxUpdateAfterBindDescriptors);
+
+    // Sampled images, storage images and samplers that fit the limits. The samplers take
+    // their share of the pool-wide total first; the images split what remains.
+    public static (uint Sampled, uint Storage, uint Samplers) Capacities(in Limits limits)
     {
-        _scheduler = scheduler;
+        var samplers = Math.Min(Math.Min(Math.Min(limits.MaxPerStageSamplers, limits.MaxPerStageUpdateAfterBindSamplers),
+            limits.MaxUpdateAfterBindSamplers), SamplerCapacity);
+        samplers = Math.Min(samplers, limits.MaxUpdateAfterBindDescriptors);
         var sampledLimit = Math.Min(
-            Math.Min(Math.Min(maxPerStageSampledImages, maxPerStageUpdateAfterBindSampledImages), maxUpdateAfterBindSampledImages),
+            Math.Min(Math.Min(limits.MaxPerStageSampledImages, limits.MaxPerStageUpdateAfterBindSampledImages), limits.MaxUpdateAfterBindSampledImages),
             StableCapacityPerBinding);
         var storageLimit = Math.Min(
-            Math.Min(Math.Min(maxPerStageStorageImages, maxPerStageUpdateAfterBindStorageImages), maxUpdateAfterBindStorageImages),
+            Math.Min(Math.Min(limits.MaxPerStageStorageImages, limits.MaxPerStageUpdateAfterBindStorageImages), limits.MaxUpdateAfterBindStorageImages),
             StableCapacityPerBinding);
-        var totalLimit = Math.Min((ulong)maxUpdateAfterBindDescriptors, (ulong)sampledLimit + storageLimit);
+        var totalLimit = Math.Min((ulong)limits.MaxUpdateAfterBindDescriptors - samplers, (ulong)sampledLimit + storageLimit);
         var sampledCapacity = Math.Min((ulong)sampledLimit, totalLimit / 2);
         var storageCapacity = Math.Min((ulong)storageLimit, totalLimit - sampledCapacity);
-        if (sampledCapacity == 0 || storageCapacity == 0)
+        if (sampledCapacity == 0 || storageCapacity == 0 || samplers == 0)
         {
             throw SubmissionScheduler.Fatal(
-                $"The device has no usable persistent image heap capacity: sampled={sampledLimit} storage={storageLimit} total={maxUpdateAfterBindDescriptors}.");
+                $"The device has no usable persistent image heap capacity: sampled={sampledLimit} storage={storageLimit} " +
+                $"samplers={samplers} total={limits.MaxUpdateAfterBindDescriptors}.");
         }
 
         // If one type has a smaller limit, give the unused half to the other type.
@@ -139,13 +149,20 @@ public sealed unsafe class BindlessImageHeap : IDisposable
             storageCapacity += Math.Min(unassigned - sampledExtra, (ulong)storageLimit - storageCapacity);
         }
 
-        _capacity[0] = (uint)sampledCapacity;
-        _capacity[1] = (uint)storageCapacity;
-        _capacity[SamplerBinding] = SamplerCapacity;
+        return ((uint)sampledCapacity, (uint)storageCapacity, samplers);
+    }
+
+    public BindlessImageHeap(GpuDeviceInfo device, SubmissionScheduler scheduler, in Limits limits)
+    {
+        _scheduler = scheduler;
+        var (sampledCapacity, storageCapacity, samplerCapacity) = Capacities(limits);
+        _capacity[0] = sampledCapacity;
+        _capacity[1] = storageCapacity;
+        _capacity[SamplerBinding] = samplerCapacity;
         _device = device;
         Console.Error.WriteLine(
-            $"[LOADER][INFO] Vulkan bindless heap sampled={sampledCapacity}/{sampledLimit} " +
-            $"storage={storageCapacity}/{storageLimit} total={sampledCapacity + storageCapacity}/{totalLimit}");
+            $"[LOADER][INFO] Vulkan bindless heap sampled={sampledCapacity} storage={storageCapacity} samplers={samplerCapacity} " +
+            $"total={limits.MaxUpdateAfterBindDescriptors}");
 
         var bindings = new DescriptorSetLayoutBinding[BindingCount];
         var flags = new DescriptorBindingFlags[bindings.Length];
@@ -161,7 +178,7 @@ public sealed unsafe class BindlessImageHeap : IDisposable
                     _ => DescriptorType.Sampler,
                 },
                 DescriptorCount = _capacity[index],
-                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit,
+                StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.ComputeBit | ShaderStageFlags.TessellationEvaluationBit,
             };
             flags[index] = DescriptorBindingFlags.PartiallyBoundBit |
                 DescriptorBindingFlags.UpdateAfterBindBit |

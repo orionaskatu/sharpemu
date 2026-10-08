@@ -236,6 +236,47 @@ public sealed partial class GuestImageCache
         destination.ClearBufferModified();
     }
 
+    // Two formats of one surface with the same layout are separate images over the same guest
+    // bytes, which the GPU writes through either of them. Before one is used, it copies the
+    // newest GPU contents among them, as unified guest memory would show them (the alias
+    // synchronization of other unified-memory emulators). Depth keeps its reinterpretation path.
+    private void SynchronizeAliases(ResourceSlotIdentifier imageIdentifier)
+    {
+        var image = _slots[imageIdentifier];
+        if (image.Description.IsDepth || ImageDescription.IsEmptyRange(image.Description.Data))
+        {
+            return;
+        }
+
+        var newest = ResourceSlotIdentifier.Invalid;
+        var newestContents = image.ContentSequence;
+        foreach (var aliasIdentifier in FindImagesInRange(image.Description.Data.Address, image.Description.Data.Size, pageOverlap: false))
+        {
+            if (aliasIdentifier == imageIdentifier || _slots.TryGet(aliasIdentifier) is not { } alias || !alias.Registered ||
+                alias.DepthOwner.IsValid || !alias.SafeToDownload || alias.ContentSequence <= newestContents ||
+                !IsSameLayoutAlias(image.Description, alias.Description))
+            {
+                continue;
+            }
+
+            newest = aliasIdentifier;
+            newestContents = alias.ContentSequence;
+        }
+
+        if (!newest.IsValid)
+        {
+            return;
+        }
+
+        CopyWholeImage(imageIdentifier, newest);
+        image.ContentSequence = newestContents;
+    }
+
+    private static bool IsSameLayoutAlias(in ImageDescription image, in ImageDescription alias) =>
+        !alias.IsDepth && alias.Data == image.Data && SameExtent(alias.Extent, image.Extent) && alias.Type == image.Type &&
+        alias.Samples == image.Samples && alias.BytesPerBlock == image.BytesPerBlock && alias.TileMode == image.TileMode &&
+        alias.Resources == image.Resources && SameMipLayout(alias, image);
+
     private void CopyIntoMip(ResourceSlotIdentifier destinationImageIdentifier, ResourceSlotIdentifier sourceImageIdentifier, uint mip, uint layer)
     {
         RefreshCopySource(sourceImageIdentifier);
@@ -421,7 +462,9 @@ public sealed partial class GuestImageCache
             }
 
             PrepareCopyTarget(replacement);
-            _blit.Reinterpret(cached, replacement);
+            // The conversion renders at the destination's guest extent, and a multisample
+            // destination never scales, so a scaled source contributes its guest-sized twin.
+            _blit.Reinterpret(cached.AtGuestResolution(), replacement);
             TakeGpuOwnership(replacement);
         }
         else
@@ -627,8 +670,17 @@ public sealed partial class GuestImageCache
             }
         }
 
+        // The replaced plane belongs to another depth image. What the GPU wrote to it reaches
+        // guest memory before the association goes, as when a depth image changes planes.
         foreach (var imageIdentifier in stale)
         {
+            var proxy = _slots[imageIdentifier];
+            if (proxy.IsGpuModified)
+            {
+                WriteBackStencilPlane(_slots[proxy.DepthOwner], proxy.Description.Data);
+                proxy.ClearGpuModified();
+            }
+
             DeleteImage(imageIdentifier);
         }
 

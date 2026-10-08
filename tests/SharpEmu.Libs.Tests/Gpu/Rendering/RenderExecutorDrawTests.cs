@@ -50,11 +50,11 @@ public sealed class RenderExecutorDrawTests : IDisposable
             "bind_target 1",
             "prepare_bindings Vertex -> 1",
             "prepare_bindings Pixel -> 2",
+            "acquire_color 0 100000000 image=1",
             "bind_resources 1",
             "bind_resources 2",
             "obtain 100400000 40 written=False -> 100:0",
             "obtain 100500000 C written=False",
-            "acquire_color 0 100000000 image=1",
             "debug DrawIndex 7 100 6 0 2 0",
             "bind_vertex 100:0",
             "commit Graphics A1 [1,2]",
@@ -126,6 +126,44 @@ public sealed class RenderExecutorDrawTests : IDisposable
 
         AssertOrder("upload_transient 18", "draw_indexed 6 2 0 3 1", "reset_bindings");
         Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indexed_indirect", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void IndirectAutoDraw_LetsTheGpuReadTheArguments()
+    {
+        var arguments = Auto(1, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawAuto(7, Banks(), arguments);
+
+        AssertOrder("obtain 100600000 10 written=False", "begin_rendering", "bind_pipeline Graphics A1", "draw_indirect", "reset_bindings");
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void IndirectAutoTriangleFan_ReadsTheArgumentsOnTheCpu()
+    {
+        WriteIndirectArguments(3, 2, 4, 1);
+        var arguments = Auto(1, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawAuto(7, Banks(PrimitiveTriangleFan), arguments);
+
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indirect", StringComparison.Ordinal));
+        Assert.Contains(_host.Calls, c => c.StartsWith("draw ", StringComparison.Ordinal));
+    }
+
+    // The merged tessellation path counts patches from the vertex count on the CPU, so an
+    // indirect tessellation draw must read its arguments there, not leave them to the GPU.
+    [Fact]
+    public void IndirectAutoTessellation_ReadsTheArgumentsOnTheCpu()
+    {
+        WriteIndirectArguments(6, 2, 0, 0);
+        var banks = Banks();
+        banks.Context.ShaderStages = TessellationStages;
+        banks.Context.ShaderInterface.TessellationFactorParameter = 0x45;
+        banks.Context.ShaderInterface.LocalHullConfiguration = 0xC301;
+        var arguments = Auto(1, source: DrawOffsetSource.IndirectArguments) with { IndirectArgumentsAddress = IndirectArguments };
+        _executor.DrawAuto(7, banks, arguments);
+
+        Assert.Contains("debug DrawIndexAuto 7 6 0 0 2 0", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("draw_indirect", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -208,6 +246,27 @@ public sealed class RenderExecutorDrawTests : IDisposable
         { "output primitive", banks => banks.Context.ShaderInterface.GeometryOutputPrimitiveType = 5 },
         { "max output per subgroup", banks => banks.Context.ShaderInterface.MaxOutputPerSubgroup = 0x41 },
     };
+
+    // LS/HS/ES with passthrough primitive generation: the merged tessellation path.
+    private const uint TessellationStages = 0x0200210D;
+
+    [Theory]
+    [InlineData(0x45u, 0xC301u, "power-of-two partitioning")]
+    [InlineData(0x03u, 0xC301u, "an undefined domain")]
+    [InlineData(0x41u, 0x0000u, "an empty hull workgroup")]
+    public void UnsupportedTessellation_SkipsTheDrawInsteadOfFailing(uint factorParameter, uint hullConfiguration, string reason)
+    {
+        var banks = Banks();
+        banks.Context.ShaderStages = TessellationStages;
+        banks.Context.ShaderInterface.TessellationFactorParameter = factorParameter;
+        banks.Context.ShaderInterface.LocalHullConfiguration = hullConfiguration;
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+        _executor.DrawAuto(2, banks, Auto(3));
+
+        Assert.True(_pipelines.Calls.Count == 0, reason);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("find_image", StringComparison.Ordinal));
+    }
 
     [Theory]
     [MemberData(nameof(UnsupportedGeometryStages))]
@@ -525,6 +584,21 @@ public sealed class RenderExecutorDrawTests : IDisposable
         var obtains = _host.Calls.Where(c => c.StartsWith("obtain", StringComparison.Ordinal)).ToList();
         Assert.Equal(["obtain 100400000 1A0 written=False -> 100:0", "obtain 100401000 40 written=False -> 101:0"], obtains);
         Assert.Contains("bind_vertex 100:100,100:0,101:0,1:0,100:180", _host.Calls);
+    }
+
+    [Theory]
+    [InlineData(0x100UL)]
+    [InlineData(0x1200UL)]
+    public void IndexAllocationDoesNotRetireTheVertexBufferBeforeTheDraw(ulong vertexOffset)
+    {
+        _pipelines.Graphics = Programs(vertexBuffers:
+            [new VertexInputBuffer(IndexBase + vertexOffset, 16, 16)]);
+        _executor.DrawIndexed(1, Banks(), Indexed(4096));
+
+        var binding = Assert.Single(_host.LastVertexBindings);
+        Assert.True(_host.IsBufferLive(binding.Handle),
+            $"The draw binds a retired vertex buffer: {string.Join(" | ", _host.Calls)}");
+        Assert.Equal(vertexOffset, binding.Offset);
     }
 
     [Fact]

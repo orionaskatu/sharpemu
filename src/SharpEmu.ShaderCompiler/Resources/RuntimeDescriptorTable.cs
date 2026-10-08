@@ -66,9 +66,34 @@ public static class RuntimeDescriptorTable
         return hash;
     }
 
-    // The view a runtime-descriptor access declares: its dimension and whether it is an array.
-    // Sampled float views only; the host creates a view of exactly this class.
-    public static uint ViewClass(ImageDimension dimension) => (uint)dimension;
+    // The view a runtime-descriptor access declares. Float views deliberately retain the
+    // old dimension-only value so existing sampled-descriptor keys stay unchanged; integer
+    // views occupy the next two 8-bit ranges.
+    public const uint ViewClassNumericShift = 8;
+    private const uint ViewClassDimensionMask = (1u << (int)ViewClassNumericShift) - 1;
+
+    public static uint ViewClass(ImageDimension dimension) => ViewClass(dimension, ImageNumericClass.Float);
+
+    public static uint ViewClass(ImageDimension dimension, ImageNumericClass numericClass) =>
+        (uint)dimension | (NumericClassCode(numericClass) << (int)ViewClassNumericShift);
+
+    public static ImageDimension ViewDimension(uint viewClass) =>
+        (ImageDimension)(viewClass & ViewClassDimensionMask);
+
+    public static ImageNumericClass ViewNumericClass(uint viewClass) =>
+        ((viewClass >> (int)ViewClassNumericShift) & 0xff) switch
+        {
+            1 => ImageNumericClass.Uint,
+            2 => ImageNumericClass.Sint,
+            _ => ImageNumericClass.Float,
+        };
+
+    public static uint NumericClassCode(ImageNumericClass numericClass) => numericClass switch
+    {
+        ImageNumericClass.Uint => 1,
+        ImageNumericClass.Sint => 2,
+        _ => 0,
+    };
 
     public static bool SupportsRuntimeView(ImageDimension dimension) =>
         dimension is ImageDimension.Dim1D or ImageDimension.Dim1DArray or ImageDimension.Dim2D or

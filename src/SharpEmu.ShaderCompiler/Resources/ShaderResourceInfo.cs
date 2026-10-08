@@ -12,6 +12,7 @@ public enum ShaderStage : byte
     Vertex,
     Pixel,
     Compute,
+    TessellationEvaluation,
 }
 
 public enum ImageNumericClass : byte
@@ -35,6 +36,9 @@ public static class DescriptorConstants
     public const uint IdentityImageSwizzle = 0xFAC;
     public const uint InvalidFormat = 0;
     public const uint NoIndex = uint.MaxValue;
+    // GFX10 S# dword 3 bits 12-29 are reserved. The adjusted sample forms carry their
+    // adjustment there; the sampler itself ignores them.
+    public const uint SamplerDword3ReservedMask = 0x3FFF_F000u;
 }
 
 // One buffer resource of a program and how the program uses it.
@@ -189,6 +193,10 @@ public sealed class ShaderResourceInfo
     // Some sampled access reads its descriptors through the runtime descriptor table.
     public bool UsesRuntimeDescriptors { get; set; }
 
+    // Descriptor accesses with no plan-time source that read the null descriptor instead
+    // (their texels read as zero); the host reports them so the loss is visible.
+    public List<(uint Pc, string Kind)> NullDescriptorFallbacks { get; set; } = [];
+
     public ShaderResourceInfo Clone() => new()
     {
         Buffers = Buffers.Select(buffer => buffer.Clone()).ToList(),
@@ -204,6 +212,7 @@ public sealed class ShaderResourceInfo
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
         UsesRuntimeDescriptors = UsesRuntimeDescriptors,
+        NullDescriptorFallbacks = [.. NullDescriptorFallbacks],
     };
 }
 
@@ -256,6 +265,9 @@ public sealed class DescriptorSource
 
     // For a sampler: Dwords are the table V#, and every record's sampler must be the same.
     public PointerTableSelector? PointerTable { get; init; }
+    // Scalar loads from an empty buffer return zero regardless of the offset.
+    // Materialization must recheck the source extent before using these words.
+    public uint? ZeroExtentBufferSource { get; init; }
 }
 
 // One immediate-offset scalar read the host evaluates into the flattened table.

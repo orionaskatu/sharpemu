@@ -699,7 +699,7 @@ public static class PlayGoExports
     {
         lock (_stateGate)
         {
-            return _metadata.ChunkIdKnowledge == PlayGoChunkIdKnowledge.Unknown ||
+            return _metadata.ChunkIdKnowledge != PlayGoChunkIdKnowledge.Authoritative ||
                 Array.BinarySearch(_metadata.ChunkIds, chunkId) >= 0;
         }
     }
@@ -726,7 +726,7 @@ public static class PlayGoExports
         if (pgmChunkIds.Length > 0)
         {
             TracePlayGo($"metadata_pgm chunks={pgmChunkIds.Length}");
-            return new PlayGoMetadata(true, pgmChunkIds, PlayGoChunkIdKnowledge.Authoritative);
+            return new PlayGoMetadata(true, pgmChunkIds, PlayGoChunkIdKnowledge.Assumed);
         }
 
         var chunkIds = LoadChunkIds(chunkDefsXml);
@@ -935,6 +935,9 @@ public static class PlayGoExports
     {
         Unknown,
         Authoritative,
+        // The list is derived rather than read (playgo.pgm gives only a count), so it is
+        // reported but an ID outside it is not rejected.
+        Assumed,
     }
 
     private sealed record PlayGoMetadata(

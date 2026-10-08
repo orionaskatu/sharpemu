@@ -14,6 +14,9 @@ internal delegate bool GuestBufferSourceReader(ulong address, Span<byte> destina
 internal sealed class GuestBufferUploader(
     GpuDeviceInfo device, SubmissionScheduler scheduler, ICpuMemory guest, GpuRingBuffer staging)
 {
+    private static readonly bool DbgUploadStacks = Environment.GetEnvironmentVariable("SHARPEMU_DBG_UPLOAD_STACKS") == "1"; // TEMP
+    private static long _dbgUploadCalls; // TEMP
+
     public GpuBuffer? PrepareSource(ulong bufferAddress, Span<BufferCopy> regions,
         ulong totalSize, ulong requestedAddress, ulong requestedSize, GuestBufferSourceReader? readSource = null)
     {
@@ -21,6 +24,12 @@ internal sealed class GuestBufferUploader(
         if (regions.IsEmpty)
         {
             return null;
+        }
+
+        if (DbgUploadStacks && Interlocked.Increment(ref _dbgUploadCalls) % 997 == 0) // TEMP
+        {
+            var frames = new System.Diagnostics.StackTrace(1, false).GetFrames().Skip(1).Take(7).Select(frame => frame.GetMethod()?.Name ?? "?");
+            Console.Error.WriteLine($"[DBG][UPLOAD] size=0x{totalSize:X} regions={regions.Length} first=0x{regions[0].Size:X} req=0x{requestedSize:X} {string.Join(" < ", frames)}");
         }
 
         if (staging.TryMap(totalSize, out var baseOffset, 4))

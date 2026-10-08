@@ -235,9 +235,6 @@ public static partial class Gen5ShaderTranslator
         var continuationPc = adjacent
             ? (uint)continuationDistance
             : (uint)((entryEnd + FusedContinuationAlignment - 1) & ~(FusedContinuationAlignment - 1));
-        // Relocated continuation instructions keep their guest PC for S_GETPC (see
-        // Gen5ShaderProgram.InstructionAddressOffset).
-        var addressOffsets = adjacent ? null : new Dictionary<uint, ulong>();
         var instructions = new List<Gen5ShaderInstruction>(
             entryProgram.Instructions.Count + continuationProgram.Instructions.Count);
         instructions.AddRange(entryProgram.Instructions.Take(entryProgram.Instructions.Count - 1));
@@ -263,19 +260,12 @@ public static partial class Gen5ShaderTranslator
                 return false;
             }
 
-            if (adjacent)
-            {
-                instructions.Add(instruction with { Pc = (uint)rebasedPc });
-            }
-            else
-            {
-                var addressOffset = unchecked(continuationDistance + instruction.ProgramOffset);
-                instructions.Add(instruction with { Pc = (uint)rebasedPc, AddressOffset = addressOffset });
-                addressOffsets![(uint)rebasedPc] = addressOffset;
-            }
+            instructions.Add(adjacent
+                ? instruction with { Pc = (uint)rebasedPc }
+                : instruction with { Pc = (uint)rebasedPc, AddressOffset = unchecked(continuationDistance + instruction.ProgramOffset) });
         }
 
-        program = new Gen5ShaderProgram(entryAddress, instructions) { InstructionAddressOffsets = addressOffsets };
+        program = new Gen5ShaderProgram(entryAddress, instructions) { FusedContinuationPc = continuationPc };
         error = string.Empty;
         return true;
     }

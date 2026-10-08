@@ -42,12 +42,17 @@ public static class DescriptorWriter
         ShaderStage.Vertex => ShaderStageFlags.VertexBit,
         ShaderStage.Pixel => ShaderStageFlags.FragmentBit,
         ShaderStage.Compute => ShaderStageFlags.ComputeBit,
+        ShaderStage.TessellationEvaluation => ShaderStageFlags.TessellationEvaluationBit,
         _ => throw SubmissionScheduler.Fatal($"The shader stage is unknown: stage={stage}."),
     };
 
     public static PipelineStageFlags PipelineStageFlag(ShaderStageFlags stages)
     {
         var result = PipelineStageFlags.None;
+        if ((stages & ShaderStageFlags.TessellationControlBit) != 0)
+            result |= PipelineStageFlags.TessellationControlShaderBit;
+        if ((stages & ShaderStageFlags.TessellationEvaluationBit) != 0)
+            result |= PipelineStageFlags.TessellationEvaluationShaderBit;
         if ((stages & ShaderStageFlags.VertexBit) != 0)
         {
             result |= PipelineStageFlags.VertexShaderBit;

@@ -188,6 +188,10 @@ internal static unsafe partial class VulkanVideoPresenter
             TrackImageBinding(imageIdentifier);
         }
 
+        public void DemoteRenderScale(ResourceSlotIdentifier imageIdentifier) => _imageCache.DemoteRenderScale(imageIdentifier);
+
+        public float GetRenderScale(ResourceSlotIdentifier imageIdentifier) => _imageCache.GetImage(imageIdentifier).RenderScale;
+
         private void ResetImageBindings()
         {
             foreach (var imageIdentifier in _trackedImageBindings)

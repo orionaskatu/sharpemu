@@ -76,6 +76,20 @@ public readonly record struct DepthStencilState(
             : ImageLayout.DepthAttachmentOptimal;
     }
 
+    // A sampled attachment needs the read-only layouts; a draw that writes needs the writable
+    // one. A draw that neither samples nor writes keeps the read-only layout it is already in,
+    // so sampling and depth-testing draws can alternate inside one rendering scope.
+    public static ImageLayout AttachmentLayoutFor(DepthStencilState state, Format format, bool sampled, ImageLayout? current)
+    {
+        var readOnly = state.AttachmentLayout(format);
+        if (sampled)
+        {
+            return readOnly;
+        }
+
+        return state.IsReadOnly(format) && current == readOnly ? readOnly : WritableAttachmentLayout(format);
+    }
+
     public ImageLayout AttachmentLayout(Format format)
     {
         var available = ViewFormatRules.DepthAspects(format);
@@ -151,22 +165,12 @@ public readonly record struct DepthTargetState(DepthTargetResolution Target, Dep
 public static class DepthTargetResolver
 {
     private const byte Ones = 0x02;
-    private const byte ReplaceWithTestValue = 0x03;
     private const byte ReplaceWithOperationValue = 0x04;
     private const byte ExclusiveOr = 0x0C;
-
-    private static bool ReferenceTested(uint compare) => compare is not ((uint)CompareOp.Never or (uint)CompareOp.Always);
 
     // Null means no depth or stencil state is active for the draw.
     public static DepthTargetState? Resolve(ContextRegisters context, IImageFormatSupport device, Func<string, Exception> fatal)
     {
-        if (Diagnostics.DbgTargetWatch.Enabled) // TEMP
-        {
-            var dbgDepth = context.DepthTarget;
-            Diagnostics.DbgTargetWatch.Log($"depth {dbgDepth.ZWriteBase:X} {dbgDepth.ZReadBase:X} {dbgDepth.StencilWriteBase:X}", () =>
-                $"depth zwrite=0x{dbgDepth.ZWriteBase:X} zread=0x{dbgDepth.ZReadBase:X} stencil=0x{dbgDepth.StencilWriteBase:X} info=0x{dbgDepth.ZInfo:X8}");
-        }
-
         if (ImageRequestBuilders.DepthTarget(in context.DepthTarget, device) is not { } target)
         {
             return null;
@@ -175,16 +179,12 @@ public static class DepthTargetResolver
         return new DepthTargetState(target, ResolveState(context, target.HasStencil, fatal));
     }
 
-    private static readonly bool DbgStencilLog = Environment.GetEnvironmentVariable("SHARPEMU_DBG_STENCIL_LOG") == "1"; // TEMP
-    private static readonly HashSet<string> DbgStencilSeen = new(); // TEMP
-    private static readonly bool DbgNoStencil = Environment.GetEnvironmentVariable("SHARPEMU_DBG_NO_STENCIL") == "1"; // TEMP
-
     public static DepthStencilState ResolveState(ContextRegisters context, bool hasStencil, Func<string, Exception> fatal)
     {
         var depth = context.DepthTarget;
         var control = context.StencilControl;
         var masks = context.StencilMask;
-        var stencilTest = hasStencil && depth.StencilTestEnabled && !DbgNoStencil; // TEMP switch
+        var stencilTest = hasStencil && depth.StencilTestEnabled;
         var front = StencilOperations.Default;
         var frontMasks = default(StencilMasks);
         var back = front;
@@ -195,32 +195,29 @@ public static class DepthTargetResolver
             var operationsDisabled = depth.StencilClearEnabled || depth.StencilWriteDisabled;
             var frontWriteMask = operationsDisabled ? (byte)0 : masks.WriteMask;
             var backWriteMask = operationsDisabled ? (byte)0 : masks.WriteMaskBack;
-            var resolved = ResolveFace(control.Fail, control.Pass, control.DepthFail, depth.StencilCompare, masks.Mask, frontWriteMask,
-                masks.TestValue, masks.OperationValue, fatal, out front, out frontMasks);
+            if (depth.StencilCompare > (uint)CompareOp.Always ||
+                (depth.BackFaceEnabled && depth.StencilCompareBack > (uint)CompareOp.Always))
+            {
+                throw fatal(
+                    $"The stencil compare or replacement state is not supported: depthControl=0x{depth.DepthControl:X8} " +
+                    $"front=(fail={control.Fail} pass={control.Pass} depthFail={control.DepthFail} test=0x{masks.TestValue:X2} operation=0x{masks.OperationValue:X2} write=0x{frontWriteMask:X2}) " +
+                    $"back=(fail={control.FailBack} pass={control.PassBack} depthFail={control.DepthFailBack} test=0x{masks.TestValueBack:X2} operation=0x{masks.OperationValueBack:X2} write=0x{backWriteMask:X2}).");
+            }
+
+            frontMasks = new StencilMasks(masks.Mask, frontWriteMask, masks.TestValue);
+            front = ConvertFace(control.Fail, control.Pass, control.DepthFail,
+                (CompareOp)depth.StencilCompare, masks.OperationValue, ref frontMasks, fatal);
             if (depth.BackFaceEnabled)
             {
-                resolved &= ResolveFace(control.FailBack, control.PassBack, control.DepthFailBack, depth.StencilCompareBack, masks.MaskBack, backWriteMask,
-                    masks.TestValueBack, masks.OperationValueBack, fatal, out back, out backMasks);
+                backMasks = new StencilMasks(masks.MaskBack, backWriteMask, masks.TestValueBack);
+                back = ConvertFace(control.FailBack, control.PassBack, control.DepthFailBack,
+                    (CompareOp)depth.StencilCompareBack, masks.OperationValueBack, ref backMasks, fatal);
             }
             else
             {
                 back = front;
                 backMasks = frontMasks;
             }
-
-            if (!resolved)
-            {
-                throw fatal(
-                    $"The stencil compare or replacement state is not supported: depthControl=0x{depth.DepthControl:X8} " +
-                    $"front=(fail={control.Fail} pass={control.Pass} depthFail={control.DepthFail} test=0x{masks.TestValue:X2} mask=0x{masks.Mask:X2} operation=0x{masks.OperationValue:X2} write=0x{frontWriteMask:X2}) " +
-                    $"back=(fail={control.FailBack} pass={control.PassBack} depthFail={control.DepthFailBack} test=0x{masks.TestValueBack:X2} mask=0x{masks.MaskBack:X2} operation=0x{masks.OperationValueBack:X2} write=0x{backWriteMask:X2}).");
-            }
-        }
-
-        if (DbgStencilLog && stencilTest) // TEMP
-        {
-            var key = $"cmp={depth.StencilCompare} fail={control.Fail} pass={control.Pass} zfail={control.DepthFail} test=0x{masks.TestValue:X2} mask=0x{masks.Mask:X2} op=0x{masks.OperationValue:X2} write=0x{masks.WriteMask:X2} -> {front} {frontMasks} zcmp={depth.DepthCompare} zwrite={depth.DepthWriteEnabled}";
-            lock (DbgStencilSeen) if (DbgStencilSeen.Add(key)) Console.Error.WriteLine($"[DBG][STENCIL] {key}");
         }
 
         return new DepthStencilState(
@@ -241,42 +238,61 @@ public static class DepthTargetResolver
             backMasks);
     }
 
-    // Vulkan has one reference per face, while the hardware tests against TEST_VAL and can write
-    // TEST_VAL, OP_VAL or all ones. The reference has to match the test value on the compared bits
-    // and every replaced value on the written bits; false means those requirements conflict.
-    private static bool ResolveFace(byte fail, byte pass, byte depthFail, uint compare, byte compareMask, byte writeMask, byte testValue,
-        byte operationValue, Func<string, Exception> fatal, out StencilOperations operations, out StencilMasks masks)
+    private static StencilOperations ConvertFace(byte fail, byte pass, byte depthFail, CompareOp compare,
+        byte operationValue, ref StencilMasks masks, Func<string, Exception> fatal)
     {
-        var reference = new ReferenceBits();
-        if (ReferenceTested(compare))
+        if (masks.WriteMask != 0 && compare == CompareOp.Equal &&
+            (masks.WriteMask & ~masks.CompareMask) == 0 && fail == 0 &&
+            (pass == 0 || pass == ReplaceWithOperationValue) &&
+            (depthFail == 0 || depthFail == ReplaceWithOperationValue) &&
+            (pass == ReplaceWithOperationValue || depthFail == ReplaceWithOperationValue))
         {
-            reference.Require(compareMask, testValue);
+            // The equal test fixes every written bit. Toggle only differing bits
+            // to produce the replacement without changing the comparison reference.
+            var invertMask = masks.WriteMask & (masks.Reference ^ operationValue);
+            masks = masks with { WriteMask = invertMask };
+            return new StencilOperations(
+                StencilOp.Keep,
+                pass == ReplaceWithOperationValue && invertMask != 0 ? StencilOp.Invert : StencilOp.Keep,
+                depthFail == ReplaceWithOperationValue && invertMask != 0 ? StencilOp.Invert : StencilOp.Keep,
+                compare);
         }
 
-        operations = new StencilOperations(
-            ConvertOperation(fail, writeMask, testValue, operationValue, ref reference, fatal),
-            ConvertOperation(pass, writeMask, testValue, operationValue, ref reference, fatal),
-            ConvertOperation(depthFail, writeMask, testValue, operationValue, ref reference, fatal),
-            (CompareOp)compare);
-        masks = new StencilMasks(compareMask, writeMask, reference.Value | (testValue & ~reference.Bits & 0xFFu));
-        return compare <= (uint)CompareOp.Always && !reference.Conflict;
-    }
-
-    // Only the written bits of a replacement land, so one that writes zeros there is a ZERO and leaves the reference free.
-    private static StencilOp Replace(byte value, byte writeMask, ref ReferenceBits reference)
-    {
-        if ((value & writeMask) == 0)
+        ReadOnlySpan<byte> operations = [fail, pass, depthFail];
+        Span<StencilOp> converted = stackalloc StencilOp[3];
+        var reference = masks.Reference;
+        var requiredBits = compare is CompareOp.Always or CompareOp.Never ? 0u : masks.CompareMask;
+        for (var index = 0; index < operations.Length; index++)
         {
-            return StencilOp.Zero;
+            converted[index] = ConvertOperation(operations[index], (byte)masks.WriteMask, operationValue, fatal);
+            if (converted[index] != StencilOp.Replace)
+            {
+                continue;
+            }
+
+            var replacement = operations[index] switch
+            {
+                Ones => (byte)0xFF,
+                ReplaceWithOperationValue => operationValue,
+                _ => (byte)masks.Reference,
+            };
+            // Vulkan shares one reference between comparison and every replacement on this face.
+            if (((reference ^ replacement) & requiredBits & masks.WriteMask) != 0)
+            {
+                throw fatal($"The stencil replacement references conflict: compare={compare} compareMask=0x{masks.CompareMask:X2} " +
+                    $"writeMask=0x{masks.WriteMask:X2} operation=0x{operationValue:X2} test=0x{masks.Reference:X2}.");
+            }
+
+            reference = (reference & ~masks.WriteMask) | (replacement & masks.WriteMask);
+            requiredBits |= masks.WriteMask;
         }
 
-        reference.Require(writeMask, value);
-        return StencilOp.Replace;
+        masks = masks with { Reference = reference };
+        return new StencilOperations(converted[0], converted[1], converted[2], compare);
     }
 
     // A zero write mask makes every operation a keep; XOR maps to invert only over the written bits.
-    private static StencilOp ConvertOperation(byte operation, byte writeMask, byte testValue, byte operationValue, ref ReferenceBits reference,
-        Func<string, Exception> fatal)
+    private static StencilOp ConvertOperation(byte operation, byte writeMask, byte operationValue, Func<string, Exception> fatal)
     {
         if (writeMask == 0)
         {
@@ -290,11 +306,10 @@ public static class DepthTargetResolver
             case 0x01:
                 return StencilOp.Zero;
             case Ones:
-                return Replace(0xFF, writeMask, ref reference);
-            case ReplaceWithTestValue:
-                return Replace(testValue, writeMask, ref reference);
+            case 0x03:
+                return StencilOp.Replace;
             case ReplaceWithOperationValue:
-                return Replace(operationValue, writeMask, ref reference);
+                return (operationValue & writeMask) == 0 ? StencilOp.Zero : StencilOp.Replace;
             case 0x05:
                 return StencilOp.IncrementAndClamp;
             case 0x06:
@@ -319,21 +334,6 @@ public static class DepthTargetResolver
                 return StencilOp.Invert;
             default:
                 throw fatal($"The stencil operation is not supported: operation=0x{operation:X2}.");
-        }
-    }
-
-    // The reference bits pinned so far by the compare and the replacements.
-    private struct ReferenceBits
-    {
-        public uint Bits;
-        public uint Value;
-        public bool Conflict;
-
-        public void Require(uint bits, uint value)
-        {
-            Conflict |= ((Value ^ value) & Bits & bits) != 0;
-            Value |= value & bits & ~Bits;
-            Bits |= bits;
         }
     }
 }

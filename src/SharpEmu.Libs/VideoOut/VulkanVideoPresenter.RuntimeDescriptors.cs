@@ -42,8 +42,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             // The view class followed by the eight image words, as the shader hashes them.
             public uint[] Key { get; } = key;
-            public ImageDimension Dimension => (ImageDimension)Key[0];
+            public ImageDimension Dimension => RuntimeDescriptorTable.ViewDimension(Key[0]);
+            public ImageNumericClass NumericClass => RuntimeDescriptorTable.ViewNumericClass(Key[0]);
             public uint Slot { get; set; }
+            // The texture its words resolved to, kept while the cache keeps its image.
+            public TextureResource? Resolved { get; set; }
         }
 
         private sealed class RuntimeSamplerEntry(uint[] key, uint slot)
@@ -75,26 +78,98 @@ internal static unsafe partial class VulkanVideoPresenter
             return descriptors;
         }
 
-        // The texture path of a registered image: a plain sampled float view of its class.
-        private static ImageResource RuntimeImageResource(ImageDimension dimension) => new()
+        // The texture path of a registered image: the view class is part of the key because
+        // Vulkan image loads need a view whose numeric type matches the SPIR-V image type.
+        private static ImageResource RuntimeImageResource(RuntimeImageEntry entry) => new()
         {
             ResourceClass = ShaderCompiler.Resources.ImageResourceClass.Sampled,
-            NumericClass = ImageNumericClass.Float,
-            Dimension = dimension,
+            NumericClass = entry.NumericClass,
+            Dimension = entry.Dimension,
         };
 
+        // Registers hold whatever a lane computed, so a runtime descriptor can describe no valid
+        // view (the hardware reads the null texture then) or name memory that is not mapped, or no
+        // longer is. An image there would have no guest bytes to track.
+        private bool IsBackedRuntimeTexture(RuntimeImageEntry entry)
+        {
+            if (!ImageRequestBuilders.TryTexture(entry.Key.AsSpan(1), ShapeOf(RuntimeImageResource(entry)), out var resolution))
+            {
+                return false;
+            }
+
+            var data = resolution.Request.Description.Data;
+            return ImageDescription.IsEmptyRange(data) || _guestMemory.CanRead(data.Address, data.Size);
+        }
+
         // Called while a stage's textures are resolved: registers what earlier draws missed and
-        // resolves this shader's registered images with the draw.
+        // binds this shader's registered images with the draw.
         private void PrepareRuntimeDescriptors(PreparedStageBindings prepared)
         {
             var descriptors = RuntimeDescriptorsFor(prepared.Program);
             RegisterRuntimeDescriptorMisses(descriptors);
-            foreach (var entry in descriptors.Images.Values)
+            List<RuntimeDescriptorKey>? freed = null;
+            foreach (var (key, entry) in descriptors.Images)
             {
-                prepared.RuntimeImages.Add(ResolveImageBinding(RuntimeImageResource(entry.Dimension), entry.Key[1..], prepared.Program, -1));
+                if (!TryBindRuntimeImage(entry, prepared.Program, out var binding))
+                {
+                    (freed ??= []).Add(key);
+                    continue;
+                }
+
+                prepared.RuntimeImages.Add(binding);
                 prepared.RuntimeEntries.Add(entry);
             }
+
+            if (freed is not null)
+            {
+                foreach (var key in freed) descriptors.Images.Remove(key);
+                descriptors.TableDirty = true;
+            }
         }
+
+        // An entry keeps the texture its words resolved to while the cache keeps that image; each
+        // draw binds its own copy. Only a new entry, or one whose image the cache retired, is
+        // resolved again - and a retired one whose memory the title freed leaves the table, so a
+        // shader that still reads the descriptor misses it again.
+        private bool TryBindRuntimeImage(RuntimeImageEntry entry, ShaderProgramInfo program, out TextureResource binding)
+        {
+            CachedImage? stale = null;
+            if (entry.Resolved is { } resolved && !IsStaleImage(resolved.ImageIdentifier, out stale))
+            {
+                BindImage(resolved.ImageIdentifier, storage: false);
+                binding = CopyRuntimeBinding(resolved);
+                return true;
+            }
+
+            if (stale is not null)
+            {
+                stale.Binding = default;
+            }
+
+            entry.Resolved = null;
+            if (!IsBackedRuntimeTexture(entry))
+            {
+                binding = null!;
+                return false;
+            }
+
+            entry.Resolved = ResolveImageBinding(RuntimeImageResource(entry), entry.Key[1..], program, -1);
+            binding = CopyRuntimeBinding(entry.Resolved);
+            return true;
+        }
+
+        // The resolved part of a binding; the acquisition fields belong to one draw.
+        private static TextureResource CopyRuntimeBinding(TextureResource resolved) => new()
+        {
+            Address = resolved.Address,
+            ImageIdentifier = resolved.ImageIdentifier,
+            Request = resolved.Request,
+            IsStorage = resolved.IsStorage,
+            IsResident = resolved.IsResident,
+            DestinationSelect = resolved.DestinationSelect,
+            Width = resolved.Width,
+            Height = resolved.Height,
+        };
 
         // Called with the stage's other images: acquires each registered view, refreshes its heap
         // slot and binds the current table and the miss buffer.
@@ -106,7 +181,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var entry = prepared.RuntimeEntries[index];
                 var binding = prepared.RuntimeImages[index];
-                var resource = RuntimeImageResource(entry.Dimension);
+                var resource = RuntimeImageResource(entry);
                 if (IsStaleImage(binding.ImageIdentifier, out var stale))
                 {
                     if (stale is not null)
@@ -114,9 +189,11 @@ internal static unsafe partial class VulkanVideoPresenter
                         stale.Binding = default;
                     }
 
-                    prepared.RuntimeImages[index] = binding = ResolveImageBinding(resource, entry.Key[1..], prepared.Program, -1);
+                    entry.Resolved = ResolveImageBinding(resource, entry.Key[1..], prepared.Program, -1);
+                    prepared.RuntimeImages[index] = binding = CopyRuntimeBinding(entry.Resolved);
                 }
 
+                // Acquisition refreshes CPU writes and transitions the image for this draw.
                 var image = _imageCache.GetImage(binding.ImageIdentifier);
                 binding.View = _imageCache.AcquireTextureView(binding.ImageIdentifier, binding.Request);
                 binding.MipViews = [];
@@ -157,9 +234,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 var key = RuntimeDescriptorKey.From(miss.Key);
                 if (miss.Image)
                 {
-                    if (!descriptors.Images.ContainsKey(key) && RuntimeDescriptorTable.SupportsRuntimeView((ImageDimension)miss.Key[0]))
+                    // A descriptor that describes no host texture (a null base or an invalid format)
+                    // stays out of the table, so the shader keeps reading the null descriptor for
+                    // it, as the hardware does.
+                    if (!descriptors.Images.ContainsKey(key) && RuntimeDescriptorTable.SupportsRuntimeView(RuntimeDescriptorTable.ViewDimension(miss.Key[0])) &&
+                        ImageRequestBuilders.DescribesHostTexture(miss.Key.AsSpan(1)) && new RuntimeImageEntry(miss.Key) is var entry &&
+                        IsBackedRuntimeTexture(entry))
                     {
-                        descriptors.Images.Add(key, new RuntimeImageEntry(miss.Key));
+                        descriptors.Images.Add(key, entry);
                         descriptors.TableDirty = true;
                     }
 

@@ -154,6 +154,10 @@ public readonly record struct Gen5PixelOutputBinding(
         init => _exportTarget = value;
     }
 
+    // The fragment output index: 1 is the second source of dual-source blending, which
+    // shares its location with the first and is not a render target.
+    public uint Index { get; init; }
+
     public Gen5PixelExportFormat ExportFormat { get; init; } = Gen5PixelExportFormat.Float16;
 }
 
@@ -400,9 +404,10 @@ public sealed record Gen5ShaderProgram(
     // Fused objects can put their continuation before the entry in guest memory.
     // Control-flow PCs remain increasing; S_GETPC still uses the original guest PC.
     public IReadOnlyDictionary<uint, ulong>? InstructionAddressOffsets { get; init; }
+    public uint? FusedContinuationPc { get; init; }
 
     public ulong InstructionAddressOffset(uint pc) =>
-        InstructionAddressOffsets is { } offsets && offsets.TryGetValue(pc, out var offset) ? offset : pc;
+        InstructionAddressOffsets is { } offsets && offsets.TryGetValue(pc, out var offset) ? offset : Instructions.FirstOrDefault(instruction => instruction.Pc == pc)?.ProgramOffset ?? pc;
 
     private static uint ComputePixelColorExportMasks(
         IReadOnlyList<Gen5ShaderInstruction> instructions)

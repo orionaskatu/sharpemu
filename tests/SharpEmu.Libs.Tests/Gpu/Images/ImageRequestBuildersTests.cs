@@ -18,6 +18,53 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
 {
     private const ulong Base = 0x1_0000_0000;
 
+    [Theory]
+    [InlineData(0x100u)]
+    [InlineData(0x800u)]
+    public void TiledTextureViewPreservesItsDescriptorAddress(uint offset)
+    {
+        var words = RegisterWords.Texture(Base + offset, GuestPixelFormat.Bits16_16_16_16Float,
+            16, 16, tile: GuestTileMode.Standard4KB);
+        var shape = new ShaderImageShape(false, false, true, false, TextureNumericClass.Float);
+        var request = ImageRequestBuilders.Texture(words, shape).Request;
+        Assert.Equal(Base + offset, request.Description.Data.Address);
+        Assert.Equal(4096UL, request.Description.Data.Size);
+        Assert.Equal(32u, request.Description.Pitch);
+        Assert.Equal(GuestTileMode.Standard4KB, request.Description.TileMode);
+        Assert.Equal(Format.R16G16B16A16Sfloat, request.Description.PixelFormat);
+        Assert.Equal(0UL, request.Description.MipLayout[0].Offset);
+    }
+
+    // A runtime descriptor read from memory can be anything; only one the host can create is
+    // registered, and the rest read as the null texture as on the hardware.
+    // A T# read at run time can hold anything a lane computed. One that describes no valid view
+    // (an image type below 8, a base level past the last level, as Ghost of Tsushima samples
+    // through) is no texture for the runtime path; the planned path still stops on it.
+    [Fact]
+    public void TryTextureRejectsDescriptorsThatDescribeNoView()
+    {
+        var shape = new ShaderImageShape(false, false, false, false, TextureNumericClass.Float);
+        var valid = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32);
+        var notAnImage = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32);
+        notAnImage[3] &= 0x0FFF_FFFFu;
+        var levelPastTheView = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32, baseLevel: 13, lastLevel: 4, maxMip: 15);
+
+        Assert.True(ImageRequestBuilders.TryTexture(valid, shape, out _));
+        Assert.False(ImageRequestBuilders.TryTexture(notAnImage, shape, out _));
+        Assert.False(ImageRequestBuilders.TryTexture(levelPastTheView, shape, out _));
+        using var fatal = new FatalScope();
+        Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.Texture(levelPastTheView, shape));
+    }
+
+    [Fact]
+    public void OnlyDescriptorsWithABaseAndAHostFormatDescribeAHostTexture()
+    {
+        Assert.True(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
+        Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(Base, GuestPixelFormat.Invalid, 32, 32)));
+        Assert.False(ImageRequestBuilders.DescribesHostTexture(RegisterWords.Texture(0, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32)));
+        Assert.False(ImageRequestBuilders.DescribesHostTexture(new uint[8]));
+    }
+
     [Fact]
     public void EightBitUnsignedScaledTextureUsesUnormBackingWithShaderConversion()
     {

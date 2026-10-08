@@ -11,6 +11,7 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // Everything a host pipeline creation reads for one graphics pipeline.
 public sealed class GraphicsPipelineDescription
 {
+    public TessellationPipelineStages? Tessellation { get; init; }
     public required PipelineRenderingState Rendering { get; init; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required VertexInputInfo VertexInfo { get; init; }
@@ -21,6 +22,8 @@ public sealed class GraphicsPipelineDescription
     public ShaderProgramInfo? PixelStage { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
 }
+
+public sealed record TessellationPipelineStages(ShaderProgram Control, ShaderProgram Evaluation, uint InputControlPoints);
 
 public sealed class ComputePipelineDescription
 {
@@ -56,6 +59,16 @@ internal interface IShaderPipelineHost
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;
     bool ClipDistanceEnabled => false;
+    bool PostDepthCoverageSupported => false;
+    bool NativeTwoSampleMixedSupported => false;
+
+    // True when this device's GLSL UnpackHalf2x16 / PackHalf2x16 were measured bit-exact
+    // against the translator's own f16 conversion. False for every host that did not measure it.
+    bool NativeHalfConversionExact => false;
+
+    // True only when the host measured that a storage-buffer read past its descriptor range
+    // returns zero on this device; the translator then stops bounds-checking every guest word.
+    bool ZeroOutOfBoundsBufferReads => false;
 
     RenderHostLimits Limits { get; }
 
@@ -70,9 +83,8 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
-    // A materialization starts: no GPU work is recorded until it ends, so the host may share
-    // ownership checks between the clean reads inside it.
-    void BeginMaterializationSession() { }
+    // The device can blend with a second fragment output (dualSrcBlend).
+    bool SupportsDualSourceBlend => false;
 
     // Whether recorded GPU work still owns the dword, so the host can copy it on the device
     // when it binds the flattened table instead of downloading it now.

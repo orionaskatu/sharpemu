@@ -16,11 +16,11 @@ public sealed partial class GpuCommandInterpreter
         var eventIndex = (payload[0] >> 8) & 0x7u;
         var eventType = payload[0] & 0x3Fu;
         ulong eventAddress = 0;
-        if (eventType == 0x39)
+        if (eventType == 0x39 || (eventType == 0x38 && packet.Length == 4))
         {
             if (packet.Length != 4)
             {
-                throw _host.Fatal($"The occlusion event packet length is not supported: length={packet.Length} address=0x{packet.PacketAddress:X16}.");
+                throw _host.Fatal($"The addressed event packet length is not supported: length={packet.Length} address=0x{packet.PacketAddress:X16}.");
             }
 
             eventAddress = Address(payload[1], payload[2]);

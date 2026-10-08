@@ -658,6 +658,94 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         run.Finish(output, nameof(GpuLoadedD16Store_UnpacksBothRegistersIntoFourComponents));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SharedFormattedLoad_RecordsTheFaultingCallerPc(bool firstPageMapped)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var program = Program([
+            .. GpuDescriptorLoadProgram(true, 1).Instructions.Take(8),
+            BufferAccess(36, "BufferLoadFormatX", 16, dwords: 1, vectorData: 4),
+            BufferAccess(44, "BufferLoadFormatX", 16, offset: (int)PageSize + 32, dwords: 1, vectorData: 5),
+            BufferAccess(52, "BufferStoreDwordx2", ResultRegister, dwords: 2, vectorData: 4), EndProgram(60),
+        ]);
+        var run = new Run(vulkan, program, traceFaults: true);
+        if (firstPageMapped) run.MapPage(GuestBase, Pattern((int)PageSize));
+        var descriptorPage = GuestBase + 4 * PageSize;
+        run.MapPage(descriptorPage, BufferDescriptorBytes(GuestBase, (uint)PageSize * 2));
+        run.Dispatch(descriptorPage);
+        Assert.Equal(0u, run.ResultWord(4));
+        Assert.Equal(firstPageMapped ? ReadWord(Pattern((int)PageSize), 0) : 0u, run.ResultWord(0));
+        var faults = run.FaultWords();
+        Assert.Equal(1u, faults[^8]);
+        Assert.Equal(firstPageMapped ? 44u : 36u, faults[^5]);
+        run.Finish(output, nameof(SharedFormattedLoad_RecordsTheFaultingCallerPc));
+    }
+
+    [Theory]
+    [InlineData(32u, 75u)]
+    [InlineData(32u, 77u)]
+    [InlineData(64u, 75u)]
+    [InlineData(64u, 77u)]
+    public void RepeatedD16Loads_KeepPerLaneValuesAndInactiveRegisters(uint waveSize, uint secondFormat)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        Gen5ShaderInstruction Load(uint pc) => BufferAccess(pc, "BufferLoadFormatD16Xy", 16,
+            dwords: 1, vectorData: 4, offsetEnabled: true, vectorAddress: OffsetRegister) with
+        {
+            Control = new Gen5BufferMemoryControl(1, OffsetRegister, 4, 16, 0,
+                false, true, false, false, false, 0, true, 2),
+        };
+        var program = Program([
+            .. GpuDescriptorLoadProgram(true).Instructions.Take(8),
+            Vop2(36, "VLshlrevB32", 2, Operand(3), Gen5Operand.Vector(1)),
+            Vop2(40, "VAddU32", 2, Gen5Operand.Vector(0), Gen5Operand.Vector(2)),
+            Vop2(44, "VLshlrevB32", OffsetRegister, Operand(3), Gen5Operand.Vector(2)),
+            Load(48),
+            ScalarLoad(56, 8, destination: 16, count: 4, immediateOffset: 16),
+            MoveScalar(64, 20, 0xAAAAAAAA), MoveScalar(72, 21, 0xAAAAAAAA),
+            Sop1(80, "SMovB64", 126, Gen5Operand.Scalar(20)),
+            Load(84),
+            Sop1(92, "SMovB64", 126, Gen5Operand.Source(193)),
+            Vop2(96, "VLshlrevB32", 5, Operand(2), Gen5Operand.Vector(2)),
+            BufferAccess(100, "BufferStoreDword", ResultRegister, vectorData: 4,
+                offsetEnabled: true, vectorAddress: 5),
+            EndProgram(108),
+        ]);
+        var run = new Run(vulkan, program, threadCount: 64, localSizeY: 8,
+            waveSize: waveSize, enableExecGuardElision: false);
+        var first = new byte[512];
+        var second = new byte[512];
+        for (var lane = 0; lane < 64; lane++)
+        {
+            WriteWord(first, lane * 8, BitConverter.SingleToUInt32Bits(lane + 1f));
+            WriteWord(first, lane * 8 + 4, BitConverter.SingleToUInt32Bits(-lane - 1f));
+            WriteWord(second, lane * 8, secondFormat == 77
+                ? BitConverter.SingleToUInt32Bits(lane + 65f) : (uint)lane + 1000);
+            WriteWord(second, lane * 8 + 4, secondFormat == 77
+                ? BitConverter.SingleToUInt32Bits(-lane - 65f) : (uint)lane + 2000);
+        }
+        run.MapPage(GuestBase, first);
+        run.MapPage(GuestBase + PageSize, second);
+        var descriptors = BufferDescriptorBytes(GuestBase, 512, 77)
+            .Concat(BufferDescriptorBytes(GuestBase + PageSize, 512, secondFormat)).ToArray();
+        var descriptorPage = GuestBase + 4 * PageSize;
+        run.MapPage(descriptorPage, descriptors);
+        run.Dispatch(descriptorPage);
+        for (uint lane = 0; lane < 64; lane++)
+        {
+            var changed = (lane & 1) != 0;
+            var integer = changed && secondFormat == 75;
+            var low = integer ? lane + 1000 : (uint)BitConverter.HalfToUInt16Bits((Half)(lane + (changed ? 65f : 1f)));
+            var high = integer ? lane + 2000 : (uint)BitConverter.HalfToUInt16Bits((Half)(-lane - (changed ? 65f : 1f)));
+            Assert.Equal(low | (high << 16), run.ResultWord(lane * 4));
+        }
+        run.Finish(output, nameof(RepeatedD16Loads_KeepPerLaneValuesAndInactiveRegisters));
+    }
+
     private static Gen5ShaderProgram GpuDescriptorLoadProgram(bool formatted, uint count = 4) => Program(
         MoveVectorFromScalar(0, 8, AddressLow),
         Vop2(4, "VAddU32", 8, Gen5Operand.Vector(8), Gen5Operand.Vector(0)),
@@ -818,11 +906,19 @@ public sealed class DeviceAddressShaderTests(HeadlessVulkanFixture fixture, ITes
         private GpuBuffer? _pageTable;
 
         public Run(HeadlessVulkan vulkan, Gen5ShaderProgram program, uint threadCount = 1, ulong tableEntries = TableEntries,
-            Action<ShaderCompileRequest>? configure = null)
+            Action<ShaderCompileRequest>? configure = null, bool traceFaults = false,
+            uint localSizeY = 1, uint waveSize = 32, bool enableExecGuardElision = true)
         {
             var (plan, resources, layout) = Prepare(program);
             Plan = plan;
-            Request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = threadCount, ThreadCountX = threadCount };
+            Request = new ShaderCompileRequest(plan, resources, layout)
+            {
+                LocalSizeX = threadCount / localSizeY, LocalSizeY = localSizeY,
+                ThreadCountX = threadCount / localSizeY,
+                ThreadCountY = localSizeY == 1 ? ShaderCompileRequest.UnboundedThreadCount : localSizeY,
+                WaveSize = waveSize, EnableExecGuardElision = enableExecGuardElision,
+                TraceDeviceAddressFaults = traceFaults,
+            };
             configure?.Invoke(Request);
             Assert.True(resources.Info.UsesDeviceAddresses);
             Assert.True(Gen5SpirvTranslator.TryCompileProgram(Request, out var shader, out var error), error);

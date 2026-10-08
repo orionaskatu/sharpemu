@@ -22,6 +22,7 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
 
     // VK_EXT_image_view_min_lod is enabled, so a view can clamp to a texture descriptor's MIN_LOD.
     public bool ImageViewMinLodSupported { get; init; }
+    public bool CustomTwoSampleLocationsSupported { get; init; }
 
     public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device, bool memoryBudgetEnabled = false)
     {
@@ -55,6 +56,8 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
         MaxMemoryAllocationCount = properties.Limits.MaxMemoryAllocationCount;
         MaxComputeWorkGroupCount = (properties.Limits.MaxComputeWorkGroupCount[0], properties.Limits.MaxComputeWorkGroupCount[1], properties.Limits.MaxComputeWorkGroupCount[2]);
         Slabs = new GpuMemorySlabs(this);
+        const FormatFeatureFlags blit = FormatFeatureFlags.BlitSrcBit | FormatFeatureFlags.BlitDstBit;
+        Images.RenderScalePolicy.ConfigureFormatSupport(format => (GetFormatProperties(format).OptimalTilingFeatures & blit) == blit);
     }
 
     // Shared chunks for small buffers; idle chunks can be returned under pressure.
@@ -173,6 +176,9 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
 
     public int LiveAllocations => Volatile.Read(ref _liveAllocations);
 
+    // Tests make an allocation of the given size fail as an exhausted device would.
+    internal Func<ulong, bool>? AllocationFailure { get; set; }
+
     public int PeakAllocations => Volatile.Read(ref _peakAllocations);
 
     public MemoryPropertyFlags GetMemoryTypeFlags(uint index)
@@ -213,7 +219,10 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     {
         fixed (MemoryAllocateInfo* pointer = &info)
         {
-            var result = Vk.AllocateMemory(Device, pointer, null, out memory);
+            memory = default;
+            var result = AllocationFailure?.Invoke(info.AllocationSize) == true
+                ? Result.ErrorOutOfDeviceMemory
+                : Vk.AllocateMemory(Device, pointer, null, out memory);
             if (result != Result.Success)
                 Interlocked.Exchange(ref _lastFailedAllocationBytes, checked((long)info.AllocationSize));
             if (result == Result.Success)

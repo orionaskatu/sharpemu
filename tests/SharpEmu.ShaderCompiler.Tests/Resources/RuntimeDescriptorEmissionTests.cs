@@ -22,6 +22,50 @@ public sealed class RuntimeDescriptorEmissionTests
         Image(0x200, "ImageSample", 8, 16),
         EndProgram(0x208));
 
+    // The image descriptor itself comes from a lane-dependent value, so ImageLoad cannot
+    // materialize an image at plan time. Its runtime path needs typed bindless ImageFetch.
+    private static Gen5ShaderProgram RuntimeImageLoadProgram() => Program(
+        MoveScalarRegister(0, 16, 0),
+        MoveScalarRegister(4, 17, 1),
+        MoveScalarRegister(8, 18, 2),
+        Vop2(12, "VLshlrevB32", 1, Operand(12), Gen5Operand.Vector(0)),
+        ReadFirstLane(16, 20, 1),
+        Sop2(20, "SOrB32", 19, Gen5Operand.Scalar(3), Gen5Operand.Scalar(20)),
+        Image(0x200, "ImageLoad", 19, vectorAddress: 0, dmask: 1),
+        EndProgram(0x208));
+
+    // IMAGE_SAMPLE_A (MIMG opcode 0xA0) carries its adjustment in the sampler's reserved dword-3
+    // bits, which select nothing in the sampler itself.
+    private static Gen5ShaderProgram RuntimeAdjustedSampleProgram() => Program(
+        MoveScalarRegister(0, 16, 0),
+        MoveScalarRegister(4, 17, 1),
+        MoveScalarRegister(8, 18, 2),
+        Vop2(12, "VLshlrevB32", 1, Operand(12), Gen5Operand.Vector(0)),
+        ReadFirstLane(16, 20, 1),
+        Sop2(20, "SOrB32", 19, Gen5Operand.Scalar(3), Gen5Operand.Scalar(20)),
+        Image(0x200, "ImageSampleA", 8, 16) with { Words = [(0xA0u & 0x7F) << 18 | (0xA0u >> 7), 0u] },
+        EndProgram(0x208));
+
+    // An adjusted sample reads its descriptors at run time like a plain one. The key drops the
+    // sampler's reserved dword-3 bits, so each adjustment does not register a sampler of its own.
+    [Fact]
+    public void RuntimeDescriptorAdjustedSample_KeysTheSamplerWithoutItsReservedBits()
+    {
+        var plan = Extract(RuntimeAdjustedSampleProgram());
+        Assert.True(plan.Info.UsesRuntimeDescriptors);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info,
+            BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 64), false,
+            ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false,
+            usesBindlessImages: true);
+        var request = new ShaderCompileRequest(plan, resources, layout) { ThreadCountX = 1, ThreadCountY = 1, ThreadCountZ = 1 };
+
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(shader.Spirv);
+        Assert.Contains(~0x3FFF_F000u, words.ToArray());
+        Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
+    }
+
     [Fact]
     public void RuntimeDescriptorSample_EmitsValidHeapLookups()
     {
@@ -37,6 +81,27 @@ public sealed class RuntimeDescriptorEmissionTests
 
         var request = new ShaderCompileRequest(plan, resources, layout) { ThreadCountX = 1, ThreadCountY = 1, ThreadCountZ = 1 };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void RuntimeDescriptorImageLoad_EmitsTypedHeapFetches()
+    {
+        var plan = Extract(RuntimeImageLoadProgram());
+        Assert.True(plan.Info.UsesRuntimeDescriptors);
+        Assert.Empty(plan.Info.NullDescriptorFallbacks);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info,
+            BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 64), false,
+            ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false,
+            usesBindlessImages: true);
+        var request = new ShaderCompileRequest(plan, resources, layout) { ThreadCountX = 1, ThreadCountY = 1, ThreadCountZ = 1 };
+
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var module = new SpirvModuleInspector(shader.Spirv);
+        Assert.Contains((ushort)SpirvOp.ImageFetch, module.Opcodes);
+        Assert.Contains(module.Names.Values, name => name == "runtimeImagesDim2DUint");
+        Assert.Contains(module.Names.Values, name => name == "runtimeImagesDim2DSint");
         Gen5LargeDispatcherValidationTests.ValidateWithSpirvToolsWhenAvailable(shader.Spirv);
     }
 
@@ -59,6 +124,20 @@ public sealed class RuntimeDescriptorEmissionTests
         Assert.Equal(RuntimeDescriptorTable.HashSeed, RuntimeDescriptorTable.Hash([]));
         var expected = unchecked(((RuntimeDescriptorTable.HashSeed ^ 1u) * RuntimeDescriptorTable.HashPrime ^ 2u) * RuntimeDescriptorTable.HashPrime);
         Assert.Equal(expected, RuntimeDescriptorTable.Hash([1u, 2u]));
+    }
+
+    [Fact]
+    public void ViewClass_KeepsFloatKeysAndSeparatesIntegerViews()
+    {
+        var legacyFloat = (uint)ImageDimension.Dim2D;
+        var @uint = RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Uint);
+        var sint = RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D, ImageNumericClass.Sint);
+
+        Assert.Equal(legacyFloat, RuntimeDescriptorTable.ViewClass(ImageDimension.Dim2D));
+        Assert.NotEqual(legacyFloat, @uint);
+        Assert.NotEqual(@uint, sint);
+        Assert.Equal(ImageNumericClass.Uint, RuntimeDescriptorTable.ViewNumericClass(@uint));
+        Assert.Equal(ImageNumericClass.Sint, RuntimeDescriptorTable.ViewNumericClass(sint));
     }
 
     // The host's table answers the shader's probe for every key, through collisions.

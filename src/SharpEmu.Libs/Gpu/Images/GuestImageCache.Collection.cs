@@ -72,6 +72,35 @@ public sealed partial class GuestImageCache
         FinishRetiredImagesForAllocation(requiredBytes);
     }
 
+    // An allocation failed despite the budget. Retire every image collection allows, then let
+    // the retired ones be destroyed and return unused pool memory to the device.
+    public void ReclaimForAllocation()
+    {
+        using var held = _lock.Hold();
+        ReclaimAfterFailedAllocation();
+    }
+
+    private void ReclaimAfterFailedAllocation()
+    {
+        _allocationCollectionBlocked = false;
+        while (true)
+        {
+            var before = _totalUsedMemory;
+            Collect(_collectionTick, allowAggressive: true);
+            if (_totalUsedMemory == before)
+                break;
+        }
+
+        if (_scheduler.Active && !_scheduler.InsideTickCallback)
+        {
+            _lock.Exit();
+            try { _scheduler.Finish(); }
+            finally { _lock.Enter(); }
+        }
+
+        ReleaseUnusedMemoryCore();
+    }
+
     private void FinishRetiredImagesForAllocation(ulong requiredBytes)
     {
         var retired = Interlocked.Read(ref _retiredImageMemoryBytes);
@@ -192,7 +221,20 @@ public sealed partial class GuestImageCache
 
             if (owner.IsGpuModified)
             {
+                if (owner.IsMaybeCpuDirty)
+                {
+                    if (owner.NeedsMaybeCpuHash)
+                        continue;
+                    _ = owner.ResolveMaybeCpuHash(owner.HashGuestEdges());
+                }
+
                 var safe = CanReadBack(owner);
+                // A dirty buffer overlap does not prove that it replaces the image contents.
+                if (!safe && owner.SafeToDownload)
+                {
+                    continue;
+                }
+
                 if (safe && !pressured)
                 {
                     continue;

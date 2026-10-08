@@ -395,8 +395,9 @@ public sealed partial class GpuCommandInterpreter
 
     private void DumpUnknownPacket(in PacketCursor cursor, uint offset)
     {
-        var begin = offset > 8 ? offset - 8 : 0;
-        var end = Math.Min(cursor.DwordCount, offset + 16);
+        // Dump from the start of the buffer so a misaligned stream can be re-parsed offline.
+        var begin = offset > 8192 ? offset - 8192 : 0u;
+        var end = Math.Min(cursor.DwordCount, offset + 64);
         Console.Error.WriteLine($"[GPU][FATAL] The packet stream near the unknown packet: buffer=0x{cursor.Address:X16} dwords={cursor.DwordCount} offset=0x{offset:X5}");
         Span<byte> word = stackalloc byte[sizeof(uint)];
         for (var index = begin; index < end; index++)
@@ -482,6 +483,8 @@ public sealed partial class GpuCommandInterpreter
         {
             throw _host.Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={source.Length}.");
         }
+        // Later commands in this stream may read the bytes through device addresses.
+        _host.NoteCommandProcessorWrite(address, (ulong)source.Length);
         _lastWriteLength = 0;
         if (source.Length is sizeof(uint) or sizeof(ulong))
         {

@@ -11,7 +11,6 @@ namespace SharpEmu.ShaderCompiler.Resources;
 public sealed partial class ResourceTracker
 {
     private const uint SamplerBorderClampMask = (1u << 2) | (1u << 5) | (1u << 8);
-    private const uint SamplerDword3ReservedMask = 0x3FFF_F000u;
 
     private readonly ShaderResourcePlan _plan;
     private readonly ScalarValueGraph _graph;
@@ -286,8 +285,8 @@ public sealed partial class ResourceTracker
 
             var left = value.Operands[0];
             var right = value.Operands[1];
-            var leftReserved = (PossibleBits(left) & ~SamplerDword3ReservedMask) == 0;
-            var rightReserved = (PossibleBits(right) & ~SamplerDword3ReservedMask) == 0;
+            var leftReserved = (PossibleBits(left) & ~DescriptorConstants.SamplerDword3ReservedMask) == 0;
+            var rightReserved = (PossibleBits(right) & ~DescriptorConstants.SamplerDword3ReservedMask) == 0;
             if (leftReserved && rightReserved)
             {
                 return _graph.Constant(0u);
@@ -336,7 +335,8 @@ public sealed partial class ResourceTracker
         {
             var current = _sources[candidate];
             if (current.DwordCount != source.DwordCount || !Equals(current.IndirectImage, source.IndirectImage) ||
-                !Equals(current.PointerTable, source.PointerTable))
+                !Equals(current.PointerTable, source.PointerTable) ||
+                current.ZeroExtentBufferSource != source.ZeroExtentBufferSource)
             {
                 continue;
             }
@@ -551,7 +551,8 @@ public sealed partial class ResourceTracker
         bool sampler = false,
         bool sampleAdjust = false,
         string? memoryOpcode = null,
-        MemoryAccess memoryAccess = MemoryAccess.Read)
+        MemoryAccess memoryAccess = MemoryAccess.Read,
+        bool allowNullFallback = true)
     {
         if (handle is null || handle.Kind != expected)
         {
@@ -572,6 +573,12 @@ public sealed partial class ResourceTracker
         var controlDependent = false;
         if (nonContiguousImage || !ValidateSource(source, out badDword, out controlDependent))
         {
+            // Words read from an empty scalar buffer are zero whatever the offset. An access the
+            // runtime table can read keeps that path, which also covers a buffer that is not empty.
+            if (allowNullFallback && expected is ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle &&
+                TryMakeZeroExtentBufferSource(source, pc, out var emptyBufferSource))
+                return emptyBufferSource;
+
             // A bindless image/sampler descriptor whose dwords resolve through a
             // control-dependent phi (e.g. a hash-table/linear-probe material lookup, as seen
             // in Ghost of Yotei) has no single compile-time source: real support needs
@@ -581,11 +588,12 @@ public sealed partial class ResourceTracker
             // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
             // descriptor). Buffer/sampler-adjacent handles or any other validation failure
             // still hard-fail, since those aren't safe to silently zero.
-            var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
+            var dynamicImageFallback = allowNullFallback && expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
                 (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
                  (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
             if (dynamicImageFallback)
             {
+                _info.NullDescriptorFallbacks.Add((pc, expected == ScalarValueKind.ImageHandle ? $"image {memoryOpcode ?? "access"}" : $"sampler {memoryOpcode ?? "access"}"));
                 source = new DescriptorSource
                 {
                     Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),
@@ -602,6 +610,37 @@ public sealed partial class ResourceTracker
         }
 
         return InternSource(source);
+    }
+
+    private bool TryMakeZeroExtentBufferSource(DescriptorSource source, uint pc, out uint sourceIndex)
+    {
+        sourceIndex = 0;
+        ScalarValue? bufferHandle = null;
+        var hasBufferRead = false;
+        foreach (var operand in source.Dwords)
+        {
+            var word = _graph.ResolveInvariantPhi(operand);
+            if (word is null) return false;
+            if (word.IsConstant && word.ConstantU32 == 0) continue;
+            if (word.Kind != ScalarValueKind.ScalarBufferWord || word.Operands.Length != 2)
+                return false;
+            var current = word.Operands[0];
+            if (bufferHandle is not null && !_graph.Equivalent(bufferHandle, current))
+                return false;
+            bufferHandle = current;
+            hasBufferRead = true;
+        }
+
+        if (!hasBufferRead || bufferHandle is null ||
+            !MakeRuntimeBufferSource(bufferHandle, pc, out var bufferSource, out _))
+            return false;
+
+        sourceIndex = InternSource(new DescriptorSource
+        {
+            Dwords = Enumerable.Repeat(_graph.Constant(0u), (int)source.DwordCount).ToArray(),
+            ZeroExtentBufferSource = bufferSource,
+        });
+        return true;
     }
 
     private string DescribeValueShape(ScalarValue value, int depth = 0)
@@ -1185,12 +1224,15 @@ public sealed partial class ResourceTracker
 
         uint imageSource;
         uint samplerSource = 0;
+        // The hardware reads both descriptors from memory when the access runs. An access the
+        // runtime descriptor table can serve does the same instead of reading the null descriptor.
+        var runtimeReadable = CanReadDescriptorsAtRuntime(memory, access);
         try
         {
             var indirect = _indirectImages.FirstOrDefault(plan => ReferenceEquals(plan.Handle, access.Handle));
             imageSource = indirect is not null
                 ? indirect.Source
-                : GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc);
+                : GetHandleSource(access.Handle, ScalarValueKind.ImageHandle, 8, memory.Pc, allowNullFallback: !runtimeReadable);
             if (memory.NeedsSampler)
             {
                 if (access.SamplerHandle is null)
@@ -1201,10 +1243,11 @@ public sealed partial class ResourceTracker
                 var sampleAdjust = (memory.ImageSampleFlags & ImageSampleFlags.Adjust) != 0;
                 samplerSource = !sampleAdjust && TryMakePointerTableSampler(access.SamplerHandle, memory.Pc, out var pointerSampler)
                     ? pointerSampler
-                    : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust);
+                    : GetHandleSource(access.SamplerHandle, ScalarValueKind.SamplerHandle, 4, memory.Pc, sampler: true, sampleAdjust,
+                        allowNullFallback: !runtimeReadable);
             }
         }
-        catch (ResourcePlanException) when (CanReadDescriptorsAtRuntime(memory, access))
+        catch (ResourcePlanException) when (runtimeReadable)
         {
             // No plan-time source: the shader reads both descriptors from its registers.
             memory.RuntimeDescriptor = true;
@@ -1233,12 +1276,14 @@ public sealed partial class ResourceTracker
         AddMemoryPatch(index, image, sampler, memory.NeedsSampler, memory.Pc);
     }
 
-    // A plain sampled access of a float view the host can create from the words alone.
-    // Depth compares, the adjusted (LOD-biased) sampler forms and cube views keep their
-    // planned path.
+    // A sampled access or an image load that the host can create from descriptor words alone.
+    // An adjusted sample keys its sampler without the reserved bits its adjustment uses. Depth
+    // compares, cube views, storage writes and atomics keep their planned path.
     private bool CanReadDescriptorsAtRuntime(MemoryAccessInfo memory, MemoryAccessBinding access) =>
-        memory.ImageClass == ImageResourceClass.Sampled && memory.NeedsSampler && access.SamplerHandle is not null &&
-        (memory.ImageSampleFlags & (ImageSampleFlags.Compare | ImageSampleFlags.Adjust)) == 0 &&
+        memory.ImageClass == ImageResourceClass.Sampled &&
+        ((memory.NeedsSampler && access.SamplerHandle is not null &&
+            (memory.ImageSampleFlags & ImageSampleFlags.Compare) == 0) ||
+            (!memory.NeedsSampler && memory.Opcode is "ImageLoad" or "ImageLoadMip")) &&
         RuntimeDescriptorTable.SupportsRuntimeView(memory.ImageDimension) &&
         _graph.Program.Instructions.FirstOrDefault(instruction => instruction.Pc == memory.Pc)?.Control is Gen5ImageControl { Dimension: not CubeDimension };
 
@@ -1316,15 +1361,18 @@ public sealed partial class ResourceTracker
         for (var index = 0; index < _plan.Memory.Count; index++)
         {
             var memory = _plan.Memory[index];
-            if (memory.Kind != MemoryResourceKind.Image || _plan.Accesses[index]?.Handle is not { } handle ||
+            if (memory.Kind != MemoryResourceKind.Image || _plan.Accesses[index] is not { Handle: { } handle } access ||
                 _indirectImages.Any(plan => ReferenceEquals(plan.Handle, handle)))
             {
                 continue;
             }
 
+            // A table in a buffer materializes every record it holds, and each draw binds them all:
+            // thousands for a material table. An access the runtime table can read binds only the
+            // records the shader actually reads.
             if (TryMakeIndirectImage(handle, memory.Pc, out var plan) ||
                 TryMakeDenseIndirectImage(handle, memory.Pc, out plan) ||
-                TryMakeBufferTableImage(handle, memory.Pc, memory.ImageR128, out plan) ||
+                (!CanReadDescriptorsAtRuntime(memory, access) && TryMakeBufferTableImage(handle, memory.Pc, memory.ImageR128, out plan)) ||
                 TryMakePointerTableImage(handle, memory.Pc, memory.ImageR128, out plan) ||
                 TryMakeDirectImage(handle, out plan))
             {
