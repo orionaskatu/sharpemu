@@ -133,6 +133,56 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
+    // A shader store through a device address announces its page only after the fact. When the
+    // CPU dirtied the page meanwhile, the page stays CPU-owned: the shader's bytes reach guest
+    // memory by a merge, and the next upload copies only what the CPU changed, so neither the
+    // earlier nor the later shader bytes in the buffer are overwritten with stale guest bytes.
+    [Fact]
+    public void ShaderBytesOnAPageTheCpuAlsoWritesSurviveTheNextUpload()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        if (!harness.Cache.UnifiedBuffers)
+        {
+            harness.Shutdown();
+            return;
+        }
+
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address, Enumerable.Repeat((byte)0x11, 0x1000).ToArray());
+        var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, 0x1000, isWritten: false, requiresDeviceAddress: true));
+        void ShaderWrite(ulong at, uint value) => harness.Worker.Run(() =>
+        {
+            buffer.Fill(offset + at, 0x10, value);
+            harness.Scheduler.Wait(harness.Scheduler.Flush());
+        });
+
+        // The first shader write is reported on a clean page; the CPU write that follows downloads it.
+        ShaderWrite(0x100, 0x22222222);
+        harness.Worker.Run(() => harness.Cache.NoteDeviceAddressWrites(address, 0x1000));
+        Assert.True(harness.Store.MarkCpuWrite(address + 0x800, 4));
+        Assert.Equal(0x22222222u, BitConverter.ToUInt32(harness.Read(address + 0x100, 4)));
+        harness.Write(address + 0x800, [0xAA, 0xAA, 0xAA, 0xAA]);
+
+        // The second shader write is reported while the page is CPU-dirty, then the page uploads.
+        ShaderWrite(0x200, 0x33333333);
+        harness.Worker.Run(() => harness.Cache.NoteDeviceAddressWrites(address, 0x1000));
+        Assert.Equal(0x33333333u, BitConverter.ToUInt32(harness.Read(address + 0x200, 4)));
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.ObtainBuffer(address, 0x1000, isWritten: false, requiresDeviceAddress: true);
+            harness.Scheduler.Wait(harness.Scheduler.Flush());
+        });
+
+        var gpu = harness.ReadBack(buffer, offset, 0x1000);
+        Assert.Equal(0x22222222u, BitConverter.ToUInt32(gpu, 0x100));
+        Assert.Equal(0x33333333u, BitConverter.ToUInt32(gpu, 0x200));
+        Assert.Equal(0xAAAAAAAAu, BitConverter.ToUInt32(gpu, 0x800));
+        Assert.Equal(0x11111111u, BitConverter.ToUInt32(gpu, 0x900));
+        harness.Shutdown();
+    }
+
     private static void GpuWrite(CacheHarness harness, ulong address, uint value) => harness.Worker.Run(() =>
     {
         var (buffer, offset) = harness.Cache.ObtainBuffer(address, 0x100, isWritten: true);

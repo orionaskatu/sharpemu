@@ -1279,14 +1279,31 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var conflicts = _tracker.MarkGpuWrittenPages(page, TrackerLayout.PageBytes);
             if (conflicts != 0)
             {
-                var reported = Interlocked.Increment(ref _reportedDeviceWriteConflicts);
-                if (reported <= 16 || (reported & (reported - 1)) == 0)
+                // The CPU dirtied the page before the write was reported: the page stays
+                // CPU-owned and the shader's bytes are merged into guest memory instead.
+                if (_sharedPages.Contains(page))
                 {
-                    Console.Error.WriteLine(
-                        $"[GPU][WARN] A device-address write reached a page the CPU dirtied before the write was reported: page=0x{page:X16} count={reported}");
+                    marked |= PullSharedPage(page, owner);
+                }
+                else
+                {
+                    AdoptLateSharedPage(page, owner);
                 }
 
                 continue;
+            }
+
+            // The first CPU access downloads the page; the shadow starts from the downloaded bytes.
+            if (!_sharedPages.Contains(page))
+            {
+                lock (_shaderWrittenPages)
+                {
+                    if (_shaderWrittenPages.Count < MaxShaderWrittenPages)
+                    {
+                        _shaderWrittenPages[page] = owner;
+                        Volatile.Write(ref _shaderWrittenPageCount, _shaderWrittenPages.Count);
+                    }
+                }
             }
 
             if (!_gpuModifiedRanges.Contains(page, TrackerLayout.PageBytes))
@@ -1305,6 +1322,126 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             RequireImageCache().InvalidateMemoryCopiesFromGpu(guestAddress, size);
         }
+    }
+
+    // Pages shaders write through device addresses; see SharedPageShadows. 64 MiB of shadows at most.
+    private const int SharedPageCapacity = 16384;
+    private readonly SharedPageShadows _sharedPages = new(TrackerLayout.PageBytes, SharedPageCapacity);
+    private static long _reportedLateSharedPages;
+    private static long _reportedSharedPageMerges;
+    private static int _reportedSharedPageCapacity;
+
+    // Pages shaders wrote that have no shadow yet, with their owner at the time of the write.
+    private const int MaxShaderWrittenPages = 1 << 20;
+    private readonly Dictionary<ulong, GpuBuffer> _shaderWrittenPages = new();
+    private int _shaderWrittenPageCount;
+
+    // A page the CPU dirtied before its first shader write was reported: shadowed from the GPU copy.
+    private void AdoptLateSharedPage(ulong page, GpuBuffer owner)
+    {
+        var adopted = owner.MappedPointer != null && owner.IsCoherent &&
+            _sharedPages.Adopt(page, owner, new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), (int)TrackerLayout.PageBytes),
+                _scheduler.CurrentTick);
+        if (!adopted && _sharedPages.Count >= SharedPageCapacity && Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
+        {
+            Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
+        }
+
+        var reported = Interlocked.Increment(ref adopted ? ref _reportedLateSharedPages : ref _reportedDeviceWriteConflicts);
+        if (reported <= 16 || (reported & (reported - 1)) == 0)
+        {
+            Console.Error.WriteLine(adopted
+                ? FormattableString.Invariant(
+                    $"[GPU][SHARED_PAGE] The CPU dirtied page=0x{page:X16} before its first shader write was reported; shader bytes an upload already overwrote are lost once shared={_sharedPages.Count} n={reported}")
+                : FormattableString.Invariant(
+                    $"[GPU][WARN] A device-address write reached a page the CPU dirtied and the page has no shadow: page=0x{page:X16} count={reported}"));
+        }
+    }
+
+    // Writes downloaded GPU bytes into guest memory; shadows of shared pages take them too.
+    private bool WriteDownloaded(ulong address, ReadOnlySpan<byte> bytes)
+    {
+        if (!_backing.TryWriteBacking(address, bytes))
+        {
+            return false;
+        }
+
+        _sharedPages.NoteDownloaded(address, bytes);
+        AdoptDownloadedPages(address, (ulong)bytes.Length);
+        return true;
+    }
+
+    // Downloaded shader-written pages now hold in guest memory what the GPU copy holds (the bytes
+    // outside the download were not GPU-written, so they already agreed): shadow them from there.
+    private void AdoptDownloadedPages(ulong address, ulong size)
+    {
+        if (Volatile.Read(ref _shaderWrittenPageCount) == 0)
+        {
+            return;
+        }
+
+        Span<byte> guest = stackalloc byte[(int)TrackerLayout.PageBytes];
+        var end = address + size;
+        for (var page = address & ~(TrackerLayout.PageBytes - 1); page < end; page += TrackerLayout.PageBytes)
+        {
+            GpuBuffer? owner;
+            lock (_shaderWrittenPages)
+            {
+                if (!_shaderWrittenPages.Remove(page, out owner))
+                {
+                    continue;
+                }
+
+                Volatile.Write(ref _shaderWrittenPageCount, _shaderWrittenPages.Count);
+            }
+
+            if (_backing.TryReadBacking(page, guest) && !_sharedPages.Adopt(page, owner!, guest) &&
+                Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
+            {
+                Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
+            }
+        }
+    }
+
+    // Merges what shaders wrote on a shared page into guest memory; true when bytes were merged.
+    private bool PullSharedPage(ulong page, GpuBuffer owner)
+    {
+        if (_sharedPages.Count == 0 || owner.MappedPointer == null || !owner.IsCoherent || !_sharedPages.Contains(page))
+        {
+            return false;
+        }
+
+        // The GPU may still write the page: merge one snapshot of it.
+        Span<byte> gpu = stackalloc byte[(int)TrackerLayout.PageBytes];
+        new ReadOnlySpan<byte>(owner.MappedPointer + owner.Offset(page), gpu.Length).CopyTo(gpu);
+        var guest = new byte[TrackerLayout.PageBytes];
+        if (!_backing.TryReadBacking(page, guest))
+        {
+            return false;
+        }
+
+        var count = _sharedPages.PullGpuWrites(page, owner, gpu, guest, _scheduler.Timeline.CompletedTick, (offset, length) =>
+        {
+            if (!_backing.TryWriteBacking(page + (ulong)offset, guest.AsSpan(offset, length)))
+            {
+                throw SubmissionScheduler.Fatal($"Could not merge shader writes into guest memory: addr=0x{page + (ulong)offset:X16} size=0x{length:X}");
+            }
+        });
+        if (count == 0)
+        {
+            return false;
+        }
+
+        var reported = Interlocked.Increment(ref _reportedSharedPageMerges);
+        if (reported <= 16 || (reported & (reported - 1)) == 0)
+        {
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"[GPU][SHARED_PAGE] merged shader bytes into a CPU-dirty page=0x{page:X16} bytes={count} shared={_sharedPages.Count} merged_bytes={_sharedPages.MergedBytes} skipped_upload_bytes={_sharedPages.SkippedUploadBytes} n={reported}"));
+        }
+
+        if (GuestGpuMemoryHook.Traces(page, TrackerLayout.PageBytes))
+            GuestGpuMemoryHook.Trace(page, TrackerLayout.PageBytes, $"shared-page-merged bytes={count} submission_tick={_scheduler.CurrentTick}");
+        return true;
     }
 
     // Uploads every mapped range before a BDA draw; the fault pass runs at the next collection.
@@ -2385,7 +2522,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var copies = pending.Copies;
             readback.Complete(pending.Ticket, (index, bytes) =>
             {
-                if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+                if (!WriteDownloaded(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
                 }
@@ -2470,7 +2607,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     WriteCombinedCopy.Read(mapped, stagedPointer, length);
                 }
 
-                if (!_backing.TryWriteBacking(copy.Address, new ReadOnlySpan<byte>(staged, 0, length)))
+                if (!WriteDownloaded(copy.Address, new ReadOnlySpan<byte>(staged, 0, length)))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{copy.Size:X16}");
                 }
@@ -2576,7 +2713,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             for (var index = 0; index < copies.Count; index++)
             {
                 var bytes = buffer.Mapped.Slice((int)pending.MainQueueOffsets[index], (int)copies[index].Size);
-                if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+                if (!WriteDownloaded(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{copies[index].Size:X16}");
                 }
@@ -2938,7 +3075,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
-            if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+            if (!WriteDownloaded(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
             }
@@ -2970,7 +3107,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var placement = copy.Placement;
             var offset = baseOffset + placement.DataOffset;
             _download.Invalidate(offset, placement.DataSize);
-            if (!_backing.TryWriteBacking(copy.Address, _download.Mapped.Slice((int)offset, (int)placement.DataSize)))
+            if (!WriteDownloaded(copy.Address, _download.Mapped.Slice((int)offset, (int)placement.DataSize)))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{placement.DataSize:X16}");
             }
@@ -3089,6 +3226,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             readImageBacking ? _tryReadImageSource ??= TryReadImageSource : null);
         _tracker.ForEachUploadRange(guestAddress, size, isWritten, ref sink, preserveCpuWriteHotPages, skipCpuWriteHotPages);
         var source = sink.Source;
+        if (source != null && _sharedPages.Count != 0)
+        {
+            // Shared pages copy only the bytes the CPU changed, so shader bytes in the buffer stay.
+            _sharedPages.FilterUpload(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick);
+            if (copies.Count == 0)
+            {
+                source = null;
+            }
+        }
+
         if (source != null)
         {
             buffer.NoteGpuWrite();
