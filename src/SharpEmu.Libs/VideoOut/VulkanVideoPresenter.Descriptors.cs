@@ -864,6 +864,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var size = ClampMappedSize(descriptor.Address, requested, prepared, index);
+                var resource = prepared.Resources.Info.Buffers[index];
+                if (resource.Formatted && resource.Written)
+                {
+                    // Image preservation can grow a buffer beyond its descriptor's range.
+                    // All stages prepare here before any stage captures buffer handles.
+                    _imageCache.InvalidateMemoryFromGpu(descriptor.Address, size);
+                }
                 sources[index] = (descriptor, _bufferCache.FindBuffer(descriptor.Address, size));
             }
 
@@ -1064,11 +1071,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             memoryOffset = (uint)adjustment;
 
-            if (resource.Formatted && resource.Written)
-            {
-                _imageCache.InvalidateMemoryFromGpu(address, size);
-            }
-            else if (resource.Written)
+            if (resource.Written && !resource.Formatted)
             {
                 _imageCache.InvalidateMemoryCopiesFromGpu(address, size);
             }

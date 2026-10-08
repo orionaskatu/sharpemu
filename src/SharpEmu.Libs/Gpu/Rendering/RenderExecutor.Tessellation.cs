@@ -79,19 +79,29 @@ public sealed partial class RenderExecutor
         var originalHullStage = input.Stage;
         var originalDomainStage = state.Programs.VertexInput.Stage;
         var pipeline = _pipelines.CreateComputePipeline(input, hull.Program);
+        // Patches are numbered across all instances, so instances share batches; each shader
+        // thread splits its patch number into an instance and a patch within it.
+        var totalPatches = (ulong)instances * patches;
+        if (totalPatches > uint.MaxValue)
+            throw _host.Fatal("The tessellated draw has more patches than one batch numbering covers.");
+        if (RenderPhaseProfile.Enabled)
+        {
+            TessellationProfile.RecordDraw(instances, patches, (long)((totalPatches + batchCapacity - 1) / batchCapacity), groupsPerBatch == 1);
+        }
+
         Span<GuestSpan> ranges = stackalloc GuestSpan[2];
         try
         {
-            for (uint instance = 0; instance < instances; instance++)
-                for (uint firstPatch = 0; firstPatch < patches;)
+            for (uint firstPatch = 0; firstPatch < (uint)totalPatches;)
                 {
-                    var batchPatches = Math.Min(batchCapacity, patches - firstPatch);
+                    var batchPatches = Math.Min(batchCapacity, (uint)totalPatches - firstPatch);
                     var groups = (batchPatches + layout.PatchesPerGroup - 1) / layout.PatchesPerGroup;
                     var data = new uint[Gen5TessellationData.DwordCount];
                     data[Gen5TessellationData.FirstPatch] = firstPatch;
                     data[Gen5TessellationData.PatchCount] = batchPatches;
                     data[Gen5TessellationData.VertexOffset] = unchecked((uint)vertexOffset);
-                    data[Gen5TessellationData.InstanceId] = checked(firstInstance + instance);
+                    data[Gen5TessellationData.InstanceId] = firstInstance;
+                    data[Gen5TessellationData.PatchesPerInstance] = patches;
                     data[Gen5TessellationData.IndexSize] = indexSize;
                     data[Gen5TessellationData.FactorBytes] = batchPatches * patchFactorBytes;
                     data[Gen5TessellationData.GroupPatches] = offchipBuffers == 0 ? 0 : layout.PatchesPerGroup;

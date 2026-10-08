@@ -221,6 +221,11 @@ public sealed partial class GpuCommandInterpreter
                 SharpEmu.Libs.Diagnostics.DbgSequence.Note($"PUSH '{text}'");
         }
 
+        if (Images.ImageDropTrace.Enabled)
+        {
+            Images.ImageDropTrace.PushMarker(this, payload);
+        }
+
         return packet.Length - 1;
     }
 
@@ -232,6 +237,12 @@ public sealed partial class GpuCommandInterpreter
             if (SharpEmu.Libs.Diagnostics.DbgSequence.Active)
                 SharpEmu.Libs.Diagnostics.DbgSequence.Note("POP");
         }
+
+        if (Images.ImageDropTrace.Enabled)
+        {
+            Images.ImageDropTrace.PopMarker(this);
+        }
+
         return packet.Length - 1;
     }
 

@@ -295,6 +295,9 @@ internal sealed class ShaderProgramCache
             if (!materialized)
             {
                 var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
+                // Set on this thread by the materialization that just failed; the cache only delegates to it.
+                if (ResourceMaterializer.LastFailureDetail is { } detail)
+                    message = message[..^1] + $" detail={detail}.";
                 if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
                     throw new ShaderProgramRejectedException(message);
                 throw SubmissionScheduler.Fatal(message);

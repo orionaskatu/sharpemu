@@ -137,6 +137,52 @@ public sealed class TessellationWaveDeviceTests(HeadlessVulkanFixture fixture) :
         return values;
     }
 
+    [Fact]
+    public void MergedHullInputs_SplitPatchesNumberedAcrossInstances()
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+        var program = Program(
+            Vop1(0, "VMovB32", 10, Gen5Operand.Vector(1)),
+            Vop1(4, "VMovB32", 11, Gen5Operand.Vector(0)),
+            Vop1(8, "VMovB32", 12, Gen5Operand.Vector(2)),
+            Vop1(12, "VMovB32", 13, Gen5Operand.Vector(5)),
+            Vop2(16, "VLshlrevB32", 14, Operand(4), Gen5Operand.Vector(3)),
+            BufferAccess(20, "BufferStoreDwordx4", 24, dwords: 4, vectorData: 10, offsetEnabled: true, vectorAddress: 14),
+            EndProgram(28));
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, Hash, 0, 64, waveSize: 64);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, 0, 64),
+            false, false, false, usesTessellationData: true);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        { LocalSizeX = 256, WaveSize = 64, CooperativeWave64Workgroup = true, TessellationHull = new(4, 4, 63, 0) };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        using var harness = new ImageTestHarness(vulkan);
+        using var runner = new LayoutComputeRunner(harness, request, shader.Spirv);
+        var buffer = runner.CreateBuffer(4096);
+        var scalar = new uint[64]; scalar[26] = 4096;
+        var data = new uint[Gen5TessellationData.DwordCount];
+        data[Gen5TessellationData.FirstPatch] = 7;
+        data[Gen5TessellationData.PatchCount] = 63;
+        data[Gen5TessellationData.VertexOffset] = 11;
+        data[Gen5TessellationData.InstanceId] = 100;
+        data[Gen5TessellationData.PatchesPerInstance] = 10;
+        harness.Run(() => runner.Dispatch(scalar,
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [buffer] }, 1,
+            tessellationData: data));
+        var bytes = runner.ReadBack(buffer, 0, 4096);
+        for (uint lane = 0; lane < 252; lane++)
+        {
+            uint Read(int component) => BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan((int)lane * 16 + component * 4));
+            var patch = 7 + lane / 4;
+            Assert.Equal((lane / 4) | ((lane % 4) << 8), Read(0));
+            Assert.Equal(patch % 10, Read(1));
+            Assert.Equal(patch % 10 * 4 + lane % 4 + 11, Read(2));
+            Assert.Equal(100 + patch / 10, Read(3));
+        }
+        harness.AssertNoValidationMessages();
+    }
+
     [Theory]
     [InlineData(0u, 0u)]
     [InlineData(1u, 1u)]

@@ -309,9 +309,53 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
-    public void RunCompletedOperations()
+    // Reading the timeline semaphore is a driver call; the per-draw housekeeping asked for it
+    // twice per draw, about 12 % of the command thread in Ghost of Yotei. That path polls at
+    // most once per interval and otherwise uses the last value: completion work then runs a
+    // fraction of a millisecond later, and every real wait still reads the timeline at once.
+    private static readonly long DefaultTimelinePollInterval = System.Diagnostics.Stopwatch.Frequency *
+        (long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TIMELINE_POLL_US"), out var pollUs) ? pollUs : 500) / 1_000_000;
+    private long _lastTimelinePoll;
+
+    // Stopwatch ticks between two polled timeline reads; zero reads it on every poll.
+    internal long TimelinePollInterval { get; set; } = DefaultTimelinePollInterval;
+
+    private void PollTimeline()
     {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (now - _lastTimelinePoll < TimelinePollInterval)
+        {
+            return;
+        }
+
+        _lastTimelinePoll = now;
         _timeline.RefreshCompletedTick();
+    }
+
+    // IsTickComplete for the per-draw housekeeping: the timeline is read at most once per poll interval.
+    public bool IsTickCompletePolled(ulong tick)
+    {
+        if (!_timeline.IsTickComplete(tick))
+        {
+            PollTimeline();
+        }
+
+        return _timeline.IsTickComplete(tick);
+    }
+
+    public void RunCompletedOperations() => RunCompletedOperations(polled: false);
+
+    public void RunCompletedOperations(bool polled)
+    {
+        if (polled)
+        {
+            PollTimeline();
+        }
+        else
+        {
+            _timeline.RefreshCompletedTick();
+        }
+
         for (;;)
         {
             TickWork operation;

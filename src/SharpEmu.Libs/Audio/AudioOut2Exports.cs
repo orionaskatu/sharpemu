@@ -881,11 +881,10 @@ public static class AudioOut2Exports
         return SetReturn(ctx, 0);
     }
 
-    // Fixed-size connected stereo state. Do not trust r8/r9 for byte counts.
-    // SceAudioOut2PortState is laid out as u16 output at +0, u8 active at +2,
-    // u8 channel count at +3, and s16 volume at +4. GTA's older trace/comment
-    // that treated +2 as channels is not the SDK layout; keep the active byte
-    // at +2 for Yotei and expose the decoded channel count at +3.
+    // Fixed-size connected state. Do not trust r8/r9 for byte counts.
+    // Both Demon's Souls and Yotei derive their speaker layout from numChannels
+    // at +2. Yotei's startup poll waits for that count to become nonzero; it is
+    // not an independent active flag. +3 is padding, as in the struct above.
     [SysAbiExport(
         Nid = "gatEUKG+Ea4",
         ExportName = "sceAudioOut2PortGetState",
@@ -914,8 +913,8 @@ public static class AudioOut2Exports
         Span<byte> state = stackalloc byte[PortStateSize];
         state.Clear();
         //   +0x00 u16 output   = CONNECTED_PRIMARY (1)
-        //   +0x02 u8  active   = 1 (the game waits for output to become active)
-        //   +0x03 u8  channels = from port format when known, else 2
+        //   +0x02 u8  channels = from port format when known, else 2
+        //   +0x03 u8  padding  = 0
         //   +0x04 s16 volume   = 127 (full volume)
         byte channels = 2;
         if (Ports.TryGetValue(portHandle, out var port) &&
@@ -925,8 +924,7 @@ public static class AudioOut2Exports
         }
 
         BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], PortStateOutputConnectedPrimary);
-        state[0x02] = 1;
-        state[0x03] = channels;
+        state[0x02] = channels;
         BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], 127);
 
         if (!ctx.Memory.TryWrite(stateAddress, state))

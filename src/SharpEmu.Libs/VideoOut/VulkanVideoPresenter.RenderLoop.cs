@@ -458,6 +458,7 @@ internal static unsafe partial class VulkanVideoPresenter
             VideoOutExports.ReportPresentedFrame();
             PerfOverlay.RecordPresent();
             RenderPhaseProfile.RecordFrame();
+            _bufferCache?.DecayCpuWriteHeat();
             if (_swapchainReadbackPending)
             {
                 // Diagnostics read back GPU memory and need this frame done.

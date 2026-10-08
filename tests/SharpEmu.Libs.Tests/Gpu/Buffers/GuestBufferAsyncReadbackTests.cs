@@ -196,6 +196,32 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     }
 
     [Fact]
+    public void AWindowWhoseReadAheadsKeepGoingStaleStopsGettingThem()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        GpuWrite(harness, address, 0x01010101);
+        QueueRead(harness, address);
+        for (var round = 0; round < 4; round++)
+        {
+            GpuWrite(harness, address, 0x02020202u + (uint)round);
+            SubmitBatch(harness);
+            GpuWrite(harness, address, 0x03030303u + (uint)round);
+            QueueRead(harness, address);
+        }
+
+        // Two wasted read-aheads, then the window is skipped; the reads still see the latest bytes.
+        Assert.Equal(2, harness.Cache.EagerReadbacksStarted);
+        Assert.Equal(0, harness.Cache.EagerReadbacksUsed);
+        Assert.Equal(0x03030306u, BitConverter.ToUInt32(harness.Read(address + 0x40, 4)));
+        Detach(harness);
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void RepeatedGuestReadsReuseTheReadbackSlots()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

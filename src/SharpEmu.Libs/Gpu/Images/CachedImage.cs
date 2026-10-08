@@ -508,7 +508,17 @@ public sealed unsafe partial class CachedImage : IDisposable
     // source's sequence, so the alias is not copied back while neither image is written again.
     public long ContentSequence { get; set; }
 
-    public void ClearGpuModified() => _gpuModified = false;
+    public void ClearGpuModified(
+        [System.Runtime.CompilerServices.CallerFilePath] string file = "",
+        [System.Runtime.CompilerServices.CallerLineNumber] int line = 0)
+    {
+        if (_gpuModified && ImageDropTrace.Enabled)
+        {
+            ImageDropTrace.Record(this, file, line);
+        }
+
+        _gpuModified = false;
+    }
 
     // Advances whenever any image becomes GPU-modified, the only way an image starts to own
     // guest bytes the CPU must not read.

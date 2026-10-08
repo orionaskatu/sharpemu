@@ -14,6 +14,14 @@ public static partial class Gen5SpirvTranslator
         private uint TessellationWord(uint index) => LoadShaderDataDword(UInt(_request.Bindings.TessellationDataDword + index));
         private uint TessellationPointer(uint index) => Pair64(TessellationWord(index), TessellationWord(index + 1));
 
+        // Patches of one instance as a divisor; zero (a single instance) divides by all ones.
+        private uint PatchesPerInstanceDivisor()
+        {
+            var patches = TessellationWord(Gen5TessellationData.PatchesPerInstance);
+            return _module.AddInstruction(SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, patches, UInt(0)), UInt(uint.MaxValue), patches);
+        }
+
         private void EmitHullInputState()
         {
             var info = _request.TessellationHull!.Value;
@@ -45,10 +53,16 @@ public static partial class Gen5SpirvTranslator
                 group, TessellationWord(Gen5TessellationData.FactorGroupBytes))));
             var relativePatch = _module.AddInstruction(SpirvOp.UDiv, _uintType, local, UInt(info.OutputControlPoints));
             var controlPoint = _module.AddInstruction(SpirvOp.UMod, _uintType, local, UInt(info.OutputControlPoints));
-            StoreV(0, IAdd(relativePatch, firstPatch), false);
+            // Patch numbers run across the instances of the draw; the guest sees the patch
+            // within its instance and the instance of each input control point.
+            var perInstance = PatchesPerInstanceDivisor();
+            StoreV(0, _module.AddInstruction(SpirvOp.UMod, _uintType, IAdd(relativePatch, firstPatch), perInstance), false);
             StoreV(1, BitwiseOr(relativePatch, ShiftLeftLogical(controlPoint, UInt(8))), false);
-            var inputIndex = IAdd(local, _module.AddInstruction(SpirvOp.IMul, _uintType,
-                firstPatch, UInt(info.InputControlPoints)));
+            var inputPatch = IAdd(firstPatch, _module.AddInstruction(SpirvOp.UDiv, _uintType, local, UInt(info.InputControlPoints)));
+            var inputIndex = IAdd(
+                _module.AddInstruction(SpirvOp.IMul, _uintType,
+                    _module.AddInstruction(SpirvOp.UMod, _uintType, inputPatch, perInstance), UInt(info.InputControlPoints)),
+                _module.AddInstruction(SpirvOp.UMod, _uintType, local, UInt(info.InputControlPoints)));
             var indexSize = TessellationWord(Gen5TessellationData.IndexSize);
             var vertex = _tessellationVertexIndexScratch;
             Store(vertex, inputIndex);
@@ -68,7 +82,8 @@ public static partial class Gen5SpirvTranslator
             });
             StoreV(2, IAdd(Load(_uintType, vertex), TessellationWord(Gen5TessellationData.VertexOffset)), false);
             StoreV(3, local, false);
-            StoreV(5, TessellationWord(Gen5TessellationData.InstanceId), false);
+            StoreV(5, IAdd(TessellationWord(Gen5TessellationData.InstanceId),
+                _module.AddInstruction(SpirvOp.UDiv, _uintType, inputPatch, perInstance)), false);
         }
 
         private void DeclareTessellationInputs()
@@ -110,7 +125,8 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, groupPatches, UInt(0)), UInt(uint.MaxValue), groupPatches);
             var group = _module.AddInstruction(SpirvOp.UDiv, _uintType, drawPatch, divisor);
             StoreV(7, _module.AddInstruction(SpirvOp.UMod, _uintType, drawPatch, divisor), guardWithExec: false);
-            StoreV(8, IAdd(drawPatch, TessellationWord(Gen5TessellationData.FirstPatch)), guardWithExec: false);
+            StoreV(8, _module.AddInstruction(SpirvOp.UMod, _uintType,
+                IAdd(drawPatch, TessellationWord(Gen5TessellationData.FirstPatch)), PatchesPerInstanceDivisor()), guardWithExec: false);
             StoreS(4, IAdd(TessellationWord(Gen5TessellationData.OffchipOffset), _module.AddInstruction(SpirvOp.IMul, _uintType,
                 group, TessellationWord(Gen5TessellationData.OffchipSlotBytes))));
         }

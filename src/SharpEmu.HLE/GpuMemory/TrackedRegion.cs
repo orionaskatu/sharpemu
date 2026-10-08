@@ -221,6 +221,9 @@ public sealed class TrackedRegion
         }
     }
 
+    // A racy hint for the per-frame decay; the decay itself runs under Lock.
+    public bool HasCpuWriteHeat => _hotCpuWrites.Any;
+
     public void ResetCpuWriteHeat(ulong address, ulong size)
     {
         var (start, end) = GetPageRange(address, size);

@@ -245,7 +245,8 @@ public sealed partial class GuestImageCache
                     continue;
                 }
 
-                owner.ClearGpuModified();
+                // Only the safe path published the contents first; the other one loses them.
+                owner.ClearGpuModified(safe ? "EvictionAfterDownload" : "EvictionWithoutDownload", 0);
             }
 
             deletions -= DeleteImage(imageIdentifier);

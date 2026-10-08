@@ -552,6 +552,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("A buffer request requires a command buffer that is recording.");
         }
 
+        if (isWritten && isTexelBuffer)
+        {
+            // Preserving a partial image write can merge this buffer with the image's whole
+            // backing range. Finish that before returning a handle the shader will write.
+            RequireImageCache().InvalidateMemoryFromGpu(guestAddress, size);
+        }
+
         if (!requiresDeviceAddress && !isWritten &&
             !_tracker.HasGpuDirtyPages(guestAddress, size) &&
             _tracker.HasCpuDirtyPages(guestAddress, size) &&
@@ -638,6 +645,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         return true;
+    }
+
+    // The image cache publishes an image's GPU-only contents into the buffer over the same bytes
+    // before it drops the image. The buffer then owns them, as after any GPU write.
+    public GpuBuffer? ObtainBufferForImageWriteBack(ulong guestAddress, ulong size)
+    {
+        if (!IsValidRange(guestAddress, size) || !_backing.IsBackedRange(guestAddress, size))
+        {
+            return null;
+        }
+
+        return ObtainBuffer(guestAddress, size, isWritten: true).Buffer;
     }
 
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
@@ -1271,6 +1290,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly long VisibilityGenerationTicks = long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VIS_GEN_US"), out var genUs) ? genUs * System.Diagnostics.Stopwatch.Frequency / 1_000_000 : 0;
     private long _visibilityGenerationAt;
 
+    // Called once per presented frame; see GuestPageTracker.DecayCpuWriteHeat.
+    public void DecayCpuWriteHeat()
+    {
+        if (!KeepCpuWriteHeatAcrossFrames)
+        {
+            _tracker.DecayCpuWriteHeat();
+        }
+    }
+
+    private static readonly bool KeepCpuWriteHeatAcrossFrames =
+        Environment.GetEnvironmentVariable("SHARPEMU_KEEP_CPU_WRITE_HEAT") == "1";
+
     public void NoteMemoryVisibilityPoint()
     {
         _bdaVisibilityPending = true;
@@ -1658,11 +1689,23 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private const ulong ReadbackWindowBytes = 512 * 1024;
+    // Uncached reads of device-local memory run near 300 MB/s, and most mapped reads want one
+    // descriptor word or packet dword: one tracker page is the smallest window that can turn clean.
+    // SHARPEMU_MAPPED_READBACK_KB overrides it (a power of two) for comparisons.
+    private static readonly ulong MappedReadbackWindowBytes =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_READBACK_KB"), out var mappedKb) && mappedKb != 0 &&
+        (mappedKb & (mappedKb - 1)) == 0 ? mappedKb * 1024 : TrackerLayout.PageBytes;
     private const long HotWindowLifetime = 512;
     private const int MaxEagerReadbacks = 4;
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
     private readonly HashSet<ulong> _eagerCandidates = new();
     private readonly List<PendingDownload> _eagerDownloads = new();
+    // Consecutive eager readbacks of a window the GPU rewrote before the CPU read them.
+    // A window that keeps wasting its copies stops getting them until the counts reset.
+    private readonly Dictionary<ulong, int> _eagerMisses = new();
+    private const int MaxEagerMisses = 2;
+    private const long EagerMissResetBatches = 256;
+    private static long _reportedEagerSkipped;
     private long _batchSerial;
     private static long _reportedEagerStarted;
     private static long _reportedEagerUsed;
@@ -1717,8 +1760,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 if (!CompleteReadMemoryOnGpu(pending, retrySynchronously: false))
                 {
                     Interlocked.Increment(ref _reportedEagerStale);
+                    NoteEagerMiss(pending.GuestAddress);
                 }
             }
+        }
+
+        if (_batchSerial % EagerMissResetBatches == 0)
+        {
+            _eagerMisses.Clear();
         }
 
         if ((_batchSerial & 1023) == 0)
@@ -1739,6 +1788,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (_eagerDownloads.Count >= MaxEagerReadbacks)
             {
                 break;
+            }
+
+            if (_eagerMisses.TryGetValue(key, out var misses) && misses >= MaxEagerMisses)
+            {
+                Interlocked.Increment(ref _reportedEagerSkipped);
+                continue;
             }
 
             if (_hotWindows.TryGetValue(key, out var hot))
@@ -1812,12 +1867,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (!CompleteReadMemoryOnGpu(pending, retrySynchronously: false))
         {
             Interlocked.Increment(ref _reportedEagerStale);
+            NoteEagerMiss(pending.GuestAddress);
             return false;
         }
 
+        _eagerMisses.Remove(pending.GuestAddress & ~(ReadbackWindowBytes - 1));
         EagerReadbacksUsed++;
         Interlocked.Increment(ref _reportedEagerUsed);
         return !HasGpuDirtyBytes(guestAddress, size);
+    }
+
+    private void NoteEagerMiss(ulong guestAddress)
+    {
+        var key = guestAddress & ~(ReadbackWindowBytes - 1);
+        _eagerMisses[key] = _eagerMisses.TryGetValue(key, out var misses) ? misses + 1 : 1;
     }
 
     private void AbandonEagerReadbacks()
@@ -1868,7 +1931,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_skipped={Interlocked.Exchange(ref _reportedEagerSkipped, 0)}");
 
     // Ticket is set when the readback queue carries the download; otherwise the main queue
     // does, into MainQueueBuffer, and MainQueueTick is the submission the guest thread waits for.
@@ -1919,6 +1982,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
         if (copies.Count != 0 && _unifiedBuffers && AreMapped(copies, out var writer))
         {
+            // The mapping is device-local memory the CPU reads uncached across the bus, so a
+            // mapped read copies only the pages around the request, not the whole window.
+            copies = CollectReadbackWindow(copies[0].Buffer, guestAddress, size, MappedReadbackWindowBytes, out windowBegin, out windowEnd);
             if (writer == 0 || _scheduler.IsTickComplete(writer))
             {
                 ApplyMappedRead(copies, windowBegin, windowEnd, guestAddress, size, isWrite, readbackStarted, source);
@@ -2389,9 +2455,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private List<DownloadPiece> CollectReadbackWindow(ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd) =>
         CollectReadbackWindow(_registry.GetBuffer(FindBuffer(guestAddress, size)), guestAddress, size, out windowBegin, out windowEnd);
 
-    private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd)
+    private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd) =>
+        CollectReadbackWindow(buffer, guestAddress, size, ReadbackWindowBytes, out windowBegin, out windowEnd);
+
+    private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, ulong windowSize,
+        out ulong windowBegin, out ulong windowEnd)
     {
-        const ulong windowSize = ReadbackWindowBytes;
         var bufferEnd = buffer.CpuAddress + buffer.Size;
         windowBegin = Math.Max(guestAddress & ~(windowSize - 1), buffer.CpuAddress);
         windowEnd = Math.Min(Math.Max(windowBegin + windowSize, guestAddress + size), bufferEnd);

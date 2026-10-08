@@ -156,6 +156,32 @@ public sealed class GuestPageTracker
         return true;
     }
 
+    // Hot pages stay writable and are copied whole at every sync, so a ring the CPU fills a
+    // little at a time would end up copied in full forever. Once a frame they lose their heat:
+    // the next sync copies them once more and protects them again, and only pages the CPU
+    // keeps rewriting within a frame turn hot again.
+    public void DecayCpuWriteHeat()
+    {
+        RejectUploadCallbackReentry();
+        for (var index = 0; index < _regions.Length; index++)
+        {
+            if (Volatile.Read(ref _regions[index]) is not { HasCpuWriteHeat: true } region)
+            {
+                continue;
+            }
+
+            region.Lock.Enter();
+            try
+            {
+                region.ResetCpuWriteHeat(region.BaseAddress, TrackerLayout.BlockBytes);
+            }
+            finally
+            {
+                region.Lock.Exit();
+            }
+        }
+    }
+
     public void UntrackMemory(ulong vaddr, ulong size)
     {
         RejectUploadCallbackReentry();

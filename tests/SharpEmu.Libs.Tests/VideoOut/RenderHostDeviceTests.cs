@@ -598,6 +598,54 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
         harness.Shutdown();
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PrepareBindings_PreservesPartialGpuImagesBeforeAnyStageCapturesBufferHandles(bool separateStages)
+    {
+        if (!Ready()) return;
+        using var presenter = new PresenterUnderTest(_vulkan!);
+        using var fatal = new FatalScope();
+        presenter.SetField("_minStorageBufferOffsetAlignment", 256UL);
+        presenter.LoadRenderingCommands();
+        var harness = presenter.Harness;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var image = Color32(address, 8192);
+        var imageId = harness.Acquire(ref image);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11223344)));
+        Assert.True(harness.Image(imageId).IsGpuModified);
+        var read = new BufferResource { Read = true, MaxByteExtent = 4 };
+        var write = new BufferResource { Written = true, Formatted = true, MaxByteExtent = 4 };
+        var readAddress = address + 0x100;
+        var writeAddress = address + 0x4000;
+        uint[] Descriptor(ulong at) => [(uint)at, (uint)(at >> 32), 4, 0];
+
+        presenter.Run(() =>
+        {
+            using var preparation = presenter.RenderHost.BeginPreparation();
+            var firstProgram = FixedProgramProvider.EmptyProgram(ShaderStageKind.Compute, 3,
+                new ShaderResourceInfo { Buffers = separateStages ? [read] : [read, write] });
+            var first = presenter.RenderHost.PrepareBindings(new ShaderStageResources(firstProgram,
+                new ResourceSnapshot { Buffers = separateStages ? [Descriptor(readAddress)] : [Descriptor(readAddress), Descriptor(writeAddress)] }));
+            IPreparedBindings? second = null;
+            if (separateStages)
+            {
+                var secondProgram = FixedProgramProvider.EmptyProgram(ShaderStageKind.Compute, 4,
+                    new ShaderResourceInfo { Buffers = [write] });
+                second = presenter.RenderHost.PrepareBindings(new ShaderStageResources(secondProgram,
+                    new ResourceSnapshot { Buffers = [Descriptor(writeAddress)] }));
+            }
+
+            var readOwner = harness.Cache.GetBuffer(harness.Cache.FindBuffer(readAddress, 4));
+            var writeOwner = harness.Cache.GetBuffer(harness.Cache.FindBuffer(writeAddress, 4));
+            presenter.RenderHost.BindResources(first);
+            if (second is not null) presenter.RenderHost.BindResources(second);
+            Assert.Same(readOwner, harness.Cache.GetBuffer(harness.Cache.FindBuffer(readAddress, 4)));
+            Assert.Same(writeOwner, harness.Cache.GetBuffer(harness.Cache.FindBuffer(writeAddress, 4)));
+        });
+        harness.Shutdown();
+    }
+
     [Fact]
     public void PrepareBindings_PrivateBufferUploadsCurrentBytesAndStillRejectsGpuWrites()
     {

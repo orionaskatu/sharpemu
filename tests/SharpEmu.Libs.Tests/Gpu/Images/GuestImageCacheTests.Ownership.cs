@@ -7,6 +7,7 @@ using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Tests.Gpu.Buffers;
+using SharpEmu.Libs.Tests.Gpu.Scheduling;
 using Silk.NET.Vulkan;
 using Xunit;
 using static SharpEmu.Libs.Tests.Gpu.Images.ImageCacheTestSupport;
@@ -109,6 +110,35 @@ public sealed partial class GuestImageCacheTests
         Assert.Equal(integerContents, harness.Image(integerId).ContentSequence);
         Assert.Equal(floatingContents, harness.Image(floatingId).ContentSequence);
         Assert.Equal(integerContents, floatingContents);
+        harness.Shutdown();
+    }
+
+    // A formatted shader binding can cover only one cache page of a larger GPU image.
+    // Publishing the untouched image bytes must keep writes through that binding visible.
+    [Fact]
+    public void PartialFormattedWriteToGpuImage_ReachesTheCurrentBufferOwner()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var request = Color32(address, 8192);
+        var imageId = harness.Acquire(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, 0x8000, 0x11223344)));
+        Assert.True(harness.Image(imageId).IsGpuModified);
+
+        var writeAddress = address + 0x4000;
+        harness.Worker.Run(() =>
+        {
+            var (bound, offset) = harness.Cache.ObtainBuffer(writeAddress, 4, isWritten: true, isTexelBuffer: true);
+            harness.Images.InvalidateMemoryFromGpu(writeAddress, 4);
+            bound.Fill(offset, 4, 0x55667788);
+        });
+
+        Assert.True(harness.Cache.DownloadToCpu(writeAddress, 4));
+        Assert.Equal(0x55667788u, harness.ReadUInt32(writeAddress));
+        Assert.True(harness.Cache.DownloadToCpu(address, 4));
+        Assert.Equal(0x11223344u, harness.ReadUInt32(address));
         harness.Shutdown();
     }
 
