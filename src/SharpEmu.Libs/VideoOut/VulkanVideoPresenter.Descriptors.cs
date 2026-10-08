@@ -1602,7 +1602,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var descriptor = new TextureDescriptorWords(snapshot.Images[index]);
-                if (descriptor.MetadataCompress)
+                // The culling pass reads the previous frame's visibility images after the game fast-cleared their DCC
+                // metadata; applying that clear leaves it nothing to read (no static world). It reads their pixels.
+                if (descriptor.MetadataCompress && !(VisibilityFeedback.KeepVisibilityImages && program.Hash == VisibilityFeedback.CullProgramHash))
                 {
                     _imageCache.ApplyPendingDccClear(binding.ImageIdentifier, descriptor.MetadataAddress << 8);
                 }

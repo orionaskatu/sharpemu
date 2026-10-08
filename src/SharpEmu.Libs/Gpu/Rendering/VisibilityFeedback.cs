@@ -11,7 +11,10 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 internal static class VisibilityFeedback
 {
     internal const ulong CullProgramHash = 0x17444E6ABBF4F82CUL;
-    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_VIS_FEEDBACK") != "0";
+    // SHARPEMU_VIS_KEEP_IMAGES=0 applies the pending DCC clear to the culling pass's inputs again.
+    internal static readonly bool KeepVisibilityImages = Environment.GetEnvironmentVariable("SHARPEMU_VIS_KEEP_IMAGES") != "0";
+    // Off by default: the id target is not the triangle-id image (feeding it left the static world mostly missing); SHARPEMU_VIS_FEEDBACK=1 enables it.
+    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_VIS_FEEDBACK") == "1";
 
     // CB_COLOR_INFO of the R32Uint id target (format bits; the DCC flag bit is ignored).
     private const uint IdTargetInfo = 0x50410;
