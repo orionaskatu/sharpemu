@@ -1191,10 +1191,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private Action<ulong, ulong>? _uploadDirtyBuffersInRange;
     private Action<ulong, ulong>? _touchBuffersInRange;
 
-    // SHARPEMU_BDA_SWEEP_REPROTECT_HOT=1 re-protects hot pages in sweeps: ~3x fewer staging uploads in Ghost of Yotei
-    // (5-7 fps instead of 2) but the GPU device was lost within a minute of reaching the game world in testing.
+    // Sweeps re-protect CPU-write-hot pages by default: keeping them writable copies them again on every sweep, which
+    // was ~40,000 staging uploads per 5 s in Ghost of Yotei (2 fps, GPU 85%). SHARPEMU_BDA_SWEEP_REPROTECT_HOT=0 keeps them writable.
     internal static bool PreserveHotPagesInSweeps { get; set; } =
-        Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_REPROTECT_HOT") != "1";
+        Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_REPROTECT_HOT") == "0";
     private bool _bdaVisibilityPending = true;
 
     private static readonly bool SweepBdaOnEveryDraw =

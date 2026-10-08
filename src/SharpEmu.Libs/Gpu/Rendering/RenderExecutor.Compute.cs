@@ -232,6 +232,24 @@ public sealed partial class RenderExecutor
         }
 
         DbgVcullWatch(program, input); // TEMP
+        if (program.Hash == 0x25FCDA2A90D50DD4UL && Environment.GetEnvironmentVariable("SHARPEMU_DBG_TABLESTAT") == "1" && input.Stage.Resources.Buffers.Length > 1 && input.Stage.Resources.Buffers[1].Length >= 4) // TEMP
+        {
+            var tableDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[1]);
+            var tableBytes = new byte[Math.Min(tableDescriptor.Footprint() ?? 0, 4UL << 20)];
+            if (tableBytes.Length >= 32 && _host.TryReadGuest(tableDescriptor.Address, tableBytes))
+            {
+                var used = 0; ulong triSum = 0;
+                for (var rec = 0; rec + 32 <= tableBytes.Length; rec += 32)
+                {
+                    var instances = BitConverter.ToUInt32(tableBytes, rec + 4);
+                    var tris = BitConverter.ToUInt32(tableBytes, rec + 8);
+                    if (instances != 0 && tris != 0) { used++; triSum += (ulong)instances * tris; }
+                }
+
+                Console.Error.WriteLine($"[DBG][TABLE] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} addr=0x{tableDescriptor.Address:X} bytes=0x{tableBytes.Length:X} usedRecords={used} triSum={triSum} groups={groupsX}");
+            }
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_STRUCTS") == "1" && program.Hash is 0x25FCDA2A90D50DD4UL or 0x525A55D3242304C9UL or 0xB7DF200E29FEE750UL && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds > 70 && DbgStructQuota(program.Hash)) // TEMP
         {
             var dbgUd = input.Stage.Resources.UserData;

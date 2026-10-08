@@ -499,14 +499,23 @@ public sealed partial class RenderExecutor
 
     private static readonly HashSet<ulong> SkippedPixelHashes = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_PS") switch
     {
-        null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL],
+        // The first six are the skin subsurface composites (white skin); F23F7E7F... is the grass pixel shader, whose
+        // waterfall loop hangs the GPU (device lost) on the first frame with grass.
+        null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL,
+            0xF23F7E7F30362713UL],
         var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
     };
 
-    private static readonly HashSet<ulong> DbgSkipVertexHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") ?? "") // TEMP
-        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+    // The water deferred draws (vertex shader 4D314AF5...) take 5 s of GPU time per frame (pixel shader 459074A8...), so they
+    // are skipped by default; SHARPEMU_DBG_SKIP_VS=off draws them.
+    private static readonly HashSet<ulong> DbgSkipVertexHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") switch
+    {
+        null => [0x4D314AF535375953UL],
+        var text => text.Split(',', StringSplitOptions.RemoveEmptyEntries).Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
+            .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet(),
+    };
 
     private const ulong IndexedIndirectArgumentsSize = 20;
     private const ulong IndirectArgumentsSize = 16;
