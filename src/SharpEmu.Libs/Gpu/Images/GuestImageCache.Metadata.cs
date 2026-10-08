@@ -176,6 +176,33 @@ public sealed unsafe partial class GuestImageCache
         TakeGpuOwnership(image);
     }
 
+    // Fills every texel of a float image with one value, in command order before whatever binds it next.
+    public void FillImage(ResourceSlotIdentifier imageIdentifier, float value)
+    {
+        using var held = _lock.Hold();
+        var image = _slots[imageIdentifier];
+        if (image.Description.IsVolume || !image.Backing.Exists)
+        {
+            return;
+        }
+
+        var command = _scheduler.Current;
+        if (command.IsInvalid)
+        {
+            return;
+        }
+
+        command.EndRendering();
+        var native = new CommandBuffer(command.Handle);
+        var range = new SubresourceRange(0, image.Backing.MipLevels, 0, image.Backing.Layers);
+        image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, native);
+        var clear = new ClearColorValue { Float32_0 = value, Float32_1 = value, Float32_2 = value, Float32_3 = value };
+        var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, image.Backing.MipLevels, 0, image.Backing.Layers);
+        _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &vkRange);
+        WatchImage(imageIdentifier);
+        TakeGpuOwnership(image);
+    }
+
     public static bool IsDccClearCode(byte code) => code is 0x00 or 0x20 or 0x40 or 0x80 or 0xc0;
 
     public bool TryReadGuestDccClear(ulong metadataAddress, ulong sliceSize, uint slice, out ulong sliceAddress, out byte code)

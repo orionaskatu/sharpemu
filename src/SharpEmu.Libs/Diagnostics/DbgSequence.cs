@@ -18,6 +18,12 @@ internal static class DbgSequence
     // The fog and haze layers (volumetric fog, water mist, deferred and translucent particles composited into the light buffer)
     // are drawn by default; SHARPEMU_FOG=0 skips them.
     private static readonly bool FogOff = Environment.GetEnvironmentVariable("SHARPEMU_FOG") == "0";
+    // SHARPEMU_SHADOWS=0 skips every shadow pass: the cascade and particle casters, the slice resolves, the screen-space and
+    // occlusion shadows and the combine. Measured: the frame rate does not change (shadows are cheap here) and the lighting
+    // then reads stale, never-written shadow data, so the picture is worse. A debugging switch only.
+    private static readonly bool ShadowsOff = Environment.GetEnvironmentVariable("SHARPEMU_SHADOWS") == "0";
+    private static readonly string[] ShadowMarkers = ["Cascaded shadow map", "Particle Shadow", "Resolve Shadow Map Slice", "Directional Shadow", "Enqueue Shadow Resolve",
+        "Screen Space Shadows", "Dirshadow occlusion", "Shadow Wait"];
     private static readonly string[] FogMarkers = ["Volfog", "Water Particles", "Deferred Particles", "Composite particles", "Translucent Particles"];
 
     // TEMP: SHARPEMU_DBG_SKIP_MARKER_SCHED="from:len:name|name;from:len:name" skips draws and dispatches recorded under a
@@ -28,7 +34,7 @@ internal static class DbgSequence
             .Select(parts => (double.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture), parts[2].Split('|'))).ToArray();
 
     // Innermost PUSH marker name of the current command stream (tracked only while capturing or sequencing).
-    public static readonly bool TrackMarkers = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_FRAME_DIR") is { Length: > 0 } || Environment.GetEnvironmentVariable("SHARPEMU_DBG_TALLY") == "1" || Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROBE") == "1" || At >= 0 || FogOff || SkipSchedule.Length != 0;
+    public static readonly bool TrackMarkers = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_FRAME_DIR") is { Length: > 0 } || Environment.GetEnvironmentVariable("SHARPEMU_DBG_TALLY") == "1" || Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROBE") == "1" || At >= 0 || FogOff || ShadowsOff || SkipSchedule.Length != 0;
 
     [ThreadStatic] private static List<string>? _markers;
     public static string Marker => _markers is { Count: > 0 } ? string.Join("/", _markers.Skip(Math.Max(0, _markers.Count - 2))) : "";
@@ -104,6 +110,13 @@ internal static class DbgSequence
         {
             if (_markers is not { Count: > 0 }) return false;
             if (ParticleEvery > 1 && (Volatile.Read(ref _frames) % ParticleEvery) != 0 && Array.IndexOf(ParticleSimMarkers, _markers[^1]) >= 0) return true;
+            if (ShadowsOff)
+            {
+                foreach (var marker in _markers)
+                    foreach (var name in ShadowMarkers)
+                        if (marker.Contains(name, StringComparison.Ordinal)) return true;
+            }
+
             if (FogOff)
             {
                 foreach (var marker in _markers)

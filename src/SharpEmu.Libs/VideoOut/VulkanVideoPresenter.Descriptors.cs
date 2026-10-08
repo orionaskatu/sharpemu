@@ -1437,6 +1437,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 var resource = info.Images[index];
                 var view = binding.Request.View;
                 var image = _imageCache.GetImage(binding.ImageIdentifier);
+                if (binding.IsStorage && HizPolicy.ShouldPrefill(program.Hash, index) && image.Backing.Format == Format.R32Sfloat)
+                {
+                    _imageCache.FillImage(binding.ImageIdentifier, 1e7f);
+                }
+
                 if (binding.IsStorage && image.Description.HasStencil && ViewFormatRules.IsStencilViewFormat(view.Format))
                 {
                     image = AcquireStencilStorage(binding, image);

@@ -81,7 +81,7 @@ public sealed partial class RenderExecutor
         {
             if (_dbgProbeFrame >= 0)
             {
-                var text = string.Join(" | ", DbgProbeDraws.OrderByDescending(pair => pair.Value[0]).Take(DbgProbeTop).Select(pair => $"{pair.Key}: n={pair.Value[0]} idx={pair.Value[1]} inst={pair.Value[2]}"));
+                var text = string.Join(" | ", DbgProbeDraws.OrderByDescending(pair => pair.Key.Contains("high-res terrain") ? long.MaxValue : pair.Value[0]).Take(DbgProbeTop).Select(pair => $"{pair.Key}: n={pair.Value[0]} idx={pair.Value[1]} inst={pair.Value[2]}"));
                 Console.Error.WriteLine($"[DBG][PROBE] frame={_dbgProbeFrame} t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F0} {text}");
             }
 

@@ -17,6 +17,18 @@ internal static class HizPolicy
     internal enum Mode { Real, Union, Far }
 
     internal const ulong BuilderProgramHash = 0x9DCF7A3711A288C0UL;
+    internal const ulong ReprojectProgramHash = 0xF00717DE7B897C69UL;
+
+    // The pyramid images are rewritten only where the frame's depth reaches: the rest keeps its old contents, zero
+    // (an occluder at distance 0 that culls everything behind it) in the image that was never fully written. The GPU
+    // consumers (terrain culling, tile passes) then dropped most of the terrain on the frames that read that image.
+    // The images are filled with "far" ahead of the pass that rewrites them. SHARPEMU_HIZ_PREFILL=0 disables.
+    internal static readonly bool PrefillFar = Environment.GetEnvironmentVariable("SHARPEMU_HIZ_PREFILL") != "0";
+
+    internal static bool ShouldPrefill(ulong programHash, int imageIndex) =>
+        PrefillFar && ((programHash == BuilderProgramHash && imageIndex == BuilderPyramidImageIndex) ||
+                       (programHash == ReprojectProgramHash && imageIndex == 0));
+
     internal const ulong ImageBytes = 960UL * 540UL * 4UL;
     internal const uint FarBits = 0x4B189680; // 1e7
     private const int BuilderPyramidImageIndex = 3;
