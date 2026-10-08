@@ -49,6 +49,7 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
             HasMemoryBudget = false;
         }
         vk.GetPhysicalDeviceProperties(physicalDevice, out var properties);
+        IsDiscrete = properties.DeviceType == PhysicalDeviceType.DiscreteGpu;
         MinUniformBufferOffsetAlignment = Math.Max(properties.Limits.MinUniformBufferOffsetAlignment, 1);
         MinStorageBufferOffsetAlignment = Math.Max(properties.Limits.MinStorageBufferOffsetAlignment, 1);
         NonCoherentAtomSize = Math.Max(properties.Limits.NonCoherentAtomSize, 1);
@@ -74,6 +75,9 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     public Device Device { get; }
 
     public ulong DeviceLocalHeapBytes { get; }
+
+    // A discrete GPU: device-local memory the host can map (resizable BAR) is VRAM behind PCIe, not shared RAM.
+    public bool IsDiscrete { get; }
 
     public ulong DeviceLocalBudgetBytes { get; private set; }
 

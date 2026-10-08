@@ -3,6 +3,7 @@
 
 namespace SharpEmu.Libs.VideoOut;
 
+using System.Buffers;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Gpu;
@@ -1075,14 +1076,17 @@ internal static unsafe partial class VulkanVideoPresenter
             return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
         }
 
-        private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program)
+        private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program) =>
+            UploadDwords(data.AsSpan(), label, program);
+
+        private BufferView UploadDwords(ReadOnlySpan<uint> data, string label, ShaderProgramInfo program)
         {
             if (data.Length == 0)
             {
                 throw SubmissionScheduler.Fatal($"The {label} upload is empty: hash=0x{program.Hash:X16}.");
             }
 
-            var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes<uint>(data);
+            var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(data);
             var binding = UploadTransient(bytes, Math.Max(TransientDataAlignment, (uint)_minStorageBufferOffsetAlignment));
             return new BufferView(new VkBuffer(binding.Handle), binding.Offset, (ulong)bytes.Length);
         }
@@ -1134,6 +1138,25 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private static readonly Dictionary<ulong, (long Calls, long Dwords, long Patches, int Max)> _dbgTable = new(); // TEMP
+        private static long _dbgTableNext; // TEMP
+        private static readonly bool _dbgTableStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_TABLESTAT2") == "1"; // TEMP
+        private static void DbgTableStat(ulong hash, int dwords, int patches) // TEMP
+        {
+            if (!_dbgTableStats) return;
+            lock (_dbgTable)
+            {
+                _dbgTable.TryGetValue(hash, out var e);
+                _dbgTable[hash] = (e.Calls + 1, e.Dwords + dwords, e.Patches + patches, Math.Max(e.Max, dwords));
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (now < _dbgTableNext) return;
+                _dbgTableNext = now + 15 * System.Diagnostics.Stopwatch.Frequency;
+                foreach (var pair in _dbgTable.OrderByDescending(p => p.Value.Dwords).Take(12))
+                    Console.Error.WriteLine($"[DBG][TABLE2] hash=0x{pair.Key:X16} calls={pair.Value.Calls} avgDw={pair.Value.Dwords / pair.Value.Calls} maxDw={pair.Value.Max} avgPatches={pair.Value.Patches / pair.Value.Calls} totalMB={pair.Value.Dwords * 4 / 1048576}");
+                _dbgTable.Clear();
+            }
+        }
+
         private void BindFlattenedResourceTable(PreparedStageBindings prepared)
         {
             var layout = prepared.Layout;
@@ -1144,69 +1167,101 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var program = prepared.Program;
             var snapshot = prepared.Stage.Resources;
+            DbgTableStat(program.Hash, snapshot.FlattenedResourceTable.Length, snapshot.TablePatches.Length); // TEMP
             if (!layout.UsesBindlessImages)
             {
-                var patched = PatchTableOnCpu(snapshot, 0, snapshot.FlattenedResourceTable, out var deviceRuns);
-                prepared.Descriptors.FlattenedTable = UploadDwords(patched, "flattened resource table", program);
-                CopyTableRuns(prepared.Descriptors.FlattenedTable, deviceRuns);
+                if (snapshot.TablePatches.Length == 0)
+                {
+                    prepared.Descriptors.FlattenedTable = UploadDwords(snapshot.FlattenedResourceTable, "flattened resource table", program);
+                    return;
+                }
+
+                var flat = ArrayPool<uint>.Shared.Rent(snapshot.FlattenedResourceTable.Length);
+                try
+                {
+                    snapshot.FlattenedResourceTable.AsSpan().CopyTo(flat);
+                    PatchTableOnCpu(snapshot, 0, flat, out var deviceRuns);
+                    prepared.Descriptors.FlattenedTable = UploadDwords(flat.AsSpan(0, snapshot.FlattenedResourceTable.Length), "flattened resource table", program);
+                    CopyTableRuns(prepared.Descriptors.FlattenedTable, deviceRuns);
+                }
+                finally
+                {
+                    ArrayPool<uint>.Shared.Return(flat);
+                }
+
                 return;
             }
 
+            // The slot table and the flattened table go to the device in one transient upload: a pooled array
+            // holds them, because a table per draw is large (one slot per image the shader declares).
             var slotCount = (int)BindingLayout.ImageSlotTableDwordCount(prepared.Resources.Info);
-            var table = new uint[checked(slotCount + snapshot.FlattenedResourceTable.Length)];
-            var slot = 0;
-            foreach (var binding in layout.Descriptors)
+            var tableLength = checked(slotCount + snapshot.FlattenedResourceTable.Length);
+            var table = ArrayPool<uint>.Shared.Rent(tableLength);
+            var imageCount = prepared.Descriptors.Images.Length;
+            var occurrences = ArrayPool<uint>.Shared.Rent(imageCount);
+            try
             {
-                if (ImageDescriptorBinding.ResourceClass(binding.Kind) == ShaderCompiler.Resources.ImageResourceClass.None)
+                Array.Clear(table, 0, slotCount);
+                Array.Clear(occurrences, 0, imageCount);
+                var slot = 0;
+                foreach (var binding in layout.Descriptors)
                 {
-                    continue;
-                }
-
-                var occurrences = new uint[prepared.Descriptors.Images.Length];
-                foreach (var resource in binding.Resources)
-                {
-                    var texture = prepared.Descriptors.Images[resource];
-                    var occurrence = occurrences[resource]++;
-                    if (!texture.IsResident)
+                    if (ImageDescriptorBinding.ResourceClass(binding.Kind) == ShaderCompiler.Resources.ImageResourceClass.None)
                     {
-                        table[slot++] = 0;
                         continue;
                     }
 
-                    var view = texture.MipViews.Length == 0
-                        ? texture.View
-                        : occurrence < (uint)texture.MipViews.Length ? texture.MipViews[occurrence] : default;
-                    if (view.Handle == 0)
+                    foreach (var resource in binding.Resources)
                     {
-                        throw SubmissionScheduler.Fatal($"A bindless image has no view: image={resource} hash=0x{program.Hash:X16}.");
+                        var texture = prepared.Descriptors.Images[resource];
+                        var occurrence = occurrences[resource]++;
+                        if (!texture.IsResident)
+                        {
+                            table[slot++] = 0;
+                            continue;
+                        }
+
+                        var view = texture.MipViews.Length == 0
+                            ? texture.View
+                            : occurrence < (uint)texture.MipViews.Length ? texture.MipViews[occurrence] : default;
+                        if (view.Handle == 0)
+                        {
+                            throw SubmissionScheduler.Fatal($"A bindless image has no view: image={resource} hash=0x{program.Hash:X16}.");
+                        }
+
+                        table[slot++] = _bindlessImageHeap!.GetOrCreateSlot(
+                            binding.Kind, prepared.Stage.Resources.Images[(int)resource], view, texture.Layout);
                     }
 
-                    table[slot++] = _bindlessImageHeap!.GetOrCreateSlot(
-                        binding.Kind, prepared.Stage.Resources.Images[(int)resource], view, texture.Layout);
+                    // The occurrence count restarts for every binding.
+                    foreach (var resource in binding.Resources)
+                    {
+                        occurrences[resource] = 0;
+                    }
                 }
-            }
 
-            snapshot.FlattenedResourceTable.AsSpan().CopyTo(table.AsSpan(slotCount));
-            PatchTableOnCpu(snapshot, slotCount, table, out var runs);
-            prepared.Descriptors.FlattenedTable = UploadDwords(table, "bindless image slot table", program);
-            CopyTableRuns(prepared.Descriptors.FlattenedTable, runs);
+                snapshot.FlattenedResourceTable.AsSpan().CopyTo(table.AsSpan(slotCount));
+                PatchTableOnCpu(snapshot, slotCount, table, out var runs);
+                prepared.Descriptors.FlattenedTable = UploadDwords(table.AsSpan(0, tableLength), "bindless image slot table", program);
+                CopyTableRuns(prepared.Descriptors.FlattenedTable, runs);
+            }
+            finally
+            {
+                ArrayPool<uint>.Shared.Return(table);
+                ArrayPool<uint>.Shared.Return(occurrences);
+            }
         }
 
         // Table words the materializer left to the device: runs whose bytes a GPU buffer still
         // owns are copied in queue order after upload; any other word is read on the CPU now.
-        private uint[] PatchTableOnCpu(ResourceSnapshot snapshot, int baseDword, uint[] table,
+        private void PatchTableOnCpu(ResourceSnapshot snapshot, int baseDword, uint[] table,
             out List<(ulong Address, uint Dword, uint Count)> deviceRuns)
         {
             deviceRuns = [];
             var patches = snapshot.TablePatches;
             if (patches.Length == 0)
             {
-                return table;
-            }
-
-            if (ReferenceEquals(table, snapshot.FlattenedResourceTable))
-            {
-                table = (uint[])table.Clone();
+                return;
             }
 
             foreach (var patch in patches)
@@ -1233,7 +1288,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            return table;
         }
 
         private void CopyTableRuns(BufferView table, List<(ulong Address, uint Dword, uint Count)> runs)

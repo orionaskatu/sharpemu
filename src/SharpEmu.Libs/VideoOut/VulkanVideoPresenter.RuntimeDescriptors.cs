@@ -60,7 +60,15 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly Dictionary<RuntimeDescriptorKey, RuntimeImageEntry> Images = new();
             public readonly Dictionary<RuntimeDescriptorKey, RuntimeSamplerEntry> Samplers = new();
             public readonly ConcurrentQueue<(bool Image, uint[] Key)> Misses = new();
-            public readonly TickOwnedResources<GpuBuffer> MissBuffers = new();
+            // A consumed miss buffer is cleared and reused by a later submission.
+            public readonly TickOwnedResources<GpuBuffer> MissBuffers = new(static buffer =>
+            {
+                buffer.Mapped.Clear();
+                if (!buffer.IsCoherent)
+                {
+                    buffer.Flush(0, buffer.Size);
+                }
+            });
             public GpuBuffer? Table;
             public bool TableDirty = true;
             public ulong MissScanTick = ulong.MaxValue;

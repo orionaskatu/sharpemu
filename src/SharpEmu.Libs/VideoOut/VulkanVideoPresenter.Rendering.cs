@@ -950,6 +950,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingState = default;
             var command = new CommandBuffer(_scheduler.Current.Handle);
             _vk.CmdEndRendering(command);
+            if (DbgFullBarrier) RecordGlobalBarrier(command); // TEMP
             CaptureSnapshotPass(capturedState); // TEMP
             foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
             {
@@ -993,6 +994,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 !next.Rendering.SampleLocationWords.AsSpan().SequenceEqual(previous.Rendering.SampleLocationWords))
                 EndRendering();
         }
+        private static readonly bool DbgFullBarrier = Environment.GetEnvironmentVariable("SHARPEMU_DBG_FULL_BARRIER") == "1"; // TEMP
+
         public void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline)
         {
             var entry = RequirePipelineEntry(in pipeline);
@@ -1159,6 +1162,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            if (DbgFullBarrier) RecordGlobalBarrier(command); // TEMP
             CaptureSnapshotStorage(command); // TEMP
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
                 _profileComputePipeline, groupsX, groupsY, groupsZ);
@@ -1183,6 +1187,7 @@ internal static unsafe partial class VulkanVideoPresenter
             };
             VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
             _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
+            if (DbgFullBarrier) RecordGlobalBarrier(command); // TEMP
             CaptureSnapshotStorage(command); // TEMP
             CountDraw();
             return true;

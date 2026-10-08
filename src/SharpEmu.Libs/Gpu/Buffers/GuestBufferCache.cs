@@ -80,7 +80,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _backing = backing;
         _guest = guest;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
-        _unifiedBuffers = UnifiedBuffersEnabled && HasUnifiedMemoryType(device);
+        _unifiedBuffers = UnifiedBuffersEnabled(device) && HasUnifiedMemoryType(device);
         _gds = new GpuBuffer(device, scheduler, GpuBufferUsage.Stream, 0, GpuBuffer.AllFlags, GdsBufferSize);
         _bdaPageTable = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, BdaPageTableSize);
         _tracker = new GuestPageTracker(pages);
@@ -2157,8 +2157,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // readback can copy straight out of the buffer once the last GPU write to it retired. That skips
     // the copy command at the tail of the queue and the wait for every draw recorded after the writer.
     // SHARPEMU_UNIFIED_BUFFERS=0 keeps device-local buffers and copy readbacks.
-    private static readonly bool UnifiedBuffersEnabled =
-        Environment.GetEnvironmentVariable("SHARPEMU_UNIFIED_BUFFERS") != "0";
+    // Unified buffers stay the default on every device: the copy readback of device-local buffers returned stale vertex
+    // data (black wedge polygons on skinned meshes). Mapped reads of VRAM go through WriteCombinedCopy.
+    private static bool UnifiedBuffersEnabled(GpuDeviceInfo device) =>
+        Environment.GetEnvironmentVariable("SHARPEMU_UNIFIED_BUFFERS") is { } value ? value != "0" : true;
 
     private static bool HasUnifiedMemoryType(GpuDeviceInfo device)
     {
@@ -2193,16 +2195,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private void ApplyMappedRead(List<DownloadPiece> copies, ulong windowBegin, ulong windowEnd, ulong guestAddress, ulong size,
         bool isWrite, long started, GuestMemoryProfile.ReadbackSource source)
     {
+        var dbgStart = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
+        ulong dbgBytes = 0; // TEMP
         foreach (var copy in copies)
         {
-            var bytes = new ReadOnlySpan<byte>(copy.Buffer.MappedPointer + copy.SourceOffset, checked((int)copy.Size));
-            if (!_backing.TryWriteBacking(copy.Address, bytes))
+            var length = checked((int)copy.Size);
+            var mapped = copy.Buffer.MappedPointer + copy.SourceOffset;
+            // Device memory is read through a streaming copy into host memory first; the guest backing is then written from there.
+            var staged = System.Buffers.ArrayPool<byte>.Shared.Rent(length);
+            try
             {
-                throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{copy.Size:X16}");
+                fixed (byte* stagedPointer = staged)
+                {
+                    WriteCombinedCopy.Read(mapped, stagedPointer, length);
+                }
+
+                if (!_backing.TryWriteBacking(copy.Address, new ReadOnlySpan<byte>(staged, 0, length)))
+                {
+                    throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{copy.Size:X16}");
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(staged);
             }
 
+            dbgBytes += copy.Size; // TEMP
             _gpuModifiedRanges.Remove(copy.Address, copy.Size);
         }
+
+        DbgReadStat(source, dbgBytes, System.Diagnostics.Stopwatch.GetTimestamp() - dbgStart); // TEMP
 
         _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
         if (isWrite)
@@ -2212,6 +2234,26 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         MappedReadbacks++;
         RecordReadback(windowBegin, windowEnd, isWrite, copies, started, source);
+    }
+
+    private static readonly Dictionary<string, (long Calls, long Bytes, long Ticks, ulong Max)> _dbgReads = new(); // TEMP
+    private static long _dbgReadsNext; // TEMP
+    private static readonly bool _dbgReadStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_READSTAT") == "1"; // TEMP
+    private static void DbgReadStat(GuestMemoryProfile.ReadbackSource source, ulong bytes, long ticks) // TEMP
+    {
+        if (!_dbgReadStats) return;
+        lock (_dbgReads)
+        {
+            var key = source.ToString();
+            _dbgReads.TryGetValue(key, out var e);
+            _dbgReads[key] = (e.Calls + 1, e.Bytes + (long)bytes, e.Ticks + ticks, Math.Max(e.Max, bytes));
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now < _dbgReadsNext) return;
+            _dbgReadsNext = now + 15 * System.Diagnostics.Stopwatch.Frequency;
+            foreach (var pair in _dbgReads.OrderByDescending(p => p.Value.Ticks))
+                Console.Error.WriteLine($"[DBG][READSTAT] src={pair.Key} calls={pair.Value.Calls} MB={pair.Value.Bytes / 1048576} ms={pair.Value.Ticks * 1000 / System.Diagnostics.Stopwatch.Frequency} maxKB={pair.Value.Max / 1024}");
+            _dbgReads.Clear();
+        }
     }
 
     // Readbacks served from a buffer's own mapping, without a copy command.
