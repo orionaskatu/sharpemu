@@ -72,6 +72,9 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport, IDeviceMemoryAll
     // created when a second queue family (the async readback queue) reads them.
     public uint[]? SharedQueueFamilies { get; set; }
 
+    // Names a Vulkan object for debuggers (RenderDoc); a no-op unless debug labels are enabled.
+    public Action<ObjectType, ulong, string>? NameObject { get; set; }
+
     public PhysicalDevice PhysicalDevice { get; }
 
     public Device Device { get; }

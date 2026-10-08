@@ -86,6 +86,9 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public TickTimeline Timeline => _timeline;
 
+    // Commands recorded into the open command buffer that the GPU has not received yet.
+    internal bool HasUnsubmittedCommands => !_command.IsInvalid && _command.HasPendingCommands;
+
     internal bool PriorityWorkerAlive => _priorityThread.IsAlive;
 
     // Report the fatal error, then return an exception to stop the caller.

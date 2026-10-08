@@ -141,6 +141,33 @@ public sealed class GuestPageTracker
 
     public void ClearGpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Gpu, enable: false, create: false);
 
+    // Marks the tracked pages of a range GPU-dirty after the fact, page by page under the region
+    // lock. A page the CPU dirtied meanwhile is left CPU-owned and counted as a conflict, since the
+    // two cannot both own it. Returns the number of such conflicting pages.
+    public int MarkGpuWrittenPages(ulong vaddr, ulong size)
+    {
+        RejectUploadCallbackReentry();
+        var conflicts = 0;
+        VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
+        {
+            using var _ = region.Lock.Hold();
+            for (var page = offset; page < offset + bytes; page += PageBytes)
+            {
+                var pageBytes = Math.Min(PageBytes, offset + bytes - page);
+                if (region.IsModified(WriteOrigin.Cpu, page, pageBytes))
+                {
+                    conflicts++;
+                    continue;
+                }
+
+                region.ChangeState(WriteOrigin.Gpu, enable: true, region.BaseAddress + page, pageBytes);
+            }
+
+            return false;
+        });
+        return conflicts;
+    }
+
     // True when every page of the range has a region, so the range is under tracking.
     public bool HasRegion(ulong vaddr, ulong size)
     {

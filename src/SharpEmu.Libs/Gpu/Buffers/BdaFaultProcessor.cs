@@ -291,7 +291,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             {
                 if (Diagnostics.DbgTargetWatch.PhysicalWatch.Length != 0) // TEMP
                     Diagnostics.DbgTargetWatch.CheckPhysical("devwrite", written[index], _pageSize, () => "");
-                _cache.NoteDeviceAddressWrite(written[index], _pageSize);
+                _cache.NoteDeviceAddressWrites(written[index], _pageSize);
             }
 
             _downloadBuffer.Invalidate(offset, PageFaultAreaSize);
