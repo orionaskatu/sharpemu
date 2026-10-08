@@ -10,6 +10,11 @@
 
 Current status:
 <img width="1597" height="923" alt="image" src="https://github.com/user-attachments/assets/2c7ffef3-016a-49f0-a075-0f2f0151d920" />
+<img width="1273" height="744" alt="image" src="https://github.com/user-attachments/assets/fb05870b-428f-4f4e-9bef-d8fc0170ebbe" />
+<img width="1276" height="744" alt="image" src="https://github.com/user-attachments/assets/e92073ab-0fba-4126-a0c8-25a1f4727995" />
+<img width="1273" height="739" alt="image" src="https://github.com/user-attachments/assets/6c20832b-a0c9-4ffb-977b-f37cbfeda2ef" />
+
+
 
 
 
