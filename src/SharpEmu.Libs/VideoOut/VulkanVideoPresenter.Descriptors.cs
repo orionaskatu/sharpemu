@@ -1435,7 +1435,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     binding.MipViews = [];
                 }
 
+                if (binding.IsStorage) CaptureNoteStorage(image, binding.Request.View, image.Description.Data.Address, program.Hash, index); // TEMP
                 var descriptor = new TextureDescriptorWords(snapshot.Images[index]);
+                CaptureNoteTexture(program, index, binding.ImageIdentifier, binding.Request, descriptor.BaseAddress, snapshot.Images[index]); // TEMP
                 // The culling pass reads the previous frame's visibility images after the game fast-cleared their DCC
                 // metadata; applying that clear leaves it nothing to read (no static world). It reads their pixels.
                 if (descriptor.MetadataCompress && !(VisibilityFeedback.KeepVisibilityImages && program.Hash == VisibilityFeedback.CullProgramHash))

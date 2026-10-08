@@ -91,6 +91,23 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _canRequireComputeSubgroup32;
         private uint _maxComputeWorkgroupSubgroups;
 
+        // A wave64 workgroup of exactly 64 invocations needs one 64-lane host subgroup: its EXEC and VCC masks, ballots
+        // and s_cbranch_execz tests span the whole group. Left to the driver's choice it may run as two wave32 halves
+        // (SHARPEMU_REQUIRE_SUBGROUP64=0 restores that).
+        internal bool _canRequireComputeSubgroup64;
+
+        private uint RequiredComputeSubgroupSize(ComputeInputInfo input)
+        {
+            if (RequiresComputeSubgroup32(input))
+            {
+                return RdnaSubgroupSize;
+            }
+
+            var invocations = (ulong)Math.Max(input.ThreadsX, 1) * Math.Max(input.ThreadsY, 1) * Math.Max(input.ThreadsZ, 1);
+            return _canRequireComputeSubgroup64 && input.WaveSize == 64 && invocations == 64 &&
+                   Environment.GetEnvironmentVariable("SHARPEMU_REQUIRE_SUBGROUP64") != "0" ? 64u : 0u;
+        }
+
         private bool RequiresComputeSubgroup32(ComputeInputInfo input)
         {
             var invocations = (ulong)Math.Max(input.ThreadsX, 1) * Math.Max(input.ThreadsY, 1) * Math.Max(input.ThreadsZ, 1);
@@ -1216,15 +1233,16 @@ internal static unsafe partial class VulkanVideoPresenter
             Pipeline pipeline;
             try
             {
+                var subgroupSizeToRequire = RequiredComputeSubgroupSize(description.Input);
                 var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
-                    RequiredSubgroupSize = RdnaSubgroupSize,
+                    RequiredSubgroupSize = subgroupSizeToRequire,
                 };
                 var stageInfo = new PipelineShaderStageCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageCreateInfo,
-                    PNext = RequiresComputeSubgroup32(description.Input) ? &requiredSubgroupSize : null,
+                    PNext = subgroupSizeToRequire != 0 ? &requiredSubgroupSize : null,
                     Stage = ShaderStageFlags.ComputeBit,
                     Module = computeModule,
                     PName = entryPoint,
@@ -1275,7 +1293,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public required PipelineLayout Layout;
             public required DescriptorSetDemand Demand;
             public required bool UsesPushDescriptors;
-            public required bool RequiresSubgroup32;
+            public required uint RequiredSubgroupSize;
             public required ulong Hash;
             public required int SpirvBytes;
             public Task<Pipeline> Compile = Task.FromResult(default(Pipeline));
@@ -1358,7 +1376,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Layout = layout,
                 Demand = demand,
                 UsesPushDescriptors = usesPushDescriptors,
-                RequiresSubgroup32 = RequiresComputeSubgroup32(description.Input),
+                RequiredSubgroupSize = RequiredComputeSubgroupSize(description.Input),
                 Hash = description.Stage.Hash,
                 SpirvBytes = SpirvBytesOf(computeModule.Handle),
                 StartTimestamp = Stopwatch.GetTimestamp(),
@@ -1376,7 +1394,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         // Importing a MoltenVK cache compiles its MSL libraries.
                         // Keep that work inside the same bounded compiler slot.
                         var cache = ResolveGuestPipelineCache(cacheSource);
-                        return CompileComputePipeline(vk, device, cache, computeModule, layout, started.RequiresSubgroup32);
+                        return CompileComputePipeline(vk, device, cache, computeModule, layout, started.RequiredSubgroupSize);
                     }
                     finally
                     {
@@ -1401,7 +1419,7 @@ internal static unsafe partial class VulkanVideoPresenter
             PipelineCache cache,
             ShaderModule module,
             PipelineLayout layout,
-            bool requireSubgroup32 = false)
+            uint requiredSubgroupSizeValue = 0)
         {
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
@@ -1409,12 +1427,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 var requiredSubgroupSize = new PipelineShaderStageRequiredSubgroupSizeCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
-                    RequiredSubgroupSize = RdnaSubgroupSize,
+                    RequiredSubgroupSize = requiredSubgroupSizeValue,
                 };
                 var stageInfo = new PipelineShaderStageCreateInfo
                 {
                     SType = StructureType.PipelineShaderStageCreateInfo,
-                    PNext = requireSubgroup32 ? &requiredSubgroupSize : null,
+                    PNext = requiredSubgroupSizeValue != 0 ? &requiredSubgroupSize : null,
                     Stage = ShaderStageFlags.ComputeBit,
                     Module = module,
                     PName = entryPoint,

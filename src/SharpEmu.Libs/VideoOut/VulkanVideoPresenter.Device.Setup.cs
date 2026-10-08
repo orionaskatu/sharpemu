@@ -619,6 +619,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 subgroupSizeControl.MaxSubgroupSize >= RdnaSubgroupSize &&
                 (subgroupSizeControl.RequiredSubgroupSizeStages & ShaderStageFlags.ComputeBit) != 0;
             _maxComputeWorkgroupSubgroups = subgroupSizeControl.MaxComputeWorkgroupSubgroups;
+            _canRequireComputeSubgroup64 =
+                subgroup.SubgroupSize == 64 &&
+                subgroupSizeControl.MinSubgroupSize <= 64 &&
+                subgroupSizeControl.MaxSubgroupSize >= 64 &&
+                (subgroupSizeControl.RequiredSubgroupSizeStages & ShaderStageFlags.ComputeBit) != 0;
 
             _maxPerStageSampledImages = properties.Limits.MaxPerStageDescriptorSampledImages;
             _maxPerStageStorageImages = properties.Limits.MaxPerStageDescriptorStorageImages;
@@ -1118,6 +1123,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
             _canRequireComputeSubgroup32 &= vulkan13Features.SubgroupSizeControl;
+            _canRequireComputeSubgroup64 &= vulkan13Features.SubgroupSizeControl;
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
             var supportsExactFloat16 = VulkanFloat16Support.SupportsExactConversions(_vk, _physicalDevice);
             SetExactFloat16ConversionsCapability(supportsExactFloat16);

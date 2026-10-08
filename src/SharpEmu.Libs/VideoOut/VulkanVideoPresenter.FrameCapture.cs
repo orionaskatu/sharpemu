@@ -48,18 +48,21 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private readonly List<(int Pass, int Slot, CaptureTarget Target, VkBuffer Buffer, DeviceMemory Memory, ulong Size, uint TexelBytes)> _captureReadbacks = new();
         private readonly List<string> _captureManifest = new();
-        private static readonly ulong _captureTextureHash =
-            ulong.TryParse((Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_TEXTURE_HASH") ?? "").Replace("0x", ""), System.Globalization.NumberStyles.HexNumber, null, out var hash) ? hash : 0;
+        private static readonly HashSet<ulong> _captureTextureHashes =
+            (Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_TEXTURE_HASH") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(text => ulong.Parse(text.Trim().Replace("0x", ""), System.Globalization.NumberStyles.HexNumber)).ToHashSet();
+        private static readonly ulong _captureTextureHash = _captureTextureHashes.Count > 0 ? 1ul : 0ul;
         private readonly Dictionary<ulong, (int Index, CachedImage Image, ImageViewDescription View, ulong Address, string Words)> _captureTextures = new();
         private readonly List<(string Name, VkBuffer Buffer, DeviceMemory Memory, ulong Size, Format Format, uint Width, uint Height, uint TexelBytes, string Info)> _captureTextureReadbacks = new();
 
         private void CaptureNoteTexture(ShaderProgramInfo program, int index, ResourceSlotIdentifier imageIdentifier, in ImageRequest request, ulong address, uint[] words)
         {
-            if (_captureState != 1 || _captureTextureHash == 0 || (_captureTextureHash != 0xA11 && program.Hash != _captureTextureHash))
+            if (_captureState != 1 || _captureTextureHash == 0 || (!_captureTextureHashes.Contains(0xA11) && !_captureTextureHashes.Contains(program.Hash)))
                 return;
             var image = _imageCache.GetImage(imageIdentifier);
             var key = (ulong)image.Backing.Handle.Handle ^ ((ulong)request.View.BaseLevel << 56) ^ ((ulong)request.View.BaseLayer << 48);
             _captureTextures.TryAdd(key, (index, image, request.View, address, $"ps=0x{program.Hash:X16} {program.Stage} " + string.Join(",", words.Select(word => word.ToString("x8")))));
+            if (program.Stage == ShaderStageKind.Compute) _capturePendingTextures?.Add((image, request.View, address, program.Hash, index));
         }
 
         private static uint BlockBytes(Format format)
@@ -383,12 +386,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void CaptureNoteDraw(string kind, uint count, uint instances)
         {
+            CaptureCheckFrame();
             if (_captureState == 1)
                 _captureManifest.Add($"drawcall pass={_capturePass} marker='{SharpEmu.Libs.Diagnostics.DbgSequence.Marker}' active={_renderingActive} kind={kind} count={count} instances={instances} pipeline={_boundGraphicsPipeline?.Id ?? 0} ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} {_dbgDepthState}");
         }
 
         private void CaptureNotePass(in Gpu.Rendering.RenderingState state)
         {
+            CaptureCheckFrame();
             if (_captureState == 1)
                 _capturePass++;
         }
@@ -412,7 +417,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            const ulong budget = 8ul * 1024 * 1024 * 1024;
+            const ulong budget = 3ul * 1024 * 1024 * 1024;
             var backing = target.Image.Backing;
             // TEMP: SHARPEMU_CAPTURE_LAST_ADDRS=addr,... keeps only the last write of those images
             // (one readback buffer per address, overwritten by every later pass).
@@ -484,18 +489,65 @@ internal static unsafe partial class VulkanVideoPresenter
             Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_STORAGE_ADDRS") is { Length: > 0 } storageText
                 ? storageText.Split(',').Select(text => Convert.ToUInt64(text.Trim(), 16)).ToHashSet()
                 : null;
+        private static readonly bool _captureStorageAll = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_STORAGE_ALL") == "1";
         private readonly List<(CachedImage Image, ImageViewDescription View, ulong Address, ulong Hash, int Slot)> _capturePendingStorage = new();
         private int _captureDispatch;
+        private readonly List<(CachedImage Image, ImageViewDescription View, ulong Address, ulong Hash, int Slot)> _capturePendingTextures = new();
+
+        // TEMP: sampled textures of the selected compute programs, copied right after their dispatch (not at frame end).
+        private void CaptureSnapshotTextures(CommandBuffer command, int dispatch)
+        {
+            foreach (var (image, view, address, hash, slot) in _capturePendingTextures)
+            {
+                var backing = image.Backing;
+                var depthFormat = backing.Format.ToString().StartsWith("D", StringComparison.Ordinal);
+                var texelBytes = TexelBytes(view.Format, false);
+                var width = Math.Max(1u, backing.Extent.Width >> (int)view.BaseLevel);
+                var height = Math.Max(1u, backing.Extent.Height >> (int)view.BaseLevel);
+                var size = (ulong)width * height * texelBytes;
+                if (depthFormat || texelBytes == 0 || backing.Samples != 1 || !backing.Exists || backing.ImageType != ImageType.Type2D ||
+                    (backing.Usage & ImageUsageFlags.TransferSrcBit) == 0 || view.BaseLayer >= backing.Layers || _captureBytes + size > 3ul * 1024 * 1024 * 1024)
+                {
+                    _captureManifest.Add($"dtex dispatch={dispatch} hash=0x{hash:X16} slot={slot} skip addr=0x{address:X} fmt={view.Format}");
+                    continue;
+                }
+
+                _captureManifest.Add($"dtex dispatch={dispatch} hash=0x{hash:X16} slot={slot} addr=0x{address:X} view={view.Format} backing={backing.Format}");
+                _captureBytes += size;
+                var buffer = CreateBuffer(size, BufferUsageFlags.TransferDstBit, MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit, out var memory);
+                var range = new SubresourceRange(view.BaseLevel, 1, view.BaseLayer, 1);
+                image.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, range, command);
+                var region = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, view.BaseLevel, view.BaseLayer, 1),
+                    ImageExtent = new Extent3D(width, height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(command, backing.Handle, ImageLayout.TransferSrcOptimal, buffer, 1, &region);
+                image.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, range, command);
+                _captureReadbacks.Add((dispatch + 5000, slot, new CaptureTarget(image, view, address, false, view.Format, width, height), buffer, memory, size, texelBytes));
+            }
+
+            _capturePendingTextures.Clear();
+        }
 
         private void CaptureNoteStorage(CachedImage image, in ImageViewDescription view, ulong address, ulong hash, int slot)
         {
-            if (_captureState == 1 && _captureStorageAddresses is { } addresses && addresses.Contains(address))
+            if (_captureState != 1) return;
+            // TEMP: SHARPEMU_CAPTURE_STORAGE_ALL=1 snapshots every near-full-resolution 2D storage image after each dispatch.
+            var all = _captureStorageAll && image.Backing.Extent.Width >= 800 && image.Backing.Extent.Height >= 450 && image.Backing.ImageType == ImageType.Type2D;
+            if (all || (_captureStorageAddresses is { } addresses && addresses.Contains(address)))
                 _capturePendingStorage.Add((image, view, address, hash, slot));
         }
 
         private void CaptureSnapshotStorage(CommandBuffer command)
         {
-            if (_capturePendingStorage.Count == 0)
+            if (_capturePendingTextures is { Count: not 0 })
+            {
+                if (_captureState == 1) CaptureSnapshotTextures(command, 20000 + _captureDispatch++);
+                else _capturePendingTextures.Clear();
+            }
+
+            if (_capturePendingStorage is not { Count: not 0 })
                 return;
             if (_captureState != 1)
             {
@@ -548,16 +600,31 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (_captureTriggerMode)
                     File.Delete(trigger);
+                _captureBaseFrames = SharpEmu.Libs.Diagnostics.DbgSequence.Frames;
+                _captureState = 4; // waiting for the next guest frame boundary
+            }
+        }
+
+        // TEMP: the presenter presents independently of guest frames, so a capture spans exactly one guest frame (Frame marker to Frame marker).
+        private int _captureBaseFrames;
+        private void CaptureCheckFrame()
+        {
+            if (_captureState != 1 && _captureState != 4)
+                return;
+            var frames = SharpEmu.Libs.Diagnostics.DbgSequence.Frames;
+            if (_captureState == 4 && frames != _captureBaseFrames)
+            {
                 _captureDirectory = Path.Combine(_captureBaseDirectory!, $"cap{_captureIndex++:D2}");
                 _capturePass = 0;
                 _captureDispatch = 0;
                 _captureManifest.Clear();
                 _captureTextures.Clear();
                 _captureTextureReadbacks.Clear();
+                _captureBaseFrames = frames;
                 _captureState = 1;
                 Console.Error.WriteLine("[DBG][CAPTURE] armed");
             }
-            else if (_captureState == 1)
+            else if (_captureState == 1 && frames != _captureBaseFrames)
             {
                 _captureState = 2;
             }

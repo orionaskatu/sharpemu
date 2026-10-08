@@ -8433,7 +8433,11 @@ public static partial class Gen5SpirvTranslator
         private static readonly bool ExecGuardElision = !string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_EXEC_GUARD_ELISION"), "0", StringComparison.Ordinal);
 
+        private static readonly HashSet<ulong> DbgGuardAddresses = (Environment.GetEnvironmentVariable("SHARPEMU_EXEC_GUARD_ADDRS") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Trim().Replace("0x", ""), 16)).ToHashSet(); // TEMP
         private IReadOnlySet<uint>? _execFullPcs;
+        private bool _execFullDumped; // TEMP
+        private uint _firstBranchPc;
 
         // Set while an instruction that starts with every EXEC lane set is emitted: its vector
         // register writes need no EXEC guard, so the old values need not stay live until them.
@@ -8441,12 +8445,41 @@ public static partial class Gen5SpirvTranslator
 
         private bool IsExecKnownFull(uint pc)
         {
-            if (!ExecGuardElision || !_request.EnableExecGuardElision)
+            if (!ExecGuardElision || !_request.EnableExecGuardElision || DbgGuardAddresses.Contains(_request.Program.Address)) // TEMP: SHARPEMU_EXEC_GUARD_ADDRS
             {
                 return false;
             }
 
             _execFullPcs ??= Ir.Gen5ExecFullAnalysis.Analyze(_request.Program, wave32: _waveLaneCount == 32);
+            if (Environment.GetEnvironmentVariable("SHARPEMU_EXEC_FULL_DUMP_DIR") is { Length: > 0 } dumpDir && !_execFullDumped) // TEMP
+            {
+                _execFullDumped = true;
+                Directory.CreateDirectory(dumpDir);
+                File.WriteAllLines(Path.Combine(dumpDir, $"{_request.Program.Address:X16}.{_stage}.w{_waveLaneCount}.{Environment.TickCount64}.execfull.txt"), _execFullPcs.OrderBy(pc => pc).Select(pc => $"0x{pc:X4}"));
+            }
+            // A compute shader's entry block keeps its EXEC guards: dropping them there (the pixel-coordinate setup of the
+            // deferred composite, ahead of its first branch) painted 16x16 blocks of wrong pixels around thin silhouettes.
+            if (_stage == Gen5SpirvStage.Compute)
+            {
+                if (_firstBranchPc == 0)
+                {
+                    _firstBranchPc = uint.MaxValue;
+                    foreach (var candidate in _request.Program.Instructions)
+                    {
+                        if (candidate.Opcode.StartsWith("SCbranch", StringComparison.Ordinal) || candidate.Opcode == "SBranch")
+                        {
+                            _firstBranchPc = candidate.Pc;
+                            break;
+                        }
+                    }
+                }
+
+                if (pc <= _firstBranchPc)
+                {
+                    return false;
+                }
+            }
+
             return _execFullPcs.Contains(pc);
         }
 
