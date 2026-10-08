@@ -16,8 +16,8 @@ internal static class DbgSequence
     private static int _repeat;
 
     // The fog and haze layers (volumetric fog, water mist, deferred and translucent particles composited into the light buffer)
-    // are skipped by default: they hazed the whole frame and cost GPU time. SHARPEMU_FOG=1 draws them again.
-    private static readonly bool FogOff = Environment.GetEnvironmentVariable("SHARPEMU_FOG") != "1";
+    // are drawn by default; SHARPEMU_FOG=0 skips them.
+    private static readonly bool FogOff = Environment.GetEnvironmentVariable("SHARPEMU_FOG") == "0";
     private static readonly string[] FogMarkers = ["Volfog", "Water Particles", "Deferred Particles", "Composite particles", "Translucent Particles"];
 
     // TEMP: SHARPEMU_DBG_SKIP_MARKER_SCHED="from:len:name|name;from:len:name" skips draws and dispatches recorded under a
@@ -28,7 +28,7 @@ internal static class DbgSequence
             .Select(parts => (double.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture), parts[2].Split('|'))).ToArray();
 
     // Innermost PUSH marker name of the current command stream (tracked only while capturing or sequencing).
-    public static readonly bool TrackMarkers = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_FRAME_DIR") is { Length: > 0 } || Environment.GetEnvironmentVariable("SHARPEMU_DBG_TALLY") == "1" || At >= 0 || FogOff || SkipSchedule.Length != 0;
+    public static readonly bool TrackMarkers = Environment.GetEnvironmentVariable("SHARPEMU_CAPTURE_FRAME_DIR") is { Length: > 0 } || Environment.GetEnvironmentVariable("SHARPEMU_DBG_TALLY") == "1" || Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROBE") == "1" || At >= 0 || FogOff || SkipSchedule.Length != 0;
 
     [ThreadStatic] private static List<string>? _markers;
     public static string Marker => _markers is { Count: > 0 } ? string.Join("/", _markers.Skip(Math.Max(0, _markers.Count - 2))) : "";
@@ -39,10 +39,13 @@ internal static class DbgSequence
         "Particle Post-Update", "ParticleWind", "Particle Wait For Velocity", "Particle CS Frame"];
     private static int _frames;
 
+    public static int Frames => Volatile.Read(ref _frames);
+    public static event Action? FrameStarted;
+
     public static void PushMarker(string text)
     {
         (_markers ??= []).Add(text);
-        if (text == "Frame") Interlocked.Increment(ref _frames);
+        if (text == "Frame") { Interlocked.Increment(ref _frames); FrameStarted?.Invoke(); }
         if (TallyOn) { lock (Tallies) { var key = "P " + text; Tallies.TryGetValue(key, out var entry); Tallies[key] = (entry.Count + 1, entry.Ticks); } }
     }
     public static void PopMarker()

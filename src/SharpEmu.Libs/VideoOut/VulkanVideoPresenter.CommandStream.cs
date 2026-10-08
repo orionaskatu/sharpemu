@@ -302,6 +302,8 @@ internal static unsafe partial class VulkanVideoPresenter
             return _bufferCache.TryWriteThrough(address, source);
         }
 
+        public bool DebugReadGpu(ulong address, byte[] destination) => _bufferCache.DbgReadGpuBytes(address, destination); // TEMP
+
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
             if (_bufferCache.TryReadCommandBacking(address, destination)) return true;

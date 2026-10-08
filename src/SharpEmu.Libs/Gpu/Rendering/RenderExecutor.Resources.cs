@@ -240,6 +240,24 @@ public sealed partial class RenderExecutor
         }
 
         Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
+        if (DbgProbeOn) // TEMP
+        {
+            if (emission.IndirectArgumentsAddress != 0)
+            {
+                var probeBytes = new byte[20];
+                if (_host.TryReadGuest(emission.IndirectArgumentsAddress, probeBytes))
+                {
+                    var probeWords = new uint[5];
+                    System.Buffer.BlockCopy(probeBytes, 0, probeWords, 0, 20);
+                    DbgProbeDraw("IND", probeWords[0], emission.Indexed ? probeWords[1] : probeWords[1]);
+                }
+            }
+            else
+            {
+                DbgProbeDraw("DIR", draw.Count, draw.InstanceCount);
+            DbgProbeDraw($"VS{vertexInput.Stage.Program?.Hash:X16}/{draw.Name}", draw.Count, draw.InstanceCount, true);
+            }
+        }
         if (!emission.Indexed && (draw.Count == 16293 || draw.Count == 216 || draw.Count == 2898) && System.Threading.Interlocked.Increment(ref _dbgHogLogs) % 25 == 1) // TEMP
             Console.Error.WriteLine($"[DBG][HOG] vs=0x{vertexInput.Stage.Program?.Hash:X} ps=0x{state.Programs.PixelInput.Stage.Program?.Hash:X} pixelActive={state.PixelActive} colors={state.ColorCount} depth={state.Depth.HasTarget} count={draw.Count} indexed={emission.Indexed} instances={draw.InstanceCount} marker={Diagnostics.DbgSequence.Marker}");
         if (emission.IndirectArgumentsAddress != 0 && Diagnostics.DbgSequence.Marker.Contains("Grass") && System.Threading.Interlocked.Increment(ref _dbgGrassLogs) <= 120) // TEMP

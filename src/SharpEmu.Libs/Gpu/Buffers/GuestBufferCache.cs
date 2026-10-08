@@ -3,6 +3,7 @@
 
 using System.Runtime.InteropServices;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.HLE.GuestMemory;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -315,6 +316,26 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return true;
     }
 
+    // TEMP: reads bytes straight from the GPU buffer containing them (the whole range must sit in one buffer), ignoring dirty tracking.
+    public bool DbgReadGpuBytes(ulong address, byte[] destination)
+    {
+        var owner = _registry.FindContainingBuffer(address, (ulong)destination.Length);
+        if (!owner.IsValid || AsyncReadback is not { } readback)
+            return false;
+        var buffer = _registry.GetBuffer(owner);
+        if (buffer.LastGpuWriteTick == 0)
+            return false;
+        if (buffer.LastGpuWriteTick >= _scheduler.CurrentTick)
+            _scheduler.Flush();
+        byte[]? result = null;
+        readback.Read([new Vulkan.ReadbackPiece(buffer, buffer.Offset(address), (ulong)destination.Length)], buffer.LastGpuWriteTick,
+            (_, bytes) => result = bytes.ToArray());
+        if (result is null || result.Length != destination.Length)
+            return false;
+        Array.Copy(result, destination, result.Length);
+        return true;
+    }
+
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
         TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.CpuReadSynchronization);
 
@@ -370,6 +391,43 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     // TEMP: SHARPEMU_DBG_GUEST_FAULTS=1 lists the pages guest threads wait on while the GPU still owns them.
+    private static readonly bool _dbgCompareReads = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CMPREADS") == "1"; // TEMP
+    private static int _dbgCompareCount; // TEMP
+    // See HizPolicy: the guest reads the depth pyramid of the other parity too, so each page it just downloaded takes
+    // the farther depth of the two images (a zero is an unwritten texel and loses to a written one).
+    private void UnionHizPages(ulong address, ulong size)
+    {
+        if (!HizPolicy.TryGetPair(address, size, out var image, out var other)) return;
+        var from = Math.Max(image, address & ~0xFFFUL);
+        var to = Math.Min(image + HizPolicy.ImageBytes, (address + size + 0xFFF) & ~0xFFFUL);
+        if (to <= from) return;
+        var length = (int)(to - from);
+        var otherFrom = other + (from - image);
+        if (_tracker.HasGpuDirtyPages(otherFrom, (ulong)length) &&
+            !ReadMemoryOrAwaitShutdown(otherFrom, (ulong)length, isWrite: false, GuestMemoryProfile.ReadbackSource.StoreDownload)) return;
+        var own = new byte[length];
+        var theirs = new byte[length];
+        if (!_backing.TryReadBacking(from, own) || !_backing.TryReadBacking(otherFrom, theirs)) return;
+        for (var offset = 0; offset + 4 <= length; offset += 4)
+        {
+            var a = BitConverter.ToSingle(own, offset);
+            var b = BitConverter.ToSingle(theirs, offset);
+            var merged = a > 0 && b > 0 ? Math.Max(a, b) : (b > 0 ? b : a);
+            if (merged != a) BitConverter.TryWriteBytes(own.AsSpan(offset, 4), merged);
+        }
+
+        _ = _backing.TryWriteBacking(from, own);
+    }
+
+    private static void DbgWatchRange(string kind, ulong address, ulong size, uint value) // TEMP
+    {
+        if (!DbgProbeWatch || address + size <= 0x504C270000UL || address >= 0x504C71A000UL) return;
+        if (System.Threading.Interlocked.Increment(ref _dbgWatchCount) > 400) return;
+        Console.Error.WriteLine($"[DBG][WATCH] frame={Diagnostics.DbgSequence.Frames} {kind} addr=0x{address:X} size=0x{size:X} value=0x{value:X8}");
+    }
+
+    private static readonly bool DbgProbeWatch = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROBE") == "1"; // TEMP
+    private static int _dbgWatchCount; // TEMP
     private static readonly bool _dbgGuestFaults = Environment.GetEnvironmentVariable("SHARPEMU_DBG_GUEST_FAULTS") == "1";
     private static readonly Dictionary<ulong, (int Count, long Ticks, ulong Size)> _dbgGuestPages = new();
     private static long _dbgGuestLast = Environment.TickCount64;
@@ -399,6 +457,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var completed = tracked && (!dirty || ReadMemoryOrAwaitShutdown(address, size, isWrite: false,
             GuestMemoryProfile.ReadbackSource.StoreDownload));
         if (dirty) DbgGuestFault(address, size, System.Diagnostics.Stopwatch.GetTimestamp() - dbgStart); // TEMP
+        if (dirty && completed && HizPolicy.Current == HizPolicy.Mode.Union) UnionHizPages(address, size);
+        if (dirty && completed && _dbgCompareReads && size <= 64 && System.Threading.Interlocked.Increment(ref _dbgCompareCount) <= 20000) // TEMP
+        {
+            var cpuBytes = new byte[size];
+            var cpuOk = _backing.TryReadBacking(address, cpuBytes);
+            Console.Error.WriteLine($"[DBG][CMPREAD] frame={Diagnostics.DbgSequence.Frames} addr=0x{address:X} size={size} ok={cpuOk} val={Convert.ToHexString(cpuBytes)}");
+        }
         if (GuestGpuMemoryHook.Traces(address, size))
             GuestGpuMemoryHook.Trace(address, size, $"buffer-read tracked={tracked} gpu_dirty={dirty} completed={completed}");
         return completed;
@@ -673,6 +738,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public void WriteHostMemory(ulong guestAddress, ReadOnlySpan<byte> data)
     {
+        DbgWatchRange("hostwrite", guestAddress, (ulong)data.Length, data.Length >= 4 ? BitConverter.ToUInt32(data) : 0); // TEMP
         if (guestAddress == 0 || data.IsEmpty || (ulong)data.Length > ulong.MaxValue - guestAddress)
         {
             throw SubmissionScheduler.Fatal("The host DMA write range is invalid.");
@@ -775,6 +841,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The fill memory address is invalid.");
         }
 
+        DbgWatchRange("fill", guestAddress, size, value); // TEMP
         var images = RequireImageCache();
         if (DbgAllFills && size >= 0x1000) // TEMP
             Diagnostics.DbgTargetWatch.Log($"anyfill {guestAddress >> 16:X} {size:X} {value:X}", () => $"anyfill address=0x{guestAddress:X} size=0x{size:X} value=0x{value:X8}");

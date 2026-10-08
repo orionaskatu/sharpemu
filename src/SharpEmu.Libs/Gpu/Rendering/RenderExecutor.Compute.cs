@@ -52,6 +52,170 @@ public sealed partial class RenderExecutor
         return elapsed >= window.From && elapsed < window.From + window.Length;
     }
 
+    // TEMP: SHARPEMU_DBG_PROBE=1 prints per-frame draw totals by marker and the state of the culling buffers (frame-alternation hunt).
+    internal static readonly bool DbgProbeOn = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROBE") == "1";
+    private static readonly Dictionary<string, long[]> DbgProbeDraws = new();
+    private static int _dbgProbeFrame = -1;
+    private static readonly int DbgProbeTop = 200;
+    private static int _dbgProbeBuffersFrame = -1;
+    private static int _dbgTileFrame = -1;
+    private static readonly HashSet<(ulong, ulong, bool, int)> _dbgImageUses = new();
+
+    internal void DbgProbeDraw(string kind, long indices, long instances, bool raw = false)
+    {
+        if (!DbgProbeOn) return;
+        DbgProbeTick();
+        var key = raw ? kind : kind + " " + Diagnostics.DbgSequence.Marker;
+        lock (DbgProbeDraws)
+        {
+            if (!DbgProbeDraws.TryGetValue(key, out var entry)) DbgProbeDraws[key] = entry = new long[3];
+            entry[0]++; entry[1] += indices; entry[2] += instances;
+        }
+    }
+
+    private void DbgProbeTick()
+    {
+        var frame = Diagnostics.DbgSequence.Frames;
+        if (frame == _dbgProbeFrame) return;
+        lock (DbgProbeDraws)
+        {
+            if (_dbgProbeFrame >= 0)
+            {
+                var text = string.Join(" | ", DbgProbeDraws.OrderByDescending(pair => pair.Value[0]).Take(DbgProbeTop).Select(pair => $"{pair.Key}: n={pair.Value[0]} idx={pair.Value[1]} inst={pair.Value[2]}"));
+                Console.Error.WriteLine($"[DBG][PROBE] frame={_dbgProbeFrame} t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F0} {text}");
+            }
+
+            DbgProbeDraws.Clear();
+            _dbgProbeFrame = frame;
+        }
+    }
+
+    private static int CountNonZero(byte[] bytes, int stride)
+    {
+        var count = 0;
+        for (var i = 0; i + stride <= bytes.Length; i += stride)
+        {
+            for (var k = 0; k < stride; k++) if (bytes[i + k] != 0) { count++; break; }
+        }
+
+        return count;
+    }
+
+    // "cpu/gpu": the guest's view of the range and the GPU buffer's own bytes.
+    private string DbgProbeNonZero(ulong address, int length, int stride)
+    {
+        var cpu = new byte[length];
+        var cpuCount = _host.TryReadGuest(address, cpu) ? CountNonZero(cpu, stride) : -1;
+        var gpu = new byte[length];
+        var gpuCount = _host.DebugReadGpu(address, gpu) ? CountNonZero(gpu, stride) : -1;
+        return $"{cpuCount}/{gpuCount}";
+    }
+
+    private void DbgProbeBuffers()
+    {
+        var frame = Diagnostics.DbgSequence.Frames;
+        if (frame == _dbgProbeBuffersFrame) return;
+        _dbgProbeBuffersFrame = frame;
+        var bits = new byte[0x400000];
+        long Pop(byte[] data) { long n = 0; for (var i = 0; i + 8 <= data.Length; i += 8) n += System.Numerics.BitOperations.PopCount(BitConverter.ToUInt64(data, i)); return n; }
+        var gpuBits = _host.DebugReadGpu(0x50633B0000UL, bits) ? Pop(bits) : -1;
+        // The two HiZ depth images (R32Sfloat 960x540): CPU view vs the GPU buffer holding the published copy.
+        foreach (var (name, address) in new[] { ("A", 0x504C270000UL), ("B", 0x504C51FC00UL) })
+        {
+            var size = 960 * 540 * 4;
+            var cpuImage = new byte[size];
+            var gpuImage = new byte[size];
+            var cpuOk = _host.TryReadGuest(address, cpuImage);
+            var gpuOk = _host.DebugReadGpu(address, gpuImage);
+            var mismatch = 0; var cpuFar = 0; var gpuFar = 0; var cpuNear = 0; var gpuNear = 0;
+            if (cpuOk && gpuOk)
+                for (var i = 0; i < size; i += 4)
+                {
+                    if (BitConverter.ToUInt32(cpuImage, i) != BitConverter.ToUInt32(gpuImage, i)) mismatch++;
+                }
+
+            for (var i = 0; i < size && cpuOk; i += 4) { var v = BitConverter.ToSingle(cpuImage, i); if (v >= 9.9e6f) cpuFar++; else if (v > 0) cpuNear++; }
+            for (var i = 0; i < size && gpuOk; i += 4) { var v = BitConverter.ToSingle(gpuImage, i); if (v >= 9.9e6f) gpuFar++; else if (v > 0) gpuNear++; }
+            if (cpuOk && Environment.GetEnvironmentVariable("SHARPEMU_DBG_DUMPDIR") is { Length: > 0 } dumpDir && (frame % 20 == 0 || (frame >= 250 && frame <= 256)))
+                File.WriteAllBytes(Path.Combine(dumpDir, $"hiz{name}_{frame}.f32"), cpuImage);
+            Console.Error.WriteLine($"[DBG][PROBE] frame={frame} hiz{name} cpuOk={cpuOk} gpuOk={gpuOk} mismatchTexels={mismatch} cpu(far/near)={cpuFar}/{cpuNear} gpu(far/near)={gpuFar}/{gpuNear}");
+        }
+
+        // CPU view vs GPU truth of the pages the guest CPU reads back (8-byte GPU results).
+        foreach (var page in new ulong[] { 0x50C3399000UL, 0x50C3398000UL, 0x50C3397000UL, 0x50C6598000UL, 0x50C6599000UL, 0x50C6597000UL, 0x504C57F000UL, 0x504C54E000UL, 0x200975F000UL })
+        {
+            var cpuPage = new byte[4096];
+            var gpuPage = new byte[4096];
+            var cpuOk = _host.TryReadGuest(page, cpuPage);
+            var gpuOk = _host.DebugReadGpu(page, gpuPage);
+            var mismatch = 0;
+            for (var i = 0; i < 4096; i++) if (cpuPage[i] != gpuPage[i]) mismatch++;
+            Console.Error.WriteLine($"[DBG][PROBE] frame={frame} page=0x{page:X} cpuOk={cpuOk} gpuOk={gpuOk} cpuNZ={CountNonZero(cpuPage, 8)} gpuNZ={CountNonZero(gpuPage, 8)} mismatchBytes={mismatch}");
+        }
+
+        // Compare the two instance arrays record by record.
+        {
+            const int Records = 0x1700000 / 92;
+            var even = new byte[Records * 92];
+            var odd = new byte[Records * 92];
+            if (_host.DebugReadGpu(0x50C1480000UL, even) && _host.DebugReadGpu(0x50C4680000UL, odd))
+            {
+                int both = 0, same = 0, onlyEven = 0, onlyOdd = 0; var diffWords = new int[23]; var sample = "";
+                for (var r = 0; r < Records; r++)
+                {
+                    var o = r * 92;
+                    var ez = true; var oz = true; var eq = true;
+                    for (var k = 0; k < 92; k++) { if (even[o + k] != 0) ez = false; if (odd[o + k] != 0) oz = false; if (even[o + k] != odd[o + k]) eq = false; }
+                    if (ez && oz) continue;
+                    if (ez) onlyOdd++; else if (oz) onlyEven++; else { both++; if (eq) same++; else { for (var w = 0; w < 23; w++) if (BitConverter.ToUInt32(even, o + w * 4) != BitConverter.ToUInt32(odd, o + w * 4)) diffWords[w]++; if (sample.Length == 0) sample = $"rec{r} even={string.Join(",", Enumerable.Range(0, 23).Select(w => BitConverter.ToUInt32(even, o + w * 4).ToString("X")))} odd={string.Join(",", Enumerable.Range(0, 23).Select(w => BitConverter.ToUInt32(odd, o + w * 4).ToString("X")))}"; } }
+                }
+
+                // Overlap of the two arrays as sets of (first 3 floats): do they hold the same objects at different indices?
+                {
+                    var evenSet = new HashSet<(uint, uint, uint)>();
+                    var oddSet = new HashSet<(uint, uint, uint)>();
+                    int evenN = 0, oddN = 0;
+                    for (var r = 0; r < Records; r++)
+                    {
+                        var o = r * 92;
+                        var e = (BitConverter.ToUInt32(even, o), BitConverter.ToUInt32(even, o + 4), BitConverter.ToUInt32(even, o + 8));
+                        var d = (BitConverter.ToUInt32(odd, o), BitConverter.ToUInt32(odd, o + 4), BitConverter.ToUInt32(odd, o + 8));
+                        if (e != (0u, 0u, 0u)) { evenSet.Add(e); evenN++; }
+                        if (d != (0u, 0u, 0u)) { oddSet.Add(d); oddN++; }
+                    }
+
+                    var overlap = evenSet.Count(item => oddSet.Contains(item));
+                    // Positions as floats near the camera-ish range: count records within 3000 units of the first plane-origin guess is meaningless; report float sanity instead.
+                    var sane = (byte[] a) => { var n = 0; for (var r = 0; r < Records; r++) { var x = BitConverter.ToSingle(a, r * 92); var y = BitConverter.ToSingle(a, r * 92 + 4); var z = BitConverter.ToSingle(a, r * 92 + 8); if (x == 0 && y == 0 && z == 0) continue; if (float.IsFinite(x) && float.IsFinite(y) && float.IsFinite(z) && Math.Abs(x) < 1e6f && Math.Abs(y) < 1e6f && Math.Abs(z) < 1e6f) n++; } return n; };
+                    if (frame % 40 == 0)
+                    {
+                        foreach (var (name, data) in new[] { ("even", even), ("odd", odd) })
+                        {
+                            var shown = 0;
+                            for (var r = 0; r < Records && shown < 6; r += 97)
+                            {
+                                var o = r * 92;
+                                if (BitConverter.ToUInt32(data, o) == 0 && BitConverter.ToUInt32(data, o + 4) == 0) continue;
+                                Console.Error.WriteLine($"[DBG][PROBE] frame={frame} {name} rec{r}: {string.Join(" ", Enumerable.Range(0, 23).Select(w => BitConverter.ToUInt32(data, o + w * 4).ToString("X8")))}");
+                                shown++;
+                            }
+                        }
+                    }
+
+                    Console.Error.WriteLine($"[DBG][PROBE] frame={frame} posSets even={evenN}/{evenSet.Count} odd={oddN}/{oddSet.Count} overlap={overlap} saneEven={sane(even)} saneOdd={sane(odd)}");
+                }
+
+                Console.Error.WriteLine($"[DBG][PROBE] frame={frame} instCmp both={both} same={same} onlyEven={onlyEven} onlyOdd={onlyOdd} diffWords={string.Join(",", diffWords)} {sample}");
+            }
+        }
+
+        Console.Error.WriteLine($"[DBG][PROBE] frame={frame} bitmaskGpu={gpuBits} flagsEven={DbgProbeNonZero(0x50C2C80000UL + 0x40000, 262144, 1)} flagsOdd={DbgProbeNonZero(0x50C5E80000UL + 0x40000, 262144, 1)} " +
+            $"dwEven={DbgProbeNonZero(0x50C2B80000UL + 0x100000, 0x100000, 4)} dwOdd={DbgProbeNonZero(0x50C5D80000UL + 0x100000, 0x100000, 4)} " +
+            $"tabB58={DbgProbeNonZero(0x5037B58000UL, 0xA0000, 32)} tabBF8={DbgProbeNonZero(0x5037BF8000UL, 0xA0000, 32)} tabC98={DbgProbeNonZero(0x5037C98000UL, 0xA0000, 32)} " +
+            $"instEven={DbgProbeNonZero(0x50C1480000UL, 0x1700000 / 92 * 92, 92)} instOdd={DbgProbeNonZero(0x50C4680000UL, 0x1700000 / 92 * 92, 92)} " +
+            $"inst2Even={DbgProbeNonZero(0x50C1480000UL + 0x1700000, 0x400000, 92)} inst2Odd={DbgProbeNonZero(0x50C4680000UL + 0x1700000, 0x400000, 92)}");
+    }
+
     private static readonly (ulong Hash, int Slot, int Words, ulong Offset)[] DbgPeek = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PEEK") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
         .Select(item => item.Split(':')).Where(parts => parts.Length >= 3).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToInt32(parts[1], 16), Convert.ToInt32(parts[2]), parts.Length > 3 ? Convert.ToUInt64(parts[3].Replace("0x", ""), 16) : 0UL)).ToArray(); // TEMP
     private static readonly int DbgBootFrames = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_BOOT_FRAMES"), out var dbgBoot) ? dbgBoot : 0; // TEMP
@@ -231,7 +395,63 @@ public sealed partial class RenderExecutor
             return;
         }
 
+
+        if (program.Hash == HizPolicy.BuilderProgramHash && HizPolicy.TryGetBuilderImage(input.Stage.Resources.Images, out var hizImage) && HizPolicy.Current == HizPolicy.Mode.Far)
+        {
+            // Nothing is occluded: the pyramid reads empty instead of being built from this frame's depth.
+            _host.DebugFillBuffer(hizImage, HizPolicy.ImageBytes, HizPolicy.FarBits);
+            _host.ResetBindings();
+            return;
+        }
+
         DbgVcullWatch(program, input); // TEMP
+        if (DbgProbeOn && program.Hash == 0x25FCDA2A90D50DD4UL) { DbgProbeTick(); DbgProbeBuffers(); } // TEMP
+        if (DbgProbeOn) DbgProbeDraw("CS", 0, 1); // TEMP
+        if (DbgProbeOn && program.Hash is 0x9DCF7A3711A288C0UL or 0xF00717DE7B897C69UL or 0xB9B4F92557380EDDUL or 0x32839016CE94F7A2UL or 0xE584166F64BA03E2UL or 0xA7661FF4EA282325UL or 0x8457901D80B91921UL) // TEMP
+        {
+            var allImages = input.Stage.Resources.Images;
+            var key2 = (program.Hash, 1UL, false, Diagnostics.DbgSequence.Frames);
+            bool first;
+            lock (_dbgImageUses) first = _dbgImageUses.Add(key2);
+            if (first)
+                for (var index = 0; index < allImages.Length && index < program.Images.Length; index++)
+                {
+                    if (allImages[index].Length < 8) continue;
+                    var tsharp = new SharpEmu.Libs.Gpu.Images.TextureDescriptorWords(allImages[index]);
+                    Console.Error.WriteLine($"[DBG][PROBE] frame={Diagnostics.DbgSequence.Frames} chain cs={program.Hash:X16} groups={groupsX}x{groupsY} img{index} base=0x{tsharp.BaseAddress:X} written={program.Images[index].Written} words={string.Join(",", allImages[index].Take(8).Select(w => w.ToString("X8")))}");
+                }
+        }
+
+        if (DbgProbeOn && Diagnostics.DbgSequence.Frames >= 0) // TEMP: who reads/writes the two culling depth images
+        {
+            var imagesAll = input.Stage.Resources.Images;
+            for (var index = 0; index < imagesAll.Length && index < program.Images.Length; index++)
+            {
+                if (imagesAll[index].Length < 8) continue;
+                var baseAddress = new SharpEmu.Libs.Gpu.Images.TextureDescriptorWords(imagesAll[index]).BaseAddress;
+                if (baseAddress is not (0x504C270000UL or 0x504C51FC00UL)) continue;
+                var key = (program.Hash, baseAddress, program.Images[index].Written, Diagnostics.DbgSequence.Frames);
+                lock (_dbgImageUses)
+                {
+                    if (!_dbgImageUses.Add(key)) continue;
+                }
+
+                Console.Error.WriteLine($"[DBG][PROBE] frame={Diagnostics.DbgSequence.Frames} image 0x{baseAddress:X} used by cs=0x{program.Hash:X16} written={program.Images[index].Written} marker={Diagnostics.DbgSequence.Marker} groups={groupsX}x{groupsY}x{groupsZ}");
+            }
+        }
+
+        if (DbgProbeOn && program.Hash == 0xA7661FF4EA282325UL && _dbgTileFrame != Diagnostics.DbgSequence.Frames) // TEMP
+        {
+            _dbgTileFrame = Diagnostics.DbgSequence.Frames;
+            var images = input.Stage.Resources.Images;
+            for (var index = 0; index < images.Length; index++)
+            {
+                var words = images[index];
+                if (words.Length < 8) continue;
+                Console.Error.WriteLine($"[DBG][PROBE] frame={_dbgTileFrame} tile-cull image{index} base=0x{new SharpEmu.Libs.Gpu.Images.TextureDescriptorWords(words).BaseAddress:X} words={string.Join(",", words.Select(w => w.ToString("X8")))}");
+            }
+        }
+
         if (program.Hash == 0x25FCDA2A90D50DD4UL && Environment.GetEnvironmentVariable("SHARPEMU_DBG_TABLESTAT") == "1" && input.Stage.Resources.Buffers.Length > 1 && input.Stage.Resources.Buffers[1].Length >= 4) // TEMP
         {
             var tableDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[1]);

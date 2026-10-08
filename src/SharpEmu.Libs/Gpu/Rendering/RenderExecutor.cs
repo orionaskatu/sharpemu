@@ -178,6 +178,7 @@ public sealed partial class RenderExecutor
             UnboundedIndexBuffer = false,
         };
         DbgWatchSlots(banks, "cpuargs", resolved.IndexCount, resolved.InstanceCount); // TEMP
+        DbgProbeDraw("CPU", resolved.IndexCount, resolved.InstanceCount); // TEMP
         if (SharpEmu.Libs.Diagnostics.DbgSequence.Marker.Contains("Grass") && System.Threading.Interlocked.Increment(ref _dbgGrassLogs2) <= 120) // TEMP
             Console.Error.WriteLine($"[DBG][GRASSCPU] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} marker={SharpEmu.Libs.Diagnostics.DbgSequence.Marker} addr=0x{arguments.IndirectArgumentsAddress:X} words={string.Join(",", words.ToArray().Select(w => w.ToString("X")))} index=0x{resolved.IndexAddress:X}");
         if (resolved.IndexCount == 0 || resolved.InstanceCount == 0)
