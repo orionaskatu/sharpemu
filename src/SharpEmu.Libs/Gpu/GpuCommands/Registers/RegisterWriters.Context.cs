@@ -170,13 +170,14 @@ internal static partial class RegisterWriters
                      DbDfsmControl, DbRmiL2CacheControl, CbRmiGl2CacheControl, TaBcBaseAddr, TaBcBaseAddrHi, PaSuPointSize, PaSuPointMinMax,
                      SpiTmpringSize, VgtDrawPayloadCntl, VgtPrimitiveIdReset, PaClObjPrimIdCntl, PaScFovWindowLr, PaScFovWindowTb, PaScFsrEnable,
                      FsrRecursions0, FsrRecursions1, PaSuVtxCntl,
-                     PaScBinnerCntl0, PaScBinnerCntl1, PaScConservativeRasterizationCntl, DbAlphaToMask,
+                     PaScBinnerCntl0, PaScBinnerCntl1, DbAlphaToMask,
                  })
         {
             indirect[offset] = IgnoreEntry;
         }
 
         indirect[PsShaderSampleExclusionMask] = static (banks, _, value) => banks.Context.ShaderSampleExclusionMask = value;
+        indirect[PaScConservativeRasterizationCntl] = static (banks, _, value) => banks.Context.ConservativeRasterizationControl = value;
         indirect[PaScAaMaskX0Y0X1Y0] = static (banks, _, value) => banks.Context.SampleCoverageMaskX0Y0X1Y0 = value;
         indirect[PaScAaMaskX0Y1X1Y1] = static (banks, _, value) => banks.Context.SampleCoverageMaskX0Y1X1Y1 = value;
 

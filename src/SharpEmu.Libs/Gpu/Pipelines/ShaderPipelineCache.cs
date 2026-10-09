@@ -621,6 +621,9 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         var mode = context.RasterMode;
         parameters.NegativeOneToOne = !context.Clip.DirectXClipSpace;
         parameters.DepthClipEnable = context.Clip.IsZClipEnabled;
+        parameters.ConservativeMode = rectangleList ? (byte)0 :
+            (context.ConservativeRasterizationControl & 1) != 0 ? (byte)1 :
+            (context.ConservativeRasterizationControl & 0x20) != 0 ? (byte)2 : (byte)0;
         parameters.Topology = topology;
         parameters.PrimitiveRestartEnable = primitiveRestartEnabled;
         parameters.Samples = samples;

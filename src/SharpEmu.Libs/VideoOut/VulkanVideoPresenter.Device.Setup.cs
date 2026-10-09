@@ -836,6 +836,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
         private bool _supportsImageViewMinLod;
         private bool _samplerFilterMinmaxEnabled;
+        private bool _fragmentShaderInterlockEnabled;
+        private bool _conservativeRasterizationEnabled;
         private bool _supportsNativeTwoSampleMixed;
         private bool _supportsVariableSampleLocations;
 
@@ -1217,6 +1219,23 @@ internal static unsafe partial class VulkanVideoPresenter
             var sampleLocationsExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sample_locations");
             var postDepthCoverageExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_post_depth_coverage");
             var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
+            var interlockExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_fragment_shader_interlock");
+            var conservativeExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_conservative_rasterization");
+            var interlockFeatures = new PhysicalDeviceFragmentShaderInterlockFeaturesEXT
+            {
+                SType = StructureType.PhysicalDeviceFragmentShaderInterlockFeaturesExt,
+            };
+            if (IsDeviceExtensionAvailable("VK_EXT_fragment_shader_interlock") &&
+                Environment.GetEnvironmentVariable("SHARPEMU_POPS_INTERLOCK") != "0")
+            {
+                var interlockQuery = new PhysicalDeviceFeatures2
+                {
+                    SType = StructureType.PhysicalDeviceFeatures2,
+                    PNext = &interlockFeatures,
+                };
+                _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &interlockQuery);
+                _fragmentShaderInterlockEnabled = interlockFeatures.FragmentShaderPixelInterlock;
+            }
             try
             {
                 var extensions = stackalloc byte*[24];
@@ -1231,6 +1250,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 _samplerFilterMinmaxEnabled = IsDeviceExtensionAvailable("VK_EXT_sampler_filter_minmax");
                 if (_samplerFilterMinmaxEnabled)
                     extensions[extensionCount++] = samplerFilterMinmaxExtension;
+                if (_fragmentShaderInterlockEnabled)
+                    extensions[extensionCount++] = interlockExtension;
+                _conservativeRasterizationEnabled = IsDeviceExtensionAvailable("VK_EXT_conservative_rasterization") &&
+                    Environment.GetEnvironmentVariable("SHARPEMU_CONSERVATIVE_RASTER") != "0";
+                if (_conservativeRasterizationEnabled)
+                    extensions[extensionCount++] = conservativeExtension;
                 if (nativeMixed)
                 {
                     extensions[extensionCount++] = nativeMixedExtension;
@@ -1423,6 +1448,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 descriptorIndexingFeatures.PNext = renderingChain;
                 renderingChain = &descriptorIndexingFeatures;
 
+                if (_fragmentShaderInterlockEnabled)
+                {
+                    interlockFeatures = new PhysicalDeviceFragmentShaderInterlockFeaturesEXT
+                    {
+                        SType = StructureType.PhysicalDeviceFragmentShaderInterlockFeaturesExt,
+                        FragmentShaderPixelInterlock = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &interlockFeatures;
+                }
+
                 if (supportsDeviceFault)
                 {
                     deviceFaultFeatures.DeviceFault = true;
@@ -1463,6 +1499,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 SilkMarshal.Free((nint)sampleLocationsExtension);
                 SilkMarshal.Free((nint)postDepthCoverageExtension);
                 SilkMarshal.Free((nint)samplerFilterMinmaxExtension);
+                SilkMarshal.Free((nint)interlockExtension);
+                SilkMarshal.Free((nint)conservativeExtension);
                 SilkMarshal.Free((nint)swapchainExtension);
                 SilkMarshal.Free((nint)maintenance8Extension);
                 SilkMarshal.Free((nint)maintenance5Extension);

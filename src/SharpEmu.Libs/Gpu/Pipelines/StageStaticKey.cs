@@ -82,6 +82,7 @@ public static class StageStaticKey
             key.Add(BitConverter.SingleToUInt32Bits(offset.Y));
         }
         key.Add(Bit(info.EarlyDepth));
+        key.Add(Bit(info.PrimitiveOrdered));
         key.Add(info.EarlyDepth ? info.ShaderSampleExclusionMask : 0u);
         for (var index = 0; index < info.TargetOutputModes.Length; index++)
         {

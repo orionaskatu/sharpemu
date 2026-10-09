@@ -389,6 +389,9 @@ public static partial class Gen5SpirvTranslator
                     _module.AddStatement(SpirvOp.Return);
                     _module.AddLabel();
                 }
+                // The whole program is the critical section: POPS orders the entire shader.
+                if (_stage == Gen5SpirvStage.Pixel && _request.PrimitiveOrderedInterlock)
+                    _module.AddStatement(SpirvOp.BeginInvocationInterlockEXT);
                 if (_structuredPlan is null) EmitInitialState();
 
                 if (!TryEmitControlFlow(blocks, out error))
@@ -397,6 +400,8 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 FlushPendingDeviceFaults();
+                if (_stage == Gen5SpirvStage.Pixel && _request.PrimitiveOrderedInterlock)
+                    _module.AddStatement(SpirvOp.EndInvocationInterlockEXT);
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
@@ -508,6 +513,8 @@ public static partial class Gen5SpirvTranslator
                     _module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
                     if (_request.EarlyFragmentTests)
                         _module.AddExecutionMode(main, SpirvExecutionMode.EarlyFragmentTests);
+                    if (_request.PrimitiveOrderedInterlock)
+                        _module.AddExecutionMode(main, SpirvExecutionMode.PixelInterlockOrderedEXT);
                     if (_pixelInvocationCoverageInput != 0)
                         _module.AddExecutionMode(main, SpirvExecutionMode.PostDepthCoverage);
                     if (_pixelDepthOutput != 0)
@@ -552,6 +559,11 @@ public static partial class Gen5SpirvTranslator
                 _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
             }
             _module.AddCapability(SpirvCapability.Int64);
+            if (_stage == Gen5SpirvStage.Pixel && _request.PrimitiveOrderedInterlock)
+            {
+                _module.AddExtension("SPV_EXT_fragment_shader_interlock");
+                _module.AddCapability(SpirvCapability.FragmentShaderPixelInterlockEXT);
+            }
             if (_request.SupportsExactFloat16Conversions)
             {
                 _module.AddCapability(SpirvCapability.Float16);

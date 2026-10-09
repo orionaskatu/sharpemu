@@ -154,6 +154,7 @@ public static class PixelStageInputResolver
             EarlyDepth = earlyDepth,
             ShaderSampleExclusionMask = earlyDepth ? shaderSampleExclusionMask & 0xFFFFu : 0u,
             ExecuteOnNoop = control.ExecuteOnNoop,
+            PrimitiveOrdered = control.PrimitiveOrdered,
         };
     }
 }

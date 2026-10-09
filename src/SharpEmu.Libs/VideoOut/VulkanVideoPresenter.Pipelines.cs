@@ -135,6 +135,7 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.ClipDistanceEnabled => _supportsShaderClipDistance;
         private bool _postDepthCoverageEnabled;
         bool IShaderPipelineHost.PostDepthCoverageSupported => _postDepthCoverageEnabled;
+        bool IShaderPipelineHost.FragmentShaderInterlockSupported => _fragmentShaderInterlockEnabled;
         public bool NativeTwoSampleMixedSupported => _supportsNativeTwoSampleMixed;
 
         bool IShaderPipelineHost.NativeHalfConversionExact => NativeHalfConversionExact;
@@ -1056,10 +1057,20 @@ internal static unsafe partial class VulkanVideoPresenter
                         SType = StructureType.PipelineRasterizationDepthClipStateCreateInfoExt,
                         DepthClipEnable = parameters.DepthClipEnable,
                     };
+                    var conservative = new PipelineRasterizationConservativeStateCreateInfoEXT
+                    {
+                        SType = StructureType.PipelineRasterizationConservativeStateCreateInfoExt,
+                        PNext = _supportsDepthClipEnable ? &depthClip : null,
+                        ConservativeRasterizationMode = parameters.ConservativeMode == 2
+                            ? ConservativeRasterizationModeEXT.UnderestimateExt
+                            : ConservativeRasterizationModeEXT.OverestimateExt,
+                    };
+                    var useConservative = _conservativeRasterizationEnabled && parameters.ConservativeMode != 0 &&
+                        polygonMode == PolygonMode.Fill;
                     var rasterization = new PipelineRasterizationStateCreateInfo
                     {
                         SType = StructureType.PipelineRasterizationStateCreateInfo,
-                        PNext = _supportsDepthClipEnable ? &depthClip : null,
+                        PNext = useConservative ? &conservative : _supportsDepthClipEnable ? &depthClip : null,
                         PolygonMode = polygonMode,
                         CullMode = cullMode,
                         FrontFace = parameters.FrontFaceClockwise ? FrontFace.Clockwise : FrontFace.CounterClockwise,

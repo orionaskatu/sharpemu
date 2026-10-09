@@ -229,6 +229,11 @@ public sealed class ShaderCompileRequest
     // four offsets; per-sample interpolation uses rasterizationSamples offsets per pixel.
     public IReadOnlyList<(float X, float Y)> PixelCustomSampleOffsets { get; init; } = [];
     public bool EarlyFragmentTests { get; init; }
+
+    // DB_SHADER_CONTROL.PRIMITIVE_ORDERED_PIXEL_SHADER on a device with fragment shader
+    // interlock: the whole pixel shader is an ordered critical section, as POPS makes it, so
+    // overlapping fragments read-modify-write their images in primitive order.
+    public bool PrimitiveOrderedInterlock { get; init; }
     // Samples excluded from triggering guest fragment execution after early depth/stencil tests.
     public uint PixelShaderSampleExclusionMask { get; init; }
     public bool PixelDepthExportEnable { get; init; }

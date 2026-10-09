@@ -61,6 +61,8 @@ internal interface IShaderPipelineHost
     bool PerVertexPixelInputsSupported => true;
     bool ClipDistanceEnabled => false;
     bool PostDepthCoverageSupported => false;
+    // fragmentShaderPixelInterlock: primitive-ordered pixel shaders run under an ordered interlock.
+    bool FragmentShaderInterlockSupported => false;
     bool NativeTwoSampleMixedSupported => false;
 
     // True when this device's GLSL UnpackHalf2x16 / PackHalf2x16 were measured bit-exact

@@ -553,8 +553,16 @@ public static partial class KernelMemoryCompatExports
             RemoveMappingLocked(alias.Address, alias.Length);
         }
         _directAllocations.ReleaseRange(start, length);
+        // A new direct allocation hands out zeroed pages; mappings share the physical backing,
+        // so a released range is cleared here (only pages a previous owner used) rather than
+        // at allocation, which would commit every never-touched page of the pool.
+        if (ClearReleasedDirectMemory)
+            _ = ResolveBackingSpace(ctx)?.TryClearBacking(start, length);
         return true;
     }
+
+    private static readonly bool ClearReleasedDirectMemory =
+        Environment.GetEnvironmentVariable("SHARPEMU_CLEAR_RELEASED_DIRECT") != "0";
 
     private static int ProtectMappedRange(CpuContext ctx, ulong address, ulong length, int protection, int? memoryType = null)
     {

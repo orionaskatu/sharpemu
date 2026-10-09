@@ -725,6 +725,7 @@ internal sealed class ShaderProgramCache
                     ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     PixelOutputs = options.PixelOutputs,
                     EarlyFragmentTests = info.EarlyDepth,
+                    PrimitiveOrderedInterlock = info.PrimitiveOrdered && _host.FragmentShaderInterlockSupported,
                     PixelShaderSampleExclusionMask = info.EarlyDepth ? info.ShaderSampleExclusionMask : 0u,
                     PixelDepthExportEnable = info.DepthExportEnable,
                     PixelSampleMaskExportEnable = info.SampleMaskExportEnable,

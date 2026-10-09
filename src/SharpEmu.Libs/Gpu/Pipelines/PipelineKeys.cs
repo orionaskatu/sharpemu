@@ -22,7 +22,9 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
     private const int WithDepthOffset = 12;
     private const int DepthBoundsTestOffset = 13;
     // Bytes 14..21 held the depth bounds, now dynamic state; they stay reserved (zero) so the
-    // layout of stored keys does not move.
+    // layout of stored keys does not move. Byte 14 now holds the conservative rasterization mode
+    // (0 off, as stored keys read).
+    private const int ConservativeModeOffset = 14;
     private const int StencilTestOffset = 22;
     private const int StencilFrontOffset = 23;
     private const int StencilBackOffset = 39;
@@ -91,6 +93,8 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
     public bool SampleShadingEnable { get => GetBool(SampleShadingOffset); set => SetBool(SampleShadingOffset, value); }
     public bool WithDepth { get => GetBool(WithDepthOffset); set => SetBool(WithDepthOffset, value); }
     public bool DepthBoundsTestEnable { get => GetBool(DepthBoundsTestOffset); set => SetBool(DepthBoundsTestOffset, value); }
+    // 0 off, 1 overestimate (OVER_RAST_ENABLE), 2 underestimate (UNDER_RAST_ENABLE).
+    public byte ConservativeMode { get => _bytes[ConservativeModeOffset]; set => _bytes[ConservativeModeOffset] = value; }
     public bool StencilTestEnable { get => GetBool(StencilTestOffset); set => SetBool(StencilTestOffset, value); }
     public StencilOperations StencilFront { get => GetStencil(StencilFrontOffset); set => SetStencil(StencilFrontOffset, in value); }
     public StencilOperations StencilBack { get => GetStencil(StencilBackOffset); set => SetStencil(StencilBackOffset, in value); }

@@ -166,6 +166,8 @@ public enum SpirvOp : ushort
     BranchConditional = 250,
     Switch = 251,
     Kill = 252,
+    BeginInvocationInterlockEXT = 5364,
+    EndInvocationInterlockEXT = 5365,
     Return = 253,
     ReturnValue = 254,
     Unreachable = 255,
@@ -200,6 +202,7 @@ public enum SpirvCapability : uint
     DenormPreserve = 4464,
     SignedZeroInfNanPreserve = 4466,
     RoundingModeRTE = 4467,
+    FragmentShaderPixelInterlockEXT = 5378,
     Float64 = 10,
     Int64 = 11,
     Int64Atomics = 12,
@@ -273,6 +276,7 @@ public enum SpirvExecutionMode : uint
     DenormPreserve = 4459,
     SignedZeroInfNanPreserve = 4461,
     RoundingModeRTE = 4462,
+    PixelInterlockOrderedEXT = 5366,
 }
 
 public enum SpirvDecoration : uint

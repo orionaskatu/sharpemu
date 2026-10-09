@@ -264,6 +264,8 @@ public struct DepthShaderControlRegisters
     public bool ExecuteOnNoop;
     public bool AlphaToMaskDisable;
     public bool DepthBeforeShader;
+    // PRIMITIVE_ORDERED_PIXEL_SHADER: overlapping fragments run the shader in primitive order.
+    public bool PrimitiveOrdered;
 
     public static DepthShaderControlRegisters Decode(uint value) => new()
     {
@@ -277,6 +279,7 @@ public struct DepthShaderControlRegisters
         ExecuteOnNoop = RegisterField.Bit(value, 10),
         AlphaToMaskDisable = RegisterField.Bit(value, 11),
         DepthBeforeShader = RegisterField.Bit(value, 12),
+        PrimitiveOrdered = RegisterField.Bit(value, 16),
     };
 }
 
@@ -392,6 +395,8 @@ public sealed class ContextRegisters
     public uint ScanModeControl1;
     public SampleLocationRegisters SampleLocations = new();
     public uint ShaderSampleExclusionMask;
+    // PA_SC_CONSERVATIVE_RASTERIZATION_CNTL: OVER_RAST_ENABLE (bit 0), UNDER_RAST_ENABLE (bit 5).
+    public uint ConservativeRasterizationControl;
     public uint SampleCoverageMaskX0Y0X1Y0 = uint.MaxValue;
     public uint SampleCoverageMaskX0Y1X1Y1 = uint.MaxValue;
     public AntialiasingConfigRegisters AntialiasingConfig;

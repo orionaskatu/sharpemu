@@ -652,9 +652,17 @@ public static partial class Gen5SpirvTranslator
                     break;
                 }
                 case "VMadF32":
-                case "VFmaF32":
                 case "VMadMkF32":
                 case "VMadAkF32":
+                    // The legacy MAD rounds the product before the add (not fused).
+                    result = EmitFloatResult(
+                        instruction,
+                        EmitUnfusedMultiplyAdd(
+                            GetFloatSource(instruction, 0),
+                            GetFloatSource(instruction, 1),
+                            GetFloatSource(instruction, 2)));
+                    break;
+                case "VFmaF32":
                 case "VFmaMkF32":
                 case "VFmaAkF32":
                     result = EmitFloatResult(
@@ -672,12 +680,17 @@ public static partial class Gen5SpirvTranslator
                     var addend = Bitcast(_floatType, LoadV(destination));
                     result = EmitFloatResult(
                         instruction,
-                        Ext(
-                            50,
-                            _floatType,
-                            GetFloatSource(instruction, 0),
-                            GetFloatSource(instruction, 1),
-                            addend));
+                        instruction.Opcode == "VMacF32"
+                            ? EmitUnfusedMultiplyAdd(
+                                GetFloatSource(instruction, 0),
+                                GetFloatSource(instruction, 1),
+                                addend)
+                            : Ext(
+                                50,
+                                _floatType,
+                                GetFloatSource(instruction, 0),
+                                GetFloatSource(instruction, 1),
+                                addend));
                     break;
                 }
                 case "VDot2cF32F16":
@@ -4363,6 +4376,17 @@ public static partial class Gen5SpirvTranslator
                     BitwiseXor(rowLane, UInt(dpp & 15))),
                 _ => lane,
             };
+        }
+
+        // V_MAD_F32 / V_MAC_F32: the product is rounded to f32 before the add; NoContraction
+        // keeps the driver from fusing the pair back into an FMA.
+        private uint EmitUnfusedMultiplyAdd(uint left, uint right, uint addend)
+        {
+            var product = _module.AddInstruction(SpirvOp.FMul, _floatType, left, right);
+            _module.AddDecoration(product, SpirvDecoration.NoContraction);
+            var sum = _module.AddInstruction(SpirvOp.FAdd, _floatType, product, addend);
+            _module.AddDecoration(sum, SpirvDecoration.NoContraction);
+            return sum;
         }
 
         // write = row_mask[lane >> 4] && bank_mask[(lane >> 2) & 3] && (valid || bound_ctrl):

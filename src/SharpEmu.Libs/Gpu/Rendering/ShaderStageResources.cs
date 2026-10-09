@@ -209,6 +209,7 @@ public sealed class PixelInputInfo
     public bool EarlyDepth { get; init; }
     public uint ShaderSampleExclusionMask { get; init; }
     public bool ExecuteOnNoop { get; init; }
+    public bool PrimitiveOrdered { get; init; }
     public ShaderStageResources Stage { get; set; }
 
     public bool PositionXY => PositionX && PositionY;

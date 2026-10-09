@@ -2573,12 +2573,14 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData0 + 1),
                     ],
-                    // GFX10 DS_MIN/MAX_F32 use DATA0 as the replacement value and
-                    // DATA1 as the floating-point compare operand.
+                    // RDNA DS_MIN/MAX_F32 compare memory with DATA0 and store DATA0 when it wins:
+                    // MEM = DATA0 < MEM ? DATA0 : MEM. DATA1 is not an operand (compilers fill it
+                    // with any register); the old GCN text compared against DATA1. The compare
+                    // operand is therefore DATA0 too.
                     "DsMinF32" or "DsMaxF32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
-                        Gen5Operand.Vector(vectorData1),
+                        Gen5Operand.Vector(vectorData0),
                     ],
                     _ when IsDataShareAtomic(opcode) => [
                         Gen5Operand.Vector(vectorAddress),
