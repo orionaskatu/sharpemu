@@ -135,6 +135,37 @@ public sealed class SharedPageShadowsTests
         Assert.Equal([new BufferCopy(30, 30, 1)], copies);
     }
 
+    [Theory]
+    [InlineData(0UL)]
+    [InlineData(3UL)]
+    public void AnEliminatedUploadDoesNotDelayCompletedShaderWrites(ulong lastUploadTick)
+    {
+        var owner = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        var guest = Fill(0);
+        Assert.True(shadows.Adopt(Page, owner, guest));
+        if (lastUploadTick != 0)
+        {
+            guest[3] = 9;
+            var first = new List<BufferCopy> { new(0, 0, PageBytes) };
+            shadows.FilterUpload(first, owner, Page, guest, lastUploadTick);
+            Assert.Equal([new BufferCopy(3, 3, 1)], first);
+        }
+
+        // Hot CPU pages can be offered for upload on every draw, even when no bytes changed.
+        // Filtering removes this upload entirely: its future tick must not gate a GPU merge.
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, owner, Page, guest, tick: 5);
+        Assert.Empty(copies);
+        var gpu = guest.ToArray();
+        gpu[20] = 0x55;
+        var writes = new List<(int Offset, int Length)>();
+        Assert.Equal(1, shadows.PullGpuWrites(Page, owner, gpu, guest, lastUploadTick,
+            (offset, length) => writes.Add((offset, length))));
+        Assert.Equal([(20, 1)], writes);
+        Assert.Equal(0x55, guest[20]);
+    }
+
     [Fact]
     public void AdoptStopsAtCapacity()
     {

@@ -220,13 +220,13 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
                     }
 
                     emitted = to;
-                    shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
                     var source = staged.Slice(checked((int)(copy.SrcOffset + (from - begin))), checked((int)(to - from)));
                     var shadowBytes = shadow.Bytes.AsSpan(checked((int)(from - page)), source.Length);
                     if (!ReferenceEquals(shadow.Owner, target))
                     {
                         shadow.Owner = target;
                         filtered.Add(Slice(copy, begin, from, to - from));
+                        shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
                         source.CopyTo(shadowBytes);
                         continue;
                     }
@@ -242,6 +242,9 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
                         }
 
                         filtered.Add(Slice(copy, begin, from + (ulong)at, (ulong)(runEnd - at)));
+                        // Only a copy that survives filtering can leave staged bytes missing
+                        // from the GPU mapping. An eliminated upload has no completion to wait for.
+                        shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
                         source[at..runEnd].CopyTo(shadowBytes[at..]);
                         skipped -= runEnd - at;
                         at = runEnd;
