@@ -19,7 +19,7 @@ public readonly record struct DownloadPiece(GpuBuffer Buffer, ulong SourceOffset
 public readonly record struct OverlapSpan(int First, int Last, ulong Begin, ulong End, bool HasStreamLeap);
 
 // Guest memory mirrored in device buffers: upload on use, download on CPU fault, page table for BDA.
-public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
+public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDisposable
 {
     public const int CachingPageBits = 14;
     public const ulong CachingPageSize = 1UL << CachingPageBits;
@@ -161,6 +161,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
+        WatchEvent(address, size, "cpu-write-fault");
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
         var completed = !needsGpuFlush || ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
             GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation);
@@ -746,6 +747,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
             NoteHotWindowWrite(guestAddress, size);
             if (_dbgFaults) lock (_dbgLastWrite) _dbgLastWrite[guestAddress >> 12] = (guestAddress, size, System.Diagnostics.Stopwatch.GetTimestamp());
+            WatchEvent(guestAddress, size, "writable-binding");
         }
 
         return (buffer, buffer.Offset(guestAddress));
@@ -898,6 +900,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public void WriteHostMemory(ulong guestAddress, ReadOnlySpan<byte> data)
     {
         DbgWatchRange("hostwrite", guestAddress, (ulong)data.Length, data.Length >= 4 ? BitConverter.ToUInt32(data) : 0); // TEMP
+        WatchEvent(guestAddress, (ulong)data.Length, "host-dma-write");
         if (guestAddress == 0 || data.IsEmpty || (ulong)data.Length > ulong.MaxValue - guestAddress)
         {
             throw SubmissionScheduler.Fatal("The host DMA write range is invalid.");
@@ -979,6 +982,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {
+        WatchEvent(guestAddress, size, "fill");
         if ((guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress)
         {
             throw SubmissionScheduler.Fatal("The fill range must be aligned to four bytes.");
@@ -1095,6 +1099,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
     {
+        if (WatchedRanges.Length != 0) WatchEvent(destination, words * 4, $"host-copy src=0x{source:X}");
         if (destination == 0 || source == 0 || sourceWords == 0 || words == 0 || ((destination | source) & 3) != 0 ||
             words > MaxHostCopyWords || sourceWords > MaxHostCopyWords)
         {
@@ -1159,6 +1164,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public void CopyBuffer(ulong dstVaddr, ulong srcVaddr, ulong size, bool dstGds, bool srcGds)
     {
+        if (WatchedRanges.Length != 0) WatchEvent(dstVaddr, size, $"dma-copy src=0x{srcVaddr:X}");
         var dstMemory = !dstGds;
         var srcMemory = !srcGds;
         if ((dstMemory && dstVaddr == 0) || (srcMemory && srcVaddr == 0) || size == 0 ||
@@ -1277,6 +1283,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
 
             var conflicts = _tracker.MarkGpuWrittenPages(page, TrackerLayout.PageBytes);
+            WatchEvent(page, TrackerLayout.PageBytes, conflicts != 0 ? "device-write-on-cpu-dirty-page" : "device-write");
             if (conflicts != 0)
             {
                 // The CPU dirtied the page before the write was reported: the page stays
@@ -3250,6 +3257,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (source != null)
         {
+            if (WatchedRanges.Length != 0)
+            {
+                foreach (var copy in copies)
+                    WatchEvent(buffer.CpuAddress + copy.DstOffset, copy.Size, "upload");
+            }
+
             buffer.NoteGpuWrite();
             var command = _scheduler.Current;
             command.EndRendering();
