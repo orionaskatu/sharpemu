@@ -4954,8 +4954,8 @@ public static partial class Gen5SpirvTranslator
         {
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
             var bitOffset = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
-            var low = LoadBufferWord(bindingIndex, dwordAddress, includeTailPadding: true);
-            var high = LoadBufferWord(bindingIndex, IAdd(dwordAddress, UInt(1)), includeTailPadding: true);
+            var low = LoadBufferWord(bindingIndex, dwordAddress);
+            var high = LoadBufferWord(bindingIndex, IAdd(dwordAddress, UInt(1)));
             // A shift by the word width is undefined, so the aligned case keeps the low word.
             var spanning = BitwiseOr(
                 ShiftRightLogical(low, bitOffset),
@@ -5100,7 +5100,7 @@ public static partial class Gen5SpirvTranslator
                 SpirvOp.LogicalAnd,
                 _boolType,
                 _module.AddInstruction(SpirvOp.INotEqual, _boolType, mask, UInt(0)),
-                IsBufferWordInRange(bindingIndex, dwordAddress, includeTailPadding: true));
+                IsBufferWordInRange(bindingIndex, dwordAddress));
             EmitConditional(touched, () =>
             {
                 var pointer = BufferWordPointer(bindingIndex, dwordAddress);
@@ -8014,18 +8014,17 @@ public static partial class Gen5SpirvTranslator
                 _ => _vec4Type,
             };
 
-        private uint LoadBufferWord(int binding, uint dwordAddress, bool includeTailPadding = false)
+        private uint LoadBufferWord(int binding, uint dwordAddress)
         {
             // With the device measured to return zero past the end of a descriptor range, the
             // range test, the address clamp and the zero select only reproduce what the read
-            // already does. A padded view still needs the logical bound for full-word
-            // loads; byte assembly can read the padded word and check its bytes later.
-            if (_zeroOutOfBoundsBufferReads && (includeTailPadding || !BufferMayHaveTailPadding(binding)))
+            // already does. The guest expects zero there, and so the load stands alone.
+            if (_zeroOutOfBoundsBufferReads)
             {
                 return Load(_uintType, BufferWordPointer(binding, dwordAddress));
             }
 
-            var inRange = IsBufferWordInRange(binding, dwordAddress, includeTailPadding);
+            var inRange = IsBufferWordInRange(binding, dwordAddress);
             var safeAddress = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -8093,13 +8092,11 @@ public static partial class Gen5SpirvTranslator
             return _module.AddInstruction(SpirvOp.ISub, _uintType, ShiftLeftLogical(BufferWordCount(binding), UInt(2)), padding);
         }
 
-        private uint IsBufferWordInRange(int binding, uint dwordAddress, bool includeTailPadding = false)
-        {
-            var length = !includeTailPadding && BufferMayHaveTailPadding(binding)
-                ? ShiftRightLogical(BufferByteLength(binding), UInt(2))
-                : BufferWordCount(binding);
-            return _module.AddInstruction(SpirvOp.ULessThan, _boolType, dwordAddress, length);
-        }
+        // The hardware range-checks an access by its first byte: a word that starts inside the
+        // guest range is read and written whole, even when the range ends inside it. Runtime
+        // views are padded to whole words, so their word count is exactly that bound.
+        private uint IsBufferWordInRange(int binding, uint dwordAddress) =>
+            _module.AddInstruction(SpirvOp.ULessThan, _boolType, dwordAddress, BufferWordCount(binding));
 
         private uint BufferWordCount(int binding)
         {

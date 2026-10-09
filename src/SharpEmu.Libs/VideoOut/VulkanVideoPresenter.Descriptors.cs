@@ -1082,10 +1082,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
             memoryOffset = (uint)adjustment;
             var range = size + adjustment;
-            // The shader accesses uint[] even for byte/halfword formats. Vulkan's
-            // runtime array length truncates a partial final word, hiding valid bytes.
-            // Keep the byte limit separately in the unused high bits of runtime stride.
-            if (program.Bindings!.UsesRuntimeBufferStrides && (resource.Formatted || !resource.DwordAddressed))
+            // The shader accesses uint[], and Vulkan's runtime array length truncates a partial
+            // final word. The hardware still reads and writes a word that starts inside the
+            // range, so the view is padded to whole words; the byte limit for byte and
+            // formatted elements travels in the unused high bits of the runtime stride.
+            if (program.Bindings!.UsesRuntimeBufferStrides)
             {
                 tailPadding = (uint)((0UL - range) & 3);
                 // Cache buffers span whole pages, so the padded word stays inside the VkBuffer.
