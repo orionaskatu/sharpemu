@@ -139,6 +139,8 @@ public static class PixelStageInputResolver
             PositionZ = (activeInputs & InputPositionZ) != 0,
             PositionW = (activeInputs & InputPositionW) != 0,
             FrontFace = (activeInputs & InputFrontFace) != 0,
+            FrontFaceAllBits = (activeInputs & InputFrontFace) != 0 &&
+                (shaderInterface.BarycentricControl & (1u << 24)) != 0,
             CustomSampleOffsets = (activeInputs & (InputPerspectiveSample | InputLinearSample)) != 0
                 ? customSampleOffsets ?? [] : [],
             SampleShading = pixelShaderIterationSamples is uint iterationCount

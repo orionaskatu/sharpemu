@@ -379,6 +379,35 @@ public sealed class Gen5InterpolationParameterTests
     }
 
     [Theory]
+    [InlineData(false, true, 0x3F800000u)]
+    [InlineData(false, false, 0xBF800000u)]
+    [InlineData(true, true, 1u)]
+    [InlineData(true, false, 0u)]
+    public void FrontFace_UsesTheSelectedEncoding(bool allBits, bool front, uint expected)
+    {
+        var program = ResourceTestProgram.Program(ResourceTestProgram.EndProgram(0));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = 0x1000, PixelInputEnable = 0x1000,
+            PixelFrontFaceAllBits = allBits,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn &&
+            instruction.Operands[2] == (uint)SpirvBuiltIn.FrontFacing).Operands[0];
+        var condition = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Load &&
+            instruction.Operands[2] == input).Operands[1];
+        var select = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Select &&
+            instruction.Operands[2] == condition);
+        var constant = select.Operands[front ? 3 : 4];
+        Assert.Equal(expected, Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Constant &&
+            instruction.Operands[1] == constant).Operands[2]);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
     [InlineData(0x800u, 1)]
     [InlineData(0x400u, 0)]
     public void PositionW_IsTheReciprocalOfTheFragmentCoordinate(uint inputs, int reciprocals)

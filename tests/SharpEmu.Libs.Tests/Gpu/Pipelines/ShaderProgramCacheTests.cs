@@ -16,6 +16,55 @@ namespace SharpEmu.Libs.Tests.Gpu.Pipelines;
 public sealed class ShaderProgramCacheTests : IDisposable
 {
     [Theory]
+    [InlineData(0x1000u, 0u, false)]
+    [InlineData(0x1000u, 0x01000000u, true)]
+    [InlineData(0x1000u, 0xFEFFFFFFu, false)]
+    [InlineData(0u, 0x01000000u, false)]
+    public void FrontFaceEncodingResolvesTheRegisterBitOnlyForAnActiveInput(uint inputs, uint barycentric, bool expected)
+    {
+        _guest.RegisterProgram(CodeA, HeaderA, [0xBF810000]);
+        var source = _guest.Source(CodeA, ShaderStage.Pixel, []);
+        var shaderInterface = new SharpEmu.Libs.Gpu.GpuCommands.Registers.ShaderInterfaceRegisters
+        {
+            PixelInputEnable = inputs, PixelInputAddress = inputs, BarycentricControl = barycentric,
+        };
+        var info = PixelStageInputResolver.Resolve(_guest.Context, source.Registered, shaderInterface,
+            new byte[8], new SharpEmu.Libs.Gpu.Images.ColorComponentMap[8], 0);
+        Assert.Equal(expected, info.FrontFaceAllBits);
+        var cursor = 0u;
+        _guest.Programs.GetOrCompile(source, new StageCompileOptions
+        {
+            PixelInfo = info, PixelInputEnable = inputs, PixelInputAddress = inputs,
+        }, ref cursor, out _);
+        Assert.Equal(expected, Assert.Single(_guest.Compiler.Requests).PixelFrontFaceAllBits);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FrontFaceEncodingSeparatesOnlyProgramsThatReadTheInput(bool active)
+    {
+        _guest.RegisterProgram(CodeA, HeaderA, [0xBF810000]);
+        var source = _guest.Source(CodeA, ShaderStage.Pixel, []);
+        ShaderProgram Compile(bool allBits)
+        {
+            var cursor = 0u;
+            return _guest.Programs.GetOrCompile(source, new StageCompileOptions
+            {
+                PixelInfo = new PixelInputInfo { FrontFace = active, FrontFaceAllBits = allBits },
+                PixelInputEnable = active ? 0x1000u : 0u,
+                PixelInputAddress = active ? 0x1000u : 0u,
+            }, ref cursor, out _);
+        }
+        var sign = Compile(false);
+        var integer = Compile(true);
+        Assert.Equal(!active, sign.Equals(integer));
+        Assert.Equal(sign, Compile(false));
+        Assert.Equal(integer, Compile(true));
+        Assert.Equal(active ? 2 : 1, _guest.Compiler.Requests.Count);
+    }
+
+    [Theory]
     [InlineData(1u, 4)]
     [InlineData(2u, 8)]
     [InlineData(0x10u, 4)]

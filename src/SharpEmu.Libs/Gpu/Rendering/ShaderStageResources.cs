@@ -197,6 +197,7 @@ public sealed class PixelInputInfo
     public bool PositionZ { get; init; }
     public bool PositionW { get; init; }
     public bool FrontFace { get; init; }
+    public bool FrontFaceAllBits { get; init; }
     public bool NoPerspective { get; init; }
     public bool KillEnable { get; init; }
     public bool DepthExportEnable { get; init; }

@@ -169,10 +169,11 @@ public static partial class Gen5SpirvTranslator
             }
         }
 
-        // Front facing reads as 1.0f and back facing as 0, which satisfies both the float greater-than
-        // and the integer not-equal tests compilers emit for it.
+        // SPI_BARYC_CNTL selects sign encoding (+1/-1) or whole-register integer encoding (1/0).
         private uint LoadFrontFaceInput() => _module.AddInstruction(
-            SpirvOp.Select, _uintType, Load(_boolType, _frontFacingInput), UInt(0x3F800000u), UInt(0));
+            SpirvOp.Select, _uintType, Load(_boolType, _frontFacingInput),
+            UInt(_request.PixelFrontFaceAllBits ? 1u : 0x3F800000u),
+            UInt(_request.PixelFrontFaceAllBits ? 0u : 0xBF800000u));
 
         private uint LoadAncillaryInput() =>
             ShiftLeftLogical(Load(_uintType, _ancillaryLayerInput), UInt(16));
@@ -287,10 +288,7 @@ public static partial class Gen5SpirvTranslator
 
             if (_frontFacingInput != 0)
             {
-                // The guest register contains the bits of 1.0f for a front face and zero for a back face.
-                var value = _module.AddInstruction(SpirvOp.Select, _uintType,
-                    Load(_boolType, _frontFacingInput), UInt(0x3F800000u), UInt(0));
-                StoreV(vgpr, value, guardWithExec: false);
+                StoreV(vgpr, LoadFrontFaceInput(), guardWithExec: false);
             }
 
             vgpr++;

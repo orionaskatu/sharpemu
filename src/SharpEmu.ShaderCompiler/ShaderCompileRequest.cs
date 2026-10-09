@@ -256,6 +256,8 @@ public sealed class ShaderCompileRequest
     // MoltenVK advertises fragment shader barycentrics but cannot translate PerVertexKHR to MSL.
     public bool SupportsPerVertexPixelInputs { get; init; } = true;
     public uint PixelInputAddress { get; init; }
+    // SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects integer 1/0 instead of float +1/-1.
+    public bool PixelFrontFaceAllBits { get; init; }
     public IReadOnlyList<uint>? PixelInputCntl { get; init; }
 
     public int RequiredVertexOutputCount { get; init; }

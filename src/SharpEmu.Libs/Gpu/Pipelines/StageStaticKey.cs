@@ -68,6 +68,7 @@ public static class StageStaticKey
         key.Add(Bit(info.PositionZ));
         key.Add(Bit(info.PositionW));
         key.Add(Bit(info.FrontFace));
+        key.Add(Bit(info.FrontFace && info.FrontFaceAllBits));
         key.Add(Bit(info.NoPerspective));
         key.Add(Bit(info.KillEnable));
         key.Add(Bit(info.DepthExportEnable));
