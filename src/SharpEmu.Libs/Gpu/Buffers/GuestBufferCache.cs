@@ -3150,6 +3150,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         newBuffer.CopyFrom(_scheduler.Current, overlap, 0, overlap.CpuAddress - newBuffer.CpuAddress, overlap.Size);
+        _sharedPages.NoteOwnerCopy(overlap, newBuffer, _scheduler.CurrentTick);
+        if (Volatile.Read(ref _shaderWrittenPageCount) != 0)
+        {
+            lock (_shaderWrittenPages)
+            {
+                for (var page = overlap.CpuAddress; page < overlap.CpuAddress + overlap.Size; page += TrackerLayout.PageBytes)
+                {
+                    if (_shaderWrittenPages.TryGetValue(page, out var owner) && ReferenceEquals(owner, overlap))
+                        _shaderWrittenPages[page] = newBuffer;
+                }
+            }
+        }
         DeleteBuffer(overlappingBufferIdentifier);
     }
 

@@ -80,6 +80,22 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
         }
     }
 
+    // The cache copied the entire old buffer into its replacement. Its shared pages retain
+    // the same baseline; treating the replacement as unrelated would upload stale GPU bytes.
+    public void NoteOwnerCopy(object source, object target, ulong tick)
+    {
+        if (Count == 0) return;
+        lock (_gate)
+        {
+            foreach (var shadow in _pages.Values)
+            {
+                if (!ReferenceEquals(shadow.Owner, source)) continue;
+                shadow.Owner = target;
+                shadow.StagedTick = Math.Max(shadow.StagedTick, tick);
+            }
+        }
+    }
+
     // A download wrote GPU bytes into guest memory; on shadowed pages both copies now agree there.
     public void NoteDownloaded(ulong address, ReadOnlySpan<byte> bytes)
     {

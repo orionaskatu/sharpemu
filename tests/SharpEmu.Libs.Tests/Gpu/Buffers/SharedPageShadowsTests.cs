@@ -176,6 +176,28 @@ public sealed class SharedPageShadowsTests
         Assert.False(shadows.Contains(Page + PageBytes));
     }
 
+    [Fact]
+    public void ABufferCopyTransfersTheBaselineAndWaitsForTheCopy()
+    {
+        var old = new object();
+        var replacement = new object();
+        var shadows = new SharedPageShadows(PageBytes, 4);
+        Assert.True(shadows.Adopt(Page, old, Fill(0x11)));
+        shadows.NoteOwnerCopy(old, replacement, tick: 5);
+        var guest = Fill(0x11);
+        guest[40] = 0xAA;
+        var copies = new List<BufferCopy> { new(0, 0, PageBytes) };
+        shadows.FilterUpload(copies, replacement, Page, guest, tick: 5);
+        Assert.Equal([new BufferCopy(40, 40, 1)], copies);
+        var gpu = Fill(0x11);
+        gpu[20] = 0x55;
+        gpu[40] = 0xAA;
+        Assert.Equal(0, shadows.PullGpuWrites(Page, replacement, gpu, guest, 4, (_, _) => { }));
+        Assert.Equal(1, shadows.PullGpuWrites(Page, replacement, gpu, guest, 5, (_, _) => { }));
+        Assert.Equal(0x55, guest[20]);
+        Assert.Equal(0xAA, guest[40]);
+    }
+
     private static byte[] Fill(byte value)
     {
         var bytes = new byte[PageBytes];

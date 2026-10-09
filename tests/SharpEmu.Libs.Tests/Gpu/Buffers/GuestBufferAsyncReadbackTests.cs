@@ -183,6 +183,55 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
+    [Fact]
+    public void GrowingASharedBufferPreservesShaderBytesNotYetReported()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        if (!harness.Cache.UnifiedBuffers)
+        {
+            harness.Shutdown();
+            return;
+        }
+
+        var address = harness.MapBacked(0x40000, ReadWrite);
+        harness.Write(address, Enumerable.Repeat((byte)0x11, 0x1000).ToArray());
+        var (old, offset) = harness.Worker.Run(() =>
+            harness.Cache.ObtainBuffer(address, 0x1000, isWritten: false, requiresDeviceAddress: true));
+        harness.Worker.Run(() =>
+        {
+            old.Fill(offset + 0x100, 0x10, 0x22222222);
+            harness.Scheduler.Wait(harness.Scheduler.Flush());
+            harness.Cache.NoteDeviceAddressWrites(address, 0x1000);
+        });
+        Assert.True(harness.Store.MarkCpuWrite(address + 0x800, 4));
+        harness.Write(address + 0x800, [0xAA, 0xAA, 0xAA, 0xAA]);
+        harness.Worker.Run(() =>
+        {
+            _ = harness.Cache.ObtainBuffer(address, 0x1000, isWritten: false, requiresDeviceAddress: true);
+            harness.Scheduler.Wait(harness.Scheduler.Flush());
+            // The device-address fault callback has not reported this new store yet.
+            old.Fill(offset + 0x200, 0x10, 0x33333333);
+            harness.Scheduler.Wait(harness.Scheduler.Flush());
+        });
+        Assert.Equal(0x11111111u, BitConverter.ToUInt32(harness.Read(address + 0x200, 4)));
+        Assert.True(harness.Store.MarkCpuWrite(address + 0x800, 4));
+        harness.Write(address + 0x800, [0xBB, 0xBB, 0xBB, 0xBB]);
+        var (grown, grownOffset) = harness.Worker.Run(() =>
+        {
+            var result = harness.Cache.ObtainBuffer(address, 0x20000, isWritten: false, requiresDeviceAddress: true);
+            harness.Scheduler.Wait(harness.Scheduler.Flush());
+            return result;
+        });
+        Assert.NotSame(old, grown);
+        var gpu = harness.ReadBack(grown, grownOffset, 0x1000);
+        Assert.Equal(0x22222222u, BitConverter.ToUInt32(gpu, 0x100));
+        Assert.Equal(0x33333333u, BitConverter.ToUInt32(gpu, 0x200));
+        Assert.Equal(0xBBBBBBBBu, BitConverter.ToUInt32(gpu, 0x800));
+        harness.Shutdown();
+    }
+
     private static void GpuWrite(CacheHarness harness, ulong address, uint value) => harness.Worker.Run(() =>
     {
         var (buffer, offset) = harness.Cache.ObtainBuffer(address, 0x100, isWritten: true);
