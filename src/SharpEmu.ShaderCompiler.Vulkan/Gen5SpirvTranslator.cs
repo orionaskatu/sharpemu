@@ -4255,9 +4255,20 @@ public static partial class Gen5SpirvTranslator
             }
         }
 
-        // Check the first and last dwords of the required range together.
+        // A native view can include a partial final word. Check guest byte bounds
+        // before extracting its components; padding is not guest data.
         private uint IsBufferElementInRange(int bindingIndex, uint byteAddress, uint lastByteOffset)
         {
+            if (BufferMayHaveTailPadding(bindingIndex))
+            {
+                var end = IAdd(byteAddress, lastByteOffset);
+                var length = BufferByteLength(bindingIndex);
+                return LogicalAnd(
+                    _module.AddInstruction(SpirvOp.ULessThan, _boolType, byteAddress, length),
+                    LogicalAnd(
+                        _module.AddInstruction(SpirvOp.ULessThan, _boolType, end, length),
+                        _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, end, byteAddress)));
+            }
             var first = IsBufferWordInRange(bindingIndex, ShiftRightLogical(byteAddress, UInt(2)));
             var last = IsBufferWordInRange(
                 bindingIndex,
@@ -4943,8 +4954,8 @@ public static partial class Gen5SpirvTranslator
         {
             var dwordAddress = ShiftRightLogical(byteAddress, UInt(2));
             var bitOffset = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
-            var low = LoadBufferWord(bindingIndex, dwordAddress);
-            var high = LoadBufferWord(bindingIndex, IAdd(dwordAddress, UInt(1)));
+            var low = LoadBufferWord(bindingIndex, dwordAddress, includeTailPadding: true);
+            var high = LoadBufferWord(bindingIndex, IAdd(dwordAddress, UInt(1)), includeTailPadding: true);
             // A shift by the word width is undefined, so the aligned case keeps the low word.
             var spanning = BitwiseOr(
                 ShiftRightLogical(low, bitOffset),
@@ -4970,6 +4981,11 @@ public static partial class Gen5SpirvTranslator
             var raw = BitwiseAnd(
                 LoadUnalignedBufferWord(bindingIndex, byteAddress),
                 UInt(byteCount == 1 ? 0xFFu : 0xFFFFu));
+            if (BufferMayHaveTailPadding(bindingIndex))
+            {
+                raw = _module.AddInstruction(SpirvOp.Select, _uintType,
+                    IsBufferElementInRange(bindingIndex, byteAddress, UInt(byteCount - 1)), raw, UInt(0));
+            }
             if (signExtend)
             {
                 raw = Bitcast(
@@ -5011,10 +5027,16 @@ public static partial class Gen5SpirvTranslator
                 value = ShiftRightLogical(value, UInt(sourceShift));
             }
 
-            StoreBufferElementBits(
-                bindingIndex,
-                byteAddress,
-                [(value, byteCount == 1 ? 0xFFu : 0xFFFFu)]);
+            void StoreBytes() => StoreBufferElementBits(
+                bindingIndex, byteAddress, [(value, byteCount == 1 ? 0xFFu : 0xFFFFu)]);
+            if (BufferMayHaveTailPadding(bindingIndex))
+            {
+                EmitConditional(IsBufferElementInRange(bindingIndex, byteAddress, UInt(byteCount - 1)), StoreBytes);
+            }
+            else
+            {
+                StoreBytes();
+            }
         }
 
         // Stores an element of up to four dwords at any byte alignment. Each touched
@@ -5078,7 +5100,7 @@ public static partial class Gen5SpirvTranslator
                 SpirvOp.LogicalAnd,
                 _boolType,
                 _module.AddInstruction(SpirvOp.INotEqual, _boolType, mask, UInt(0)),
-                IsBufferWordInRange(bindingIndex, dwordAddress));
+                IsBufferWordInRange(bindingIndex, dwordAddress, includeTailPadding: true));
             EmitConditional(touched, () =>
             {
                 var pointer = BufferWordPointer(bindingIndex, dwordAddress);
@@ -7992,17 +8014,18 @@ public static partial class Gen5SpirvTranslator
                 _ => _vec4Type,
             };
 
-        private uint LoadBufferWord(int binding, uint dwordAddress)
+        private uint LoadBufferWord(int binding, uint dwordAddress, bool includeTailPadding = false)
         {
             // With the device measured to return zero past the end of a descriptor range, the
             // range test, the address clamp and the zero select only reproduce what the read
-            // already does. The guest expects zero there, and so the load stands alone.
-            if (_zeroOutOfBoundsBufferReads)
+            // already does. A padded view still needs the logical bound for full-word
+            // loads; byte assembly can read the padded word and check its bytes later.
+            if (_zeroOutOfBoundsBufferReads && (includeTailPadding || !BufferMayHaveTailPadding(binding)))
             {
                 return Load(_uintType, BufferWordPointer(binding, dwordAddress));
             }
 
-            var inRange = IsBufferWordInRange(binding, dwordAddress);
+            var inRange = IsBufferWordInRange(binding, dwordAddress, includeTailPadding);
             var safeAddress = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -8059,23 +8082,37 @@ public static partial class Gen5SpirvTranslator
         private static readonly HashSet<ulong> DbgForceStoreAddresses = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_FORCE_STORE") ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
 
-        private uint IsBufferWordInRange(int binding, uint dwordAddress)
+        private bool BufferMayHaveTailPadding(int binding) =>
+            _request.Bindings.UsesRuntimeBufferStrides &&
+            (_request.Resources.Info.Buffers[binding].Formatted || !_request.Resources.Info.Buffers[binding].DwordAddressed);
+
+        private uint BufferByteLength(int binding)
+        {
+            var packed = LoadShaderDataDword(UInt(_request.Bindings.BufferStrideDword + (uint)binding / 2));
+            var padding = BitwiseAnd(ShiftRightLogical(packed, UInt(((uint)binding % 2) * 16 + 14)), UInt(3));
+            return _module.AddInstruction(SpirvOp.ISub, _uintType, ShiftLeftLogical(BufferWordCount(binding), UInt(2)), padding);
+        }
+
+        private uint IsBufferWordInRange(int binding, uint dwordAddress, bool includeTailPadding = false)
+        {
+            var length = !includeTailPadding && BufferMayHaveTailPadding(binding)
+                ? ShiftRightLogical(BufferByteLength(binding), UInt(2))
+                : BufferWordCount(binding);
+            return _module.AddInstruction(SpirvOp.ULessThan, _boolType, dwordAddress, length);
+        }
+
+        private uint BufferWordCount(int binding)
         {
             var buffer = _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _storageBlockPointer,
                 _globalBuffers,
                 UInt((uint)binding));
-            var length = _module.AddInstruction(
+            return _module.AddInstruction(
                 SpirvOp.ArrayLength,
                 _uintType,
                 buffer,
                 0);
-            return _module.AddInstruction(
-                SpirvOp.ULessThan,
-                _boolType,
-                dwordAddress,
-                length);
         }
 
         private uint BufferWordPointer(int binding, uint dwordAddress) =>

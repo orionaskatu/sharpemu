@@ -46,6 +46,9 @@ public sealed class ShaderPrewarmPresenterTests(HeadlessVulkanFixture fixture) :
         using (var list = ShaderPrewarmList.Open(_directory)!)
         {
             var guest = new PipelineTestGuest(Compile);
+            // Match the presenter's runtime buffer metadata policy before comparing
+            // module identities; formatted bounds also consume the packed tail size.
+            guest.Host.RuntimeBufferStridesEnabled = true;
             guest.Host.ShaderPrewarm = list;
             guest.RegisterProgram(CodeAddress, HeaderAddress, PipelineTestGuest.FormatLoadProgram);
             var cursor = 0u;

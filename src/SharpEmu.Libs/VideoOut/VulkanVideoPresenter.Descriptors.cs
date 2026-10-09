@@ -1051,9 +1051,11 @@ internal static unsafe partial class VulkanVideoPresenter
             ShaderProgramInfo program,
             int slot,
             ResourceSlotIdentifier bufferIdentifier,
-            out uint memoryOffset)
+            out uint memoryOffset,
+            out uint tailPadding)
         {
             memoryOffset = 0;
+            tailPadding = 0;
             var address = descriptor.Address;
             var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal($"A storage buffer descriptor footprint overflows: buffer={slot} hash=0x{program.Hash:X16}.");
             if (address == 0 || requested == 0)
@@ -1079,13 +1081,27 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             memoryOffset = (uint)adjustment;
+            var range = size + adjustment;
+            // The shader accesses uint[] even for byte/halfword formats. Vulkan's
+            // runtime array length truncates a partial final word, hiding valid bytes.
+            // Keep the byte limit separately in the unused high bits of runtime stride.
+            if (program.Bindings!.UsesRuntimeBufferStrides && (resource.Formatted || !resource.DwordAddressed))
+            {
+                tailPadding = (uint)((0UL - range) & 3);
+                // Cache buffers span whole pages, so the padded word stays inside the VkBuffer.
+                if (range > maxRange - tailPadding || alignedOffset + range + tailPadding > buffer.Size)
+                {
+                    throw SubmissionScheduler.Fatal($"A padded storage buffer exceeds the device limit or its cache buffer: buffer={slot} range=0x{range:X} offset=0x{alignedOffset:X} cache_size=0x{buffer.Size:X}.");
+                }
+                range += tailPadding;
+            }
 
             if (resource.Written && !resource.Formatted)
             {
                 _imageCache.InvalidateMemoryCopiesFromGpu(address, size);
             }
 
-            return new BufferView(buffer.Handle, alignedOffset, size + adjustment);
+            return new BufferView(buffer.Handle, alignedOffset, range);
         }
 
         private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program) =>
@@ -1118,6 +1134,10 @@ internal static unsafe partial class VulkanVideoPresenter
             // Reset only packed buffer offsets; dispatch limits follow them in shader data.
             Array.Clear(shaderData, (int)layout.MemoryOffsetDword, (int)((layout.MemoryOffsetCount + 3) / 4));
             var views = prepared.Descriptors.Buffers;
+            if (layout.UsesRuntimeBufferStrides)
+            {
+                Array.Clear(shaderData, (int)layout.BufferStrideDword, (int)layout.BufferStrideDwordCount);
+            }
             if (views.Length != info.Buffers.Count)
             {
                 Scratch.Buffers.Return(views);
@@ -1127,18 +1147,13 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < views.Length; index++)
             {
                 var (descriptor, bufferIdentifier) = prepared.BufferSources[index];
-                views[index] = BindStorageBuffer(in descriptor, info.Buffers[index], program, index, bufferIdentifier, out var memoryOffset);
+                views[index] = BindStorageBuffer(in descriptor, info.Buffers[index], program, index, bufferIdentifier, out var memoryOffset, out var tailPadding);
                 var dword = layout.MemoryOffsetDword + (uint)index / 4;
                 var shift = ((uint)index % 4) * 8;
                 shaderData[dword] |= memoryOffset << (int)shift;
-            }
-
-            if (layout.UsesRuntimeBufferStrides)
-            {
-                Array.Clear(shaderData, (int)layout.BufferStrideDword, (int)layout.BufferStrideDwordCount);
-                for (var index = 0; index < views.Length; index++)
+                if (layout.UsesRuntimeBufferStrides)
                 {
-                    var stride = prepared.BufferSources[index].Descriptor.Stride;
+                    var stride = descriptor.Stride | (tailPadding << 14);
                     shaderData[layout.BufferStrideDword + (uint)index / 2] |= stride << ((index % 2) * 16);
                 }
             }

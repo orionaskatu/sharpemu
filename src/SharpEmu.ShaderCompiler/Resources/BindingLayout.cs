@@ -376,6 +376,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public const uint RenderScaleDwordCount = 5;
 
+    // Two entries per dword: a 14-bit stride followed by a 2-bit count of native
+    // tail-padding bytes. The shader subtracts padding for guest byte bounds.
     public uint BufferStrideDword => MemoryOffsetDword + (MemoryOffsetCount + 3) / 4;
 
     public uint BufferStrideDwordCount => UsesRuntimeBufferStrides ? (MemoryOffsetCount + 1) / 2 : 0;
