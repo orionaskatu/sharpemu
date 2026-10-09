@@ -116,6 +116,9 @@ public readonly struct SamplerDescriptorWords
 
     public bool ForceUnnormalizedCoordinates => ((Fields[0] >> 15) & 0x1) == 1;
 
+    // FILTER_MODE: 0 blends the footprint, 1 takes its minimum, 2 its maximum.
+    public uint FilterMode => (Fields[0] >> 29) & 0x3;
+
     public uint MinLod => (Fields[1] >> 0) & 0xFFF;
 
     public uint MaxLod => (Fields[1] >> 12) & 0xFFF;

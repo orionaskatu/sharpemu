@@ -4166,47 +4166,52 @@ public static partial class Gen5SpirvTranslator
 
         private uint ApplyDppSource(Gen5DppControl control, uint value)
         {
+            var sourceValid = GetDppSourceValid(control, out var safeTarget);
+            var shuffled = ShuffleGuestLaneOrSelf(value, safeTarget, out _);
+            return _module.AddInstruction(
+                SpirvOp.Select,
+                _uintType,
+                sourceValid,
+                shuffled,
+                UInt(0));
+        }
+
+        // A DPP16 source lane is valid when it lies in the row and, without FETCH_INACTIVE,
+        // is active: valid = in_row && (exec[src] || fi). An invalid source reads zero, and
+        // writes only with BOUND_CTRL (see IsDppWriteEnabled).
+        private uint GetDppSourceValid(Gen5DppControl control, out uint safeTarget)
+        {
             GetDppSourceLane(control, out var targetLane, out var inRange);
             var lane = GuestWaveLane();
-            var safeTarget = _module.AddInstruction(
+            safeTarget = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
                 inRange,
                 targetLane,
                 lane);
-            // Mask to guest wave size (32 or 64 lanes) — on Radeon hardware, DPP 
-            // operations are limited to a single half-wave for some encodings, so we 
-            // must not clamp wave64 lanes to 31; use the full lane mask instead.
+            // Mask to guest wave size (32 or 64 lanes); a DPP16 row never crosses 16 lanes.
             safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 ? 63u : 31u));
-            var shuffled = ShuffleGuestLaneOrSelf(value, safeTarget, out var sourcePresent);
-
-            var sourceAvailable = inRange;
-            if (!control.FetchInactive)
+            if (control.FetchInactive)
             {
-                var activeWord = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    Load(_boolType, _exec),
-                    UInt(1),
-                    UInt(0));
-                var shuffledActive = ShuffleGuestLaneOrSelf(activeWord, safeTarget, out _);
-                sourceAvailable = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    sourceAvailable,
-                    _module.AddInstruction(
-                        SpirvOp.LogicalOr,
-                        _boolType,
-                        LogicalNot(sourcePresent),
-                        IsNotZero(shuffledActive)));
+                return inRange;
             }
 
-            return _module.AddInstruction(
+            var activeWord = _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                sourceAvailable,
-                shuffled,
+                Load(_boolType, _exec),
+                UInt(1),
                 UInt(0));
+            var shuffledActive = ShuffleGuestLaneOrSelf(activeWord, safeTarget, out var sourcePresent);
+            return _module.AddInstruction(
+                SpirvOp.LogicalAnd,
+                _boolType,
+                inRange,
+                _module.AddInstruction(
+                    SpirvOp.LogicalOr,
+                    _boolType,
+                    LogicalNot(sourcePresent),
+                    IsNotZero(shuffledActive)));
         }
 
         private uint ApplySdwaDestination(
@@ -4360,12 +4365,13 @@ public static partial class Gen5SpirvTranslator
             };
         }
 
+        // write = row_mask[lane >> 4] && bank_mask[(lane >> 2) & 3] && (valid || bound_ctrl):
+        // each bank-mask bit covers four consecutive lanes of a row (bit 3 = lanes 12-15).
         private uint IsDppWriteEnabled(Gen5DppControl control)
         {
-            GetDppSourceLane(control, out _, out var inRange);
             var lane = GuestWaveLane();
             var row = ShiftRightLogical(lane, UInt(4));
-            var bank = BitwiseAnd(lane, UInt(3));
+            var bank = BitwiseAnd(ShiftRightLogical(lane, UInt(2)), UInt(3));
             var rowEnabled = IsNotZero(BitwiseAnd(
                 UInt(control.RowMask),
                 ShiftLeftLogical(UInt(1), row)));
@@ -4374,7 +4380,7 @@ public static partial class Gen5SpirvTranslator
                 ShiftLeftLogical(UInt(1), bank)));
             var sourceAllowsWrite = control.BoundControl
                 ? _module.ConstantBool(true)
-                : inRange;
+                : GetDppSourceValid(control, out _);
             return _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -5326,6 +5332,7 @@ public static partial class Gen5SpirvTranslator
             targetLane = BitwiseAnd(targetLane, UInt(_waveLaneCount == 64 ? 63u : 31u));
             var shuffled = ShuffleGuestLaneOrSelf(value, targetLane, out var sourcePresent);
             var fetchInactive = (control.OperandSelect & 1) != 0;
+            var boundControl = (control.OperandSelect & 2) != 0;
             if (fetchInactive)
             {
                 return shuffled;
@@ -5339,6 +5346,8 @@ public static partial class Gen5SpirvTranslator
                 UInt(0));
             var sourceActive = IsNotZero(
                 ShuffleGuestLaneOrSelf(activeWord, targetLane, out _));
+            // An inactive source reads zero with BOUND_CTRL; without it the lane keeps its
+            // old destination value (the intrinsic's `old` operand).
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
@@ -5348,7 +5357,9 @@ public static partial class Gen5SpirvTranslator
                     LogicalNot(sourcePresent),
                     sourceActive),
                 shuffled,
-                UInt(0));
+                boundControl || instruction.Destinations.Count == 0
+                    ? UInt(0)
+                    : LoadV(instruction.Destinations[0].Value));
         }
 
         private uint GetInt16Source(Gen5ShaderInstruction instruction, int sourceIndex, bool signed)

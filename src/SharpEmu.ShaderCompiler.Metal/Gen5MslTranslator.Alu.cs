@@ -635,7 +635,7 @@ public static partial class Gen5MslTranslator
         {
             var (_, inRange) = EmitDppSourceLane(control);
             var rowEnabled = $"(({control.RowMask}u >> (sharpemu_lane >> 4)) & 1u) != 0u";
-            var bankEnabled = $"(({control.BankMask}u >> (sharpemu_lane & 3u)) & 1u) != 0u";
+            var bankEnabled = $"(({control.BankMask}u >> ((sharpemu_lane >> 2u) & 3u)) & 1u) != 0u";
             var sourceAllows = control.BoundControl ? "true" : inRange;
             return Temp("bool", $"({rowEnabled}) && ({bankEnabled}) && ({sourceAllows})");
         }

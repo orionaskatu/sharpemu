@@ -56,6 +56,8 @@ public sealed unsafe class SamplerStore : IDisposable
 
     public SamplerStore(GpuDeviceInfo device) => _device = device;
 
+    private bool _warnedMinmax;
+
     public int Count => _samplers.Count;
 
     public Sampler GetSampler(in SamplerDescriptorWords words, bool integerView)
@@ -187,6 +189,31 @@ public sealed unsafe class SamplerStore : IDisposable
             info.MaxAnisotropy = 1.0f;
             info.CompareEnable = false;
             info.MipLodBias = 0.0f;
+        }
+
+        // A min/max reduction replaces the weighted average of the footprint: depth pyramids
+        // downsample with one bilinear min fetch, which averaging makes non-conservative.
+        var reduction = new SamplerReductionModeCreateInfo
+        {
+            SType = StructureType.SamplerReductionModeCreateInfo,
+            ReductionMode = words.FilterMode switch
+            {
+                1 => SamplerReductionMode.Min,
+                2 => SamplerReductionMode.Max,
+                _ => SamplerReductionMode.WeightedAverage,
+            },
+        };
+        if (reduction.ReductionMode != SamplerReductionMode.WeightedAverage && !integerView && !info.CompareEnable)
+        {
+            if (_device.SamplerFilterMinmaxSupported)
+            {
+                info.PNext = &reduction;
+            }
+            else if (!_warnedMinmax)
+            {
+                _warnedMinmax = true;
+                Console.Error.WriteLine($"[LOADER][WARN] A min/max sampler reduction is approximated by averaging: mode={words.FilterMode}.");
+            }
         }
 
         var result = _device.Vk.CreateSampler(_device.Device, &info, null, out var sampler);
