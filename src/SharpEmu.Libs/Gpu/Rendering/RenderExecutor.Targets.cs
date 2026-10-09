@@ -3,6 +3,7 @@
 
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
+using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 
@@ -337,9 +338,12 @@ public sealed partial class RenderExecutor
     private static readonly string? DbgDropPs = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DROP_PS"); // TEMP
     private static int _dbgDropLogs; // TEMP
 
-    internal static bool IsUnwrittenColorTarget(ContextRegisters context, uint slot, ColorComponentMap exportMapping, uint pixelColorExportMasks) =>
-        exportMapping.ApplyMask(context.RenderTargetMaskForSlot(slot)) == 0 ||
-        ((pixelColorExportMasks >> (int)(slot * 4)) & 0xFu) == 0;
+    internal static bool IsUnwrittenColorTarget(ContextRegisters context, uint slot, ColorComponentMap exportMapping, uint pixelColorExportMasks)
+    {
+        var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, slot);
+        return exportMapping.ApplyMask(context.RenderTargetMaskForSlot(slot)) == 0 ||
+            exportTarget < 0 || ((pixelColorExportMasks >> (exportTarget * 4)) & 0xFu) == 0;
+    }
 
     // Acquires every attachment through the host and assembles the rendering scope.
     private RenderingState AcquireAttachments(ref DrawState state, ContextRegisters context)

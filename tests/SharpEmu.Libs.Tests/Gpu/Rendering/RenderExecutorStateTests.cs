@@ -402,6 +402,57 @@ public sealed class RenderExecutorStateTests : IDisposable
         Assert.Equal((expectedColors, expectedExtent, expectedExtent), (rendering.ColorAttachmentCount, rendering.Width, rendering.Height));
     }
 
+    [Theory]
+    [InlineData(0xFu, 0xF000Fu, 1u, 64u, true, false)]
+    [InlineData(0xF0u, 0xF000Fu, 1u, 32u, false, true)]
+    [InlineData(0xFFu, 0xF000Fu, 2u, 32u, true, true)]
+    [InlineData(0xF0000u, 0xF000Fu, 0u, 64u, false, false)]
+    [InlineData(0u, 0xF000Fu, 0u, 64u, false, false)]
+    [InlineData(0xF0u, 0xFu, 0u, 64u, false, false)]
+    public void Attachments_DepthPassRetainsOnlyTargetsFedByWrittenExports(
+        uint exportMasks, uint targetMask, uint expectedColors, uint expectedExtent,
+        bool expectedSlotZero, bool expectedSlotFour)
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorTargets[4] = RegisterWords.Color(SecondColorBase, 32, 32);
+        banks.Context.RenderTargetMask = targetMask;
+        // Formatted MRT0/MRT1 feed enabled CB slots0/4 respectively.
+        banks.Context.ShaderInterface.ColorShaderMask = 0xF000F;
+        banks.Context.ShaderInterface.TargetOutputModes[0] = 4;
+        banks.Context.ShaderInterface.TargetOutputModes[1] = 4;
+        _pipelines.Graphics = Programs(pixelStage: Stage(new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Pixel,
+            PixelColorExportMasks = exportMasks,
+        }));
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var rendering = Assert.Single(_host.BegunRenderings);
+        Assert.Equal((expectedColors, expectedExtent, expectedExtent),
+            (rendering.ColorAttachmentCount, rendering.Width, rendering.Height));
+        Assert.Equal(expectedSlotZero, _host.Calls.Any(call => call.StartsWith("acquire_color 0 ", StringComparison.Ordinal)));
+        Assert.Equal(expectedSlotFour, _host.Calls.Any(call => call.StartsWith("acquire_color 4 ", StringComparison.Ordinal)));
+        Assert.Contains($"create_graphics_pipeline colors={expectedColors} depth=True topology=TriangleList restart=False", _pipelines.Calls);
+    }
+
+    [Fact]
+    public void Attachments_DepthPassDropsATargetThatNoFormattedExportReaches()
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorTargets[2] = RegisterWords.Color(SecondColorBase, 32, 32);
+        banks.Context.RenderTargetMask = 0xF00;
+        banks.Context.ShaderInterface.ColorShaderMask = 0xF000F;
+        banks.Context.ShaderInterface.TargetOutputModes[0] = 4;
+        banks.Context.ShaderInterface.TargetOutputModes[1] = 4;
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var rendering = Assert.Single(_host.BegunRenderings);
+        Assert.Equal((0u, 64u, 64u), (rendering.ColorAttachmentCount, rendering.Width, rendering.Height));
+        Assert.DoesNotContain(_host.Calls, call => call.StartsWith("acquire_color ", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Attachments_AColorTargetWithoutAnActivePixelShaderIsDroppedFromTheDepthPass()
     {
