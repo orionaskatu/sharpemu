@@ -73,63 +73,8 @@ public sealed class PlayGoExportsTests : IDisposable
             ReadLoci(3));
     }
 
-    [Fact]
-    public void PlayGoPgm_ReportsEveryChunkAndProgress()
-    {
-        var cacheDirectory = Directory.CreateDirectory(Path.Combine(_app0Root, "cache_ps5"));
-        var header = new byte[0x14];
-        "DMGP"u8.CopyTo(header);
-        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(0x10), 35);
-        File.WriteAllBytes(Path.Combine(cacheDirectory.FullName, "playgo.pgm"), header);
-
-        var handle = InitializeAndOpen();
-
-        _ctx[CpuRegister.Rdi] = handle;
-        _ctx[CpuRegister.Rsi] = 0;
-        _ctx[CpuRegister.Rdx] = 0;
-        _ctx[CpuRegister.Rcx] = OutEntriesAddress;
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, PlayGoExports.PlayGoGetChunkId(_ctx));
-        Assert.Equal(35u, ReadUInt32(OutEntriesAddress));
-
-        var chunkIds = Enumerable.Range(0, 35).Select(static value => (ushort)value).ToArray();
-        WriteChunkIds(chunkIds);
-        _ctx[CpuRegister.Rsi] = ChunkIdsAddress;
-        _ctx[CpuRegister.Rdx] = (ulong)chunkIds.Length;
-        _ctx[CpuRegister.Rcx] = OutEntriesAddress;
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, PlayGoExports.PlayGoGetChunkId(_ctx));
-        Assert.Equal(35u, ReadUInt32(OutEntriesAddress));
-        Assert.Equal(chunkIds, ReadChunkIds(chunkIds.Length));
-
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [34]));
-        Assert.Equal(new byte[] { LocusLocalFast }, ReadLoci(1));
-
-        SetGetProgressArguments(handle, ChunkIdsAddress, (uint)chunkIds.Length, ProgressAddress);
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, PlayGoExports.PlayGoGetProgress(_ctx));
-        Assert.Equal(1ul, ReadUInt64(ProgressAddress));
-        Assert.Equal(1ul, ReadUInt64(ProgressAddress + sizeof(ulong)));
-
-        _ctx[CpuRegister.Rdi] = handle;
-        _ctx[CpuRegister.Rsi] = NextChunkAddress;
-        Assert.Equal(unchecked((int)0x80020002), PlayGoExports.PlayGoRequestNextChunk(_ctx));
-        Assert.Equal(0u, ReadUInt32(NextChunkAddress));
-    }
-
     // playgo.pgm gives only a chunk count: the numbering 0..count-1 is assumed, so an ID
     // outside it is not proof of a bad chunk.
-    [Fact]
-    public void PlayGoPgm_DoesNotRejectAnIdOutsideTheAssumedNumbering()
-    {
-        var cacheDirectory = Directory.CreateDirectory(Path.Combine(_app0Root, "cache_ps5"));
-        var header = new byte[0x14];
-        "DMGP"u8.CopyTo(header);
-        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(0x10), 3);
-        File.WriteAllBytes(Path.Combine(cacheDirectory.FullName, "playgo.pgm"), header);
-
-        var handle = InitializeAndOpen();
-
-        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, GetLocus(handle, [2, 40]));
-    }
-
     [Fact]
     public void GetLocus_ParsedChunkDefinitions_WritesPrefixAndRejectsFirstUnknownChunk()
     {

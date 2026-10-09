@@ -14,12 +14,14 @@ using System.Threading;
 using System.Runtime.InteropServices;
 using System.Linq;
 using System.Globalization;
+using System.Security.Cryptography;
 
 namespace SharpEmu.Libs.Kernel;
 
 public static partial class KernelMemoryCompatExports
 {
     private const int MaxGuestStringLength = 4096;
+    internal const FileShare GuestFileShare = FileShare.ReadWrite | FileShare.Delete;
     private const int WideCharSize = sizeof(ushort);
     private const int MemsetChunkSize = 16 * 1024;
     private static readonly byte[] _zeroChunk = new byte[MemsetChunkSize];
@@ -96,7 +98,7 @@ public static partial class KernelMemoryCompatExports
 
     private static readonly object _fdGate = new();
     private static readonly Dictionary<int, FileStream> _openFiles = new();
-    private static readonly HashSet<int> _entropyDevices = new();
+    private static readonly HashSet<int> _randomDeviceDescriptors = new();
     private static readonly Dictionary<int, HostMovieBridge.BinkGuestCompletionShim>
         _binkGuestCompletionShims = new();
     private static readonly Dictionary<int, string> _observedBinkGuestFiles = new();
@@ -1440,7 +1442,9 @@ public static partial class KernelMemoryCompatExports
         ExportName = "_open",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
-    public static int KernelOpenUnderscore(CpuContext ctx)
+    public static int KernelOpenUnderscore(CpuContext ctx) => PosixOpen(ctx);
+
+    internal static int KernelOpenCore(CpuContext ctx)
     {
         var pathAddress = ctx[CpuRegister.Rdi];
         var flags = unchecked((int)ctx[CpuRegister.Rsi]);
@@ -1451,19 +1455,16 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (guestPath is "/dev/urandom" or "/dev/random")
+        if (IsRandomDevicePath(guestPath) && (flags & O_DIRECTORY) == 0)
         {
-            // These character devices provide entropy, not mounted host files.
-            // Only read-only opens are currently supported.
-            if (ResolveOpenAccess(flags) != FileAccess.Read ||
-                (flags & (O_CREAT | O_TRUNC | O_APPEND | O_DIRECTORY)) != 0)
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+            var randomFd = (int)Interlocked.Increment(ref _nextFileDescriptor);
             lock (_fdGate)
             {
-                var entropyFd = (int)Interlocked.Increment(ref _nextFileDescriptor);
-                _entropyDevices.Add(entropyFd);
-                ctx[CpuRegister.Rax] = unchecked((ulong)entropyFd);
+                _randomDeviceDescriptors.Add(randomFd);
             }
+
+            LogOpenTrace($"_open random-device path='{guestPath}' flags=0x{flags:X8} fd={randomFd}");
+            ctx[CpuRegister.Rax] = unchecked((ulong)randomFd);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
@@ -1536,7 +1537,7 @@ public static partial class KernelMemoryCompatExports
             }
 
             EnsureOpenParentDirectoryExists(guestPath, hostPath, flags);
-            var stream = new FileStream(hostPath, mode, access, FileShare.ReadWrite);
+            var stream = new FileStream(hostPath, mode, access, GuestFileShare);
             if ((flags & O_APPEND) != 0)
             {
                 stream.Seek(0, SeekOrigin.End);
@@ -1694,11 +1695,11 @@ public static partial class KernelMemoryCompatExports
     }
 
     // POSIX open(2): translates a failed raw open into -1/errno. On success
-    // KernelOpenUnderscore already writes the fd into RAX (the import bridge
+    // KernelOpenCore already writes the fd into RAX (the import bridge
     // prefers a written RAX over the return value), so returning 0 is correct.
     public static int PosixOpen(CpuContext ctx)
     {
-        var result = KernelOpenUnderscore(ctx);
+        var result = KernelOpenCore(ctx);
         return result == (int)OrbisGen2Result.ORBIS_GEN2_OK
             ? 0
             : PosixFailure(ctx, result);
@@ -1751,7 +1752,8 @@ public static partial class KernelMemoryCompatExports
             {
                 // Stop at the first miss and report its index.
                 // The caller can then use its normal file-open fallback.
-                LogIoTrace("apr_resolve", guestPath, $"host='{hostPath}' index={i} count={count} result=not_found");
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] sceKernelAprResolveFilepathsToIdsAndFileSizes: '{guestPath}' -> '{hostPath}' not found (index {i} of {count})");
                 if (sizesAddress != 0 &&
                     !TryWriteUInt64Compat(ctx, sizesAddress + (i * sizeof(ulong)), 0))
                 {
@@ -2271,12 +2273,12 @@ public static partial class KernelMemoryCompatExports
         string? observedBinkPath = null;
         lock (_fdGate)
         {
-            if (_entropyDevices.Remove(fd))
+            if (_randomDeviceDescriptors.Remove(fd))
             {
                 ctx[CpuRegister.Rax] = 0;
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
-            if (_openFiles.Remove(fd, out stream))
+            else if (_openFiles.Remove(fd, out stream))
             {
                 _binkGuestCompletionShims.Remove(fd);
                 if (_observedBinkGuestFiles.Remove(fd, out observedBinkPath))
@@ -2329,17 +2331,23 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
+        bool isRandomDevice;
         lock (_fdGate)
         {
-            if (_entropyDevices.Contains(fd))
+            isRandomDevice = _randomDeviceDescriptors.Contains(fd);
+        }
+
+        if (isRandomDevice)
+        {
+            var randomBytes = GC.AllocateUninitializedArray<byte>(requested);
+            RandomNumberGenerator.Fill(randomBytes);
+            if (!ctx.Memory.TryWrite(bufferAddress, randomBytes))
             {
-                var bytes = GC.AllocateUninitializedArray<byte>(requested);
-                System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
-                if (!TryWriteCompat(ctx, bufferAddress, bytes))
-                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-                ctx[CpuRegister.Rax] = unchecked((ulong)requested);
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
+
+            ctx[CpuRegister.Rax] = unchecked((ulong)requested);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
         if (KernelSocketCompatExports.TryReadSocketFd(
@@ -2889,13 +2897,21 @@ public static partial class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
             }
 
-            var searchStart = searchStartRaw < 0 ? 0UL : (ulong)searchStartRaw;
-            var searchEnd = searchEndRaw <= 0
-                ? GuestMemoryLayout.DirectBytes
-                : Math.Min((ulong)searchEndRaw, GuestMemoryLayout.DirectBytes);
-            if (searchStart >= searchEnd)
+            if (!ctx.TryWriteUInt64(outAddress, 0) || !ctx.TryWriteUInt64(outSize, 0))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            if (searchStartRaw < 0 || searchEndRaw < 0)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+            }
+
+            var searchStart = (ulong)searchStartRaw;
+            var searchEnd = Math.Min((ulong)searchEndRaw, GuestMemoryLayout.DirectBytes);
+            if (searchStart >= searchEnd)
+            {
+                return MemoryNoSpace;
             }
 
             bool foundSpan;
@@ -2913,7 +2929,7 @@ public static partial class KernelMemoryCompatExports
 
             if (!foundSpan)
             {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+                return MemoryNoSpace;
             }
 
             if (!ctx.TryWriteUInt64(outAddress, candidate) || !ctx.TryWriteUInt64(outSize, rangeAvailable))
@@ -6994,15 +7010,14 @@ public static partial class KernelMemoryCompatExports
 
         string? hostPath = null;
         bool isDirectory = false;
+        bool isRandomDevice = false;
         lock (_fdGate)
         {
-            if (_entropyDevices.Contains(fd))
+            if (_randomDeviceDescriptors.Contains(fd))
             {
-                return TryWriteKernelStat(ctx, statAddress, isDirectory: false, size: 0,
-                    DateTime.UnixEpoch, DateTime.UnixEpoch, DateTime.UnixEpoch,
-                    "entropy-device", modeOverride: 0x2124);
+                isRandomDevice = true;
             }
-            if (_openDirectories.TryGetValue(fd, out var directory))
+            else if (_openDirectories.TryGetValue(fd, out var directory))
             {
                 hostPath = directory.Path;
                 isDirectory = true;
@@ -7011,6 +7026,14 @@ public static partial class KernelMemoryCompatExports
             {
                 hostPath = stream.Name;
             }
+        }
+
+        if (isRandomDevice)
+        {
+            var now = DateTime.UtcNow;
+            LogIoTrace("fstat", "/dev/urandom", $"fd={fd} size=0 device=random");
+            return TryWriteKernelStat(ctx, statAddress, isDirectory: false, size: 0,
+                now, now, now, "/dev/urandom");
         }
 
         if (!string.IsNullOrWhiteSpace(hostPath))
@@ -7033,6 +7056,10 @@ public static partial class KernelMemoryCompatExports
 
         return !string.IsNullOrWhiteSpace(hostPath) && TryWriteHostPathStat(ctx, statAddress, hostPath!, isDirectory);
     }
+
+    private static bool IsRandomDevicePath(string path) =>
+        string.Equals(path, "/dev/random", StringComparison.Ordinal) ||
+        string.Equals(path, "/dev/urandom", StringComparison.Ordinal);
 
     private static bool TryWriteHostPathStat(CpuContext ctx, ulong statAddress, string hostPath)
     {

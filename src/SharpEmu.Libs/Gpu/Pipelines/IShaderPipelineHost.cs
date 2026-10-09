@@ -55,6 +55,7 @@ internal interface IShaderPipelineHost
     // so the stride leaves the permutation key.
     bool RuntimeBufferStridesEnabled => false;
     bool UsesBindlessImages => false;
+    bool ShaderSignedZeroInfNanPreserveFloat32Supported => false;
     bool ExecGuardElisionEnabled => true;
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;

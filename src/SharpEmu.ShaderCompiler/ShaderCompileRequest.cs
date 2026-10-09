@@ -214,6 +214,8 @@ public sealed class ShaderCompileRequest
     // zero select around it exist only to produce the zero the device already returns. Default
     // false, because an out-of-range read is undefined without that promise.
     public bool ZeroOutOfBoundsBufferReads { get; init; }
+
+    public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
     public Gen5HullDispatch? HullDispatch { get; init; }
     public Gen5DomainGrid? DomainGrid { get; init; }

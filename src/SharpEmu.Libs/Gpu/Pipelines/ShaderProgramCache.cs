@@ -667,6 +667,7 @@ internal sealed class ShaderProgramCache
         var nonUniformImageIndexing = _host.NonUniformImageIndexingEnabled;
         var nativeHalfConversion = _host.NativeHalfConversionExact;
         var zeroOutOfBoundsReads = _host.ZeroOutOfBoundsBufferReads;
+        var signedZeroInfNanPreserve = _host.ShaderSignedZeroInfNanPreserveFloat32Supported;
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
@@ -686,6 +687,7 @@ internal sealed class ShaderProgramCache
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     NativeHalfConversionExact = nativeHalfConversion,
                     ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
+                    ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
                     PositionExportControl = info.PositionExportControl,
@@ -720,6 +722,7 @@ internal sealed class ShaderProgramCache
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     NativeHalfConversionExact = nativeHalfConversion,
                     ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
+                    ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     PixelOutputs = options.PixelOutputs,
                     EarlyFragmentTests = info.EarlyDepth,
                     PixelShaderSampleExclusionMask = info.EarlyDepth ? info.ShaderSampleExclusionMask : 0u,
@@ -754,6 +757,7 @@ internal sealed class ShaderProgramCache
                     SupportsNonUniformImageIndexing = nonUniformImageIndexing,
                     NativeHalfConversionExact = nativeHalfConversion,
                     ZeroOutOfBoundsBufferReads = zeroOutOfBoundsReads,
+                    ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     ComputeSystemRegisters = options.ComputeSystemRegisters,
                     LocalDataShareDwords = info.LocalDataShareDwords,
                     LocalSizeX = Math.Max(info.ThreadsX, 1),
@@ -803,6 +807,7 @@ internal sealed class ShaderProgramCache
             SupportsExactFloat16Conversions = host.ExactFloat16ConversionsEnabled,
             FastFloat16Arithmetic = host.ExactFloat16ConversionsEnabled && !ExactFloat16Arithmetic,
             SupportsNonUniformImageIndexing = host.NonUniformImageIndexingEnabled,
+            ShaderSignedZeroInfNanPreserveFloat32Supported = host.ShaderSignedZeroInfNanPreserveFloat32Supported,
             ComputeSystemRegisters = systemRegisters,
             LocalDataShareDwords = info.LocalDataShareDwords,
             LocalSizeX = Math.Max(info.ThreadsX, 1),
