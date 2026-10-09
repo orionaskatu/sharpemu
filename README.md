@@ -6,9 +6,12 @@
 > It'll probably break other games.
 
 > [!NOTE]
-> Based on the **great work** done by:
+> Based on the **great work** by:
+> 
 > **foufouadi**: https://github.com/foufouadi/sharpemu/tree/yotei-rendering
+> 
 > **fxpw**: https://github.com/fxpw/KytyPS5/tree/yotei-windows-bringup
+> 
 > **Celegans12**: https://github.com/boykopovar/AnyPS5/discussions/675
 
 Current status:
