@@ -733,13 +733,9 @@ public static class ResourceMaterializer
         }
         // Bound 1, from the shader: a selector it clamps or masks reaches exactly
         // selector * stride + offset for selector in [0, bound].
-        // Bound 2, from the table: the material V# holds size / stride records and the hardware
-        // reads zero (key 0, always probed) past them, so the reachable record offsets are
-        // offset + k * stride inside the table. Absent a proven bound, the exhaustive
-        // enumeration of every residue + k * step (the product wraps modulo 2^32) stays exact
-        // while it fits the cap; past it the table bound applies, which treats a selector as a
-        // record index rather than one wrapping the 32-bit product. If even that exceeds the
-        // cap the plan fails.
+        // Absent a proven bound, the exhaustive enumeration of every residue + k * step (the
+        // product wraps modulo 2^32 for an unbounded selector) stays exact while it fits the
+        // cap. Material-table size does not bound the selector, so past the cap the plan fails.
         IEnumerable<ulong> offsets;
         if (provenOffsets is not null)
         {
@@ -773,18 +769,8 @@ public static class ResourceMaterializer
         }
         else
         {
-            var records = indirect.SelectorOffset <= limit ? (limit - indirect.SelectorOffset) / indirect.SelectorStride + 1 : 0;
-            if (records > MaxIndirectImageProbes)
-            {
-                return Detail($"indirect image {Hex(image.FirstUsePc)}: no selector clamp and the material table holds {records} records, over {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
-            }
-
-            if (diagnostic is not null)
-            {
-                diagnostic.SelectionMode = "table_bounded";
-            }
-
-            offsets = Enumerable.Range(0, (int)records).Select(index => indirect.SelectorOffset + (ulong)index * indirect.SelectorStride);
+            // Material-table size does not bound the selector before the wrapping 32-bit product.
+            return Detail($"indirect image {Hex(image.FirstUsePc)}: {probeCount} unbounded selector probes exceed {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
         }
 
         var keys = new List<uint> { 0 };

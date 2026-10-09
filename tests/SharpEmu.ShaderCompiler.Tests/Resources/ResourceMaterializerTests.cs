@@ -198,8 +198,8 @@ public sealed class ResourceMaterializerTests
 
     // A 116-byte-stride material table with a selector offset of 4: the exhaustive probe step is
     // 4 bytes, so a table of 2260+ records exceeds the probe cap. Keys 1 and 2 sit at record
-    // aligned offsets (4 + 116 * 3 and 4 + 116 * 2000); key 3 is a poison value at a misaligned
-    // offset (4 + 116 * 10 + 8) that only the exhaustive enumeration can reach.
+    // aligned offsets (4 + 116 * 3 and 4 + 116 * 2000); key 3 is at a misaligned offset
+    // (4 + 116 * 10 + 8) reachable through wrapped selector arithmetic.
     private const uint AlignedStride = 116;
     private const uint AlignedKeyOneOffset = 4 + AlignedStride * 3;
     private const uint AlignedKeyTwoOffset = 4 + AlignedStride * 2000;
@@ -239,32 +239,62 @@ public sealed class ResourceMaterializerTests
         return (plan, Inputs(userData, readCleanMemory: memory.Read), heap);
     }
 
+    [Fact]
+    public void UnboundedSelectorPastTheProbeCapPreservesReachableWrappedOffsets()
+    {
+        // The shader multiplies and adds in 32 bits. A selector outside the record range
+        // can therefore wrap to a readable offset that is not record aligned.
+        const uint wrappedSelector = 518358132;
+        var wrappedOffset = unchecked(wrappedSelector * AlignedStride + 4u);
+        Assert.Equal(MisalignedKeyThreeOffset, wrappedOffset);
+        Assert.NotEqual(0u, (wrappedOffset - 4u) % AlignedStride);
+
+        var (plan, smallerInputs, heap) = RecordAlignedTable(2259);
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(plan, smallerInputs, ref snapshot, ref specialization));
+        Assert.Contains(snapshot.Images, image => image.SequenceEqual(heap[3]));
+        var previousSnapshot = snapshot;
+        var previousSpecialization = specialization;
+
+        var (_, expandedInputs, _) = RecordAlignedTable(2260);
+        Assert.False(ResourceMaterializer.Materialize(plan, expandedInputs, ref snapshot, ref specialization,
+            out var failureKind));
+        Assert.Equal(ResourceMaterializationFailure.Other, failureKind);
+        Assert.Contains("unbounded selector probes exceed 65536", ResourceMaterializer.LastFailureDetail);
+        Assert.Same(previousSnapshot, snapshot);
+        Assert.Same(previousSpecialization, specialization);
+    }
+
     // 2259 records keep the exhaustive probe count under the cap (65512 offsets, step 4): the
-    // misaligned key is found as before. 2260 records exceed it (65541) and probe only the
-    // record-aligned offsets instead of failing.
+    // misaligned key must be found. 2260 records exceed it (65541) and require a selector proof.
     [Theory]
     [InlineData(2259u, true)]
     [InlineData(2260u, false)]
-    public void UnclampedSelectorProbesTheTableRecordsOnlyPastTheCap(uint records, bool exhaustive)
+    public void UnboundedSelectorProbesRequireExhaustiveOffsetsOrFail(uint records, bool exhaustive)
     {
         var (plan, inputs, heap) = RecordAlignedTable(records);
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
 
-        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
-        Assert.Equal(exhaustive ? 4 : 3, snapshot.Images.Length);
-        for (var key = 0; key < 3; key++)
+        Assert.Equal(exhaustive, ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+        if (!exhaustive)
+        {
+            Assert.Empty(snapshot.Images);
+            return;
+        }
+
+        Assert.Equal(4, snapshot.Images.Length);
+        for (var key = 0; key < 4; key++)
         {
             Assert.Contains(snapshot.Images, image => image.SequenceEqual(heap[key]));
         }
-
-        Assert.Equal(exhaustive, snapshot.Images.Any(image => image.SequenceEqual(heap[3])));
     }
 
     [Theory]
     [InlineData(2259u, false)]
     [InlineData(2260u, true)]
-    public void TableBoundedProbeReportsTheProbedOffsets(uint records, bool fallback)
+    public void UnboundedSelectorFailureReportsOnlyExhaustivelyProbedOffsets(uint records, bool exceedsCap)
     {
         var (plan, inputs, _) = RecordAlignedTable(records, incompatibleKeyTwo: true);
         var snapshot = new ResourceSnapshot();
@@ -273,18 +303,23 @@ public sealed class ResourceMaterializerTests
 
         Assert.False(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization,
             out var failureKind, captures.Add));
-        Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failureKind);
+        Assert.Equal(exceedsCap ? ResourceMaterializationFailure.Other : ResourceMaterializationFailure.IncompatibleImageCandidates, failureKind);
+        if (exceedsCap)
+        {
+            Assert.Empty(captures);
+            return;
+        }
+
         var diagnostic = Assert.IsType<IndirectSelectorDiagnostic>(Assert.Single(captures).SelectorDiagnostic);
-        Assert.Equal(fallback ? "table_bounded" : "full_domain_no_proof", diagnostic.SelectionMode);
-        SelectorKeyProbe[] expected = fallback ?
-            [new(AlignedKeyOneOffset, 1), new(AlignedKeyTwoOffset, 2)] :
+        Assert.Equal("full_domain_no_proof", diagnostic.SelectionMode);
+        SelectorKeyProbe[] expected =
             [new(AlignedKeyOneOffset, 1), new(MisalignedKeyThreeOffset, 3), new(AlignedKeyTwoOffset, 2)];
         Assert.Equal(expected, diagnostic.KeyProbes);
     }
 
-    // 70000 records leave more than the cap even among the record-aligned offsets.
+    // Larger tables must also fail without publishing an incomplete candidate set.
     [Fact]
-    public void UnclampedSelectorStillFailsWhenTheTableHoldsMoreRecordsThanTheCap()
+    public void LargerUnboundedSelectorTablesPreservePublishedState()
     {
         var (plan, inputs, _) = RecordAlignedTable(70000);
         var snapshot = new ResourceSnapshot();
@@ -294,7 +329,6 @@ public sealed class ResourceMaterializerTests
 
         Assert.False(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization, out var failureKind));
         Assert.Equal(ResourceMaterializationFailure.Other, failureKind);
-        Assert.Contains("no selector clamp and the material table holds 70000 records", ResourceMaterializer.LastFailureDetail);
         Assert.Same(previousSnapshot, snapshot);
         Assert.Same(previousSpecialization, specialization);
     }
