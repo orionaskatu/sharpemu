@@ -1245,9 +1245,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 _postDepthCoverageEnabled = IsDeviceExtensionAvailable("VK_EXT_post_depth_coverage");
                 if (_postDepthCoverageEnabled)
                     extensions[extensionCount++] = postDepthCoverageExtension;
+                // Opt-in (SHARPEMU_SAMPLER_MINMAX=1): applying FILTER_MODE min/max made Yotei render large
+                // dark dithered triangles and doubled GPU time; kept for investigation.
                 // Enabling the extension enables samplerFilterMinmax: the guest sampler's FILTER_MODE
                 // (min/max reduction, used by depth-pyramid downsamples) maps to a reduction mode.
-                _samplerFilterMinmaxEnabled = IsDeviceExtensionAvailable("VK_EXT_sampler_filter_minmax");
+                _samplerFilterMinmaxEnabled = IsDeviceExtensionAvailable("VK_EXT_sampler_filter_minmax") &&
+                    Environment.GetEnvironmentVariable("SHARPEMU_SAMPLER_MINMAX") == "1";
                 if (_samplerFilterMinmaxEnabled)
                     extensions[extensionCount++] = samplerFilterMinmaxExtension;
                 if (_fragmentShaderInterlockEnabled)

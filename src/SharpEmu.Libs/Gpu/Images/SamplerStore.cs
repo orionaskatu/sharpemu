@@ -57,6 +57,7 @@ public sealed unsafe class SamplerStore : IDisposable
     public SamplerStore(GpuDeviceInfo device) => _device = device;
 
     private bool _warnedMinmax;
+    private bool _loggedMinmax;
 
     public int Count => _samplers.Count;
 
@@ -208,11 +209,16 @@ public sealed unsafe class SamplerStore : IDisposable
             if (_device.SamplerFilterMinmaxSupported)
             {
                 info.PNext = &reduction;
+                if (!_loggedMinmax)
+                {
+                    _loggedMinmax = true;
+                    Console.Error.WriteLine($"[LOADER][INFO] Sampler reduction in use: mode={reduction.ReductionMode} words={words[0]:x8},{words[1]:x8},{words[2]:x8},{words[3]:x8}.");
+                }
             }
             else if (!_warnedMinmax)
             {
                 _warnedMinmax = true;
-                Console.Error.WriteLine($"[LOADER][WARN] A min/max sampler reduction is approximated by averaging: mode={words.FilterMode}.");
+                Console.Error.WriteLine($"[LOADER][INFO] A min/max sampler reduction is approximated by averaging (SHARPEMU_SAMPLER_MINMAX=1 applies it): mode={words.FilterMode}.");
             }
         }
 
