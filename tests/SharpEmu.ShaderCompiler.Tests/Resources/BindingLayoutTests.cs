@@ -28,6 +28,21 @@ public sealed class BindingLayoutTests
             BindingLayoutValidator.Validate(limits, info, [0u], false, false, true, Hash, ShaderStage.Pixel));
     }
 
+    // The draw's object ID takes the last shader-data dword of a pixel program writing an ID target.
+    [Fact]
+    public void ObjectIdTakesTheLastShaderDataDword()
+    {
+        var info = new ShaderResourceInfo { Buffers = Enumerable.Range(0, 2).Select(_ => new BufferResource { Read = true }).ToList() };
+        var plain = BindingLayout.Allocate(info, [0u], false, false, false);
+        var objectId = BindingLayout.Allocate(info, [0u], false, false, false, usesObjectId: true);
+        Assert.False(plain.UsesObjectId);
+        Assert.True(objectId.UsesObjectId);
+        Assert.Equal(plain.ShaderDataDwordCount, objectId.ObjectIdDword);
+        Assert.Equal(plain.ShaderDataDwordCount + 1, objectId.ShaderDataDwordCount);
+        Assert.NotEqual(plain, objectId);
+        BindingLayoutValidator.Validate(objectId, info, [0u], false, false, false, Hash, ShaderStage.Pixel);
+    }
+
     [Fact]
     public void ShaderInfoAndBindingLayout()
     {

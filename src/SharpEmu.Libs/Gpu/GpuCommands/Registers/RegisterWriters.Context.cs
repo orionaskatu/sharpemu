@@ -21,7 +21,7 @@ internal static partial class RegisterWriters
                  {
                      DbCountControl, DbRenderOverride2, DbDfsmControl, DbRmiL2CacheControl, CbRmiGl2CacheControl,
                      TaBcBaseAddr, TaBcBaseAddrHi, CbDccControl, PaSuPointSize, PaSuPointMinMax, DbAlphaToMask, VgtDrawPayloadCntl,
-                     VgtPrimitiveIdReset, PaClObjPrimIdCntl, PaSuVtxCntl, PaScFovWindowLr, PaScFovWindowTb,
+                     VgtPrimitiveIdReset, PaSuVtxCntl, PaScFovWindowLr, PaScFovWindowTb,
                      PaScBinnerCntl0, PaScBinnerCntl1,
                      PaScConservativeRasterizationCntl,
                  })
@@ -168,7 +168,7 @@ internal static partial class RegisterWriters
                  {
                      CbDccControl, DbCountControl, DbSResultsCompareState0, DbSResultsCompareState1, DbRenderOverride2,
                      DbDfsmControl, DbRmiL2CacheControl, CbRmiGl2CacheControl, TaBcBaseAddr, TaBcBaseAddrHi, PaSuPointSize, PaSuPointMinMax,
-                     SpiTmpringSize, VgtDrawPayloadCntl, VgtPrimitiveIdReset, PaClObjPrimIdCntl, PaScFovWindowLr, PaScFovWindowTb, PaScFsrEnable,
+                     SpiTmpringSize, VgtDrawPayloadCntl, VgtPrimitiveIdReset, PaScFovWindowLr, PaScFovWindowTb, PaScFsrEnable,
                      FsrRecursions0, FsrRecursions1, PaSuVtxCntl,
                      PaScBinnerCntl0, PaScBinnerCntl1, DbAlphaToMask,
                  })
@@ -212,6 +212,7 @@ internal static partial class RegisterWriters
         indirect[CbShaderMask] = static (banks, _, value) => banks.ShaderInterfaceForWrite.ColorShaderMask = value;
         indirect[PaScShaderControl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.ScanShaderControl = value;
         indirect[CbTargetMask] = static (banks, _, value) => banks.Context.RenderTargetMask = value;
+        indirect[PaClObjPrimIdCntl] = static (banks, _, value) => banks.Context.ObjectPrimitiveIdControl = value;
         indirect[PaScScreenScissorTl] = ScreenScissorTopLeftEntry;
         indirect[PaScScreenScissorBr] = ScreenScissorBottomRightEntry;
         indirect[PaScGenericScissorTl] = GenericScissorTopLeftEntry;

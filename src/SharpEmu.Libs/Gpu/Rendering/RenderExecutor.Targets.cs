@@ -340,6 +340,11 @@ public sealed partial class RenderExecutor
 
     internal static bool IsUnwrittenColorTarget(ContextRegisters context, uint slot, ColorComponentMap exportMapping, uint pixelColorExportMasks)
     {
+        if (ObjectPrimitiveIdTarget.IsTarget(context, slot))
+        {
+            return false;
+        }
+
         var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, slot);
         return exportMapping.ApplyMask(context.RenderTargetMaskForSlot(slot)) == 0 ||
             exportTarget < 0 || ((pixelColorExportMasks >> (exportTarget * 4)) & 0xFu) == 0;

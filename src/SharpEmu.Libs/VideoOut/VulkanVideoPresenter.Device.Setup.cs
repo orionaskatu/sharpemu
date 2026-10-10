@@ -949,6 +949,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _supportsDepthBiasClamp = supportedFeatures.DepthBiasClamp;
             _supportsDepthBounds = supportedFeatures.DepthBounds;
             _supportsShaderClipDistance = supportedFeatures.ShaderClipDistance;
+            // A fragment program reads the primitive ID through the tessellation capability.
+            Gpu.Pipelines.ObjectPrimitiveIdTarget.Supported = supportedFeatures.TessellationShader;
             _supportsFillRectangle = IsDeviceExtensionAvailable(FillRectangleExtensionName);
             var enabledFeatures = new PhysicalDeviceFeatures
             {

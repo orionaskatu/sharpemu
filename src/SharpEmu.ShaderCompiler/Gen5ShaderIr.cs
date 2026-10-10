@@ -164,6 +164,9 @@ public readonly record struct Gen5PixelOutputBinding(
     public uint Index { get; init; }
 
     public Gen5PixelExportFormat ExportFormat { get; init; } = Gen5PixelExportFormat.Float16;
+
+    // The slot receives the object ID plus the primitive ID instead of an export.
+    public bool ObjectPrimitiveId { get; init; }
 }
 
 public readonly record struct Gen5ComputeSystemRegisters(

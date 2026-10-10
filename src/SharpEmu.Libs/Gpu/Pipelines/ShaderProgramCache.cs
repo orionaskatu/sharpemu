@@ -626,7 +626,8 @@ internal sealed class ShaderProgramCache
             resources = ResourceMaterializer.ApplyTo(plan, specialization);
             layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
                 source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions, source.Stage,
-                options.Tessellation is not null || options.TessellationHull is not null);
+                options.Tessellation is not null || options.TessellationHull is not null,
+                source.Stage == ShaderStage.Pixel && options.PixelOutputs.Any(static output => output.ObjectPrimitiveId));
         }
         catch (ResourcePlanException exception)
         {
@@ -820,13 +821,13 @@ internal sealed class ShaderProgramCache
 
     private BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
         uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, ShaderStage stage,
-        bool usesTessellationData = false) =>
+        bool usesTessellationData = false, bool usesObjectId = false) =>
         AllocateLayout(program, plan, resources, userDataBase, userDataCount, pushDataCursor, usesDispatchThreadLimits, stage,
-            _host, usesTessellationData);
+            _host, usesTessellationData, usesObjectId);
 
     private static BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
         uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, ShaderStage stage,
-        IShaderPipelineHost host, bool usesTessellationData = false) =>
+        IShaderPipelineHost host, bool usesTessellationData = false, bool usesObjectId = false) =>
         BindingLayout.Allocate(
             resources.Info,
             BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount),
@@ -838,6 +839,7 @@ internal sealed class ShaderProgramCache
             usesBindlessImages: host.UsesBindlessImages,
             usesRuntimeBufferStrides: host.RuntimeBufferStridesEnabled,
             usesTessellationData: usesTessellationData,
+            usesObjectId: usesObjectId,
             // A pixel program reads its position in guest pixels; any program that samples or
             // fetches an image needs to know which of them the host holds at another size.
             usesRenderScale: Images.RenderScalePolicy.Enabled &&

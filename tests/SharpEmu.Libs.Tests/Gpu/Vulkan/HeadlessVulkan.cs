@@ -43,6 +43,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     // Dynamic rendering support required by the presenter's render host.
     public bool SupportsDynamicRendering { get; }
     public bool SupportsFragmentShaderBarycentric { get; private init; }
+    public bool SupportsTessellationShader { get; private init; }
     public bool SupportsFillRectangle { get; private init; }
 
     private static readonly string[] RenderingExtensionNames =
@@ -457,6 +458,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         var result = new HeadlessVulkan(vk, instance, physical, device, queue, family, apiVersion, enabledFeatures, dynamicRendering)
         {
             SupportsFragmentShaderBarycentric = barycentric,
+            SupportsTessellationShader = enabledFeatures.TessellationShader,
             SupportsFillRectangle = fillRectangle,
             ExactFloat16Conversions = exactFloat16,
             SupportsRuntimeDescriptorArrays = runtimeDescriptorArrays,

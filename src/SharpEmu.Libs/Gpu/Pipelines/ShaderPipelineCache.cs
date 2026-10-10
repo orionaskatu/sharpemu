@@ -361,6 +361,19 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 throw SubmissionScheduler.Fatal($"The color target format has no pixel output kind: slot={slot} layout={(uint)words.Layout} numberType={(uint)words.NumberType} order={(uint)words.Order}.");
             }
 
+            if (ObjectPrimitiveIdTarget.IsTarget(context, slot))
+            {
+                // The high nibble keys the compiled program as an ID writer, not an export.
+                outputModes[slot] = (byte)(((uint)kind + 1) | (ObjectPrimitiveIdOutputMode << 4));
+                outputMappings[slot] = new ColorComponentMap(mapping.Packed);
+                outputs.Add(new Gen5PixelOutputBinding(slot, location++, kind, mapping)
+                {
+                    ExportTarget = ContextRegisters.ColorTargetCount + slot,
+                    ObjectPrimitiveId = true,
+                });
+                continue;
+            }
+
             // A bound slot that no export reaches keeps its contents: its color write mask is zero.
             var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, slot);
             // The high nibble keys the compiled program by the export that feeds the slot.
@@ -423,6 +436,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     }
 
     private const byte DualSourceOutputMode = 0xFF;
+    // Export-nibble value of an object/primitive ID slot; exports use 1..8.
+    private const uint ObjectPrimitiveIdOutputMode = 0xE;
 
     // BLEND_SRC1_COLOR, BLEND_ONE_MINUS_SRC1_COLOR, BLEND_SRC1_ALPHA, BLEND_ONE_MINUS_SRC1_ALPHA.
     internal static bool UsesSecondBlendSource(in BlendRegisters blend)
@@ -824,7 +839,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             var exportTarget = PixelExportRouting.ExportForSlot(context.ShaderInterface, color.Slot);
             var exported = pixelStage is not null &&
                 (exportTarget >= 0 && ((pixelStage.PixelColorExportMasks >> (exportTarget * 4)) & 0xFu) != 0);
-            var colorMask = exported ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0;
+            var written = exported || ObjectPrimitiveIdTarget.IsTarget(context, color.Slot);
+            var colorMask = written ? color.Resolution.ExportMapping.ApplyMask(context.RenderTargetMaskForSlot(color.Slot)) : 0;
             parameters.SetColorMask(index, colorMask);
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {

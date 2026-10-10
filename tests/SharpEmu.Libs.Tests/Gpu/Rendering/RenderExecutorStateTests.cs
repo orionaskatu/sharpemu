@@ -436,6 +436,45 @@ public sealed class RenderExecutorStateTests : IDisposable
         Assert.Contains($"create_graphics_pipeline colors={expectedColors} depth=True topology=TriangleList restart=False", _pipelines.Calls);
     }
 
+    // An instance-ID pass: MRT0 feeds a 16-bit slot 0 while slots 1..7 all name one 32-bit
+    // surface no export reaches. With the object/primitive ID mode the hardware writes that
+    // surface itself, so it stays bound (once); without it the slot is unwritten and dropped.
+    [Theory]
+    [InlineData(0x2u, ChannelLayout.Bits32, ChannelType.UInt, 2u)]
+    [InlineData(0x0u, ChannelLayout.Bits32, ChannelType.UInt, 1u)]
+    [InlineData(0x2u, ChannelLayout.Bits32, ChannelType.Float, 1u)]
+    [InlineData(0x2u, ChannelLayout.Bits16, ChannelType.UInt, 1u)]
+    public void Attachments_ObjectPrimitiveIdModeRetainsTheUnexportedIdTargetOnce(
+        uint objectPrimitiveIdControl, ChannelLayout idLayout, ChannelType idType, uint expectedColors)
+    {
+        Libs.Gpu.Pipelines.ObjectPrimitiveIdTarget.Supported = true;
+        var banks = Banks(withDepth: true);
+        banks.Context.ColorTargets[0] = RegisterWords.Color(ColorBase, 64, 64, layout: ChannelLayout.Bits16, type: ChannelType.UInt);
+        for (var slot = 1; slot < 8; slot++)
+        {
+            banks.Context.ColorTargets[slot] = RegisterWords.Color(SecondColorBase, 64, 64, layout: idLayout, type: idType);
+        }
+
+        banks.Context.RenderTargetMask = 0xFFFFFFFF;
+        banks.Context.ObjectPrimitiveIdControl = objectPrimitiveIdControl;
+        banks.Context.ShaderInterface.ColorShaderMask = 0x1;
+        banks.Context.ShaderInterface.TargetOutputModes[0] = 1;
+        _pipelines.Graphics = Programs(pixelStage: Stage(new ShaderProgramInfo { Stage = ShaderStageKind.Pixel, PixelColorExportMasks = 0x1 }));
+
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var rendering = Assert.Single(_host.BegunRenderings);
+        Assert.Equal(expectedColors, rendering.ColorAttachmentCount);
+        Assert.Contains(_host.Calls, call => call.StartsWith("acquire_color 0 ", StringComparison.Ordinal));
+        Assert.Equal(expectedColors == 2, _host.Calls.Any(call => call.StartsWith("acquire_color 1 ", StringComparison.Ordinal)));
+        for (var slot = 2; slot < 8; slot++)
+        {
+            Assert.DoesNotContain(_host.Calls, call => call.StartsWith($"acquire_color {slot} ", StringComparison.Ordinal));
+        }
+
+        Assert.Contains($"create_graphics_pipeline colors={expectedColors} depth=True topology=TriangleList restart=False", _pipelines.Calls);
+    }
+
     [Fact]
     public void Attachments_DepthPassDropsATargetThatNoFormattedExportReaches()
     {
