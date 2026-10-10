@@ -609,7 +609,15 @@ public sealed partial class RenderExecutor
             for (var i = 0; i < vertexLimit; i++) ids[i] = (uint)((size == 4 ? BitConverter.ToUInt32(bytes, i * 4) : BitConverter.ToUInt16(bytes, i * 2)) + vertexOffset);
         }
         else for (var i = 0u; i < vertexLimit; i++) ids[i] = (uint)(i + vertexOffset);
-        var interpreter = new SharpEmu.ShaderCompiler.Reference.Gen5ReferenceInterpreter(program, (address, destination) => _host.TryReadGuest(address, destination));
+        // The GPU's view: every earlier recorded command finished, read from the GPU buffer copies (guest memory where none exists).
+        var gpuPage = new byte[4096];
+        bool ReadGpuView(ulong address, Span<byte> destination)
+        {
+            if (destination.Length == 4096 && _host.DebugReadGpuCopy(address, gpuPage)) { gpuPage.CopyTo(destination); return true; }
+            return _host.TryReadGuest(address, destination);
+        }
+        var gpuView = Environment.GetEnvironmentVariable("SHARPEMU_DBG_VREF_GPU") == "1";
+        var interpreter = new SharpEmu.ShaderCompiler.Reference.Gen5ReferenceInterpreter(program, gpuView ? ReadGpuView : (address, destination) => _host.TryReadGuest(address, destination));
         var instanceLimit = Math.Max(1u, Math.Min(instances, 6144u / Math.Max(1u, vertexLimit)));
         try
         {
@@ -639,7 +647,7 @@ public sealed partial class RenderExecutor
             if (ndc > 50) huge++;
         }
         if (nan == 0 && huge == 0 && !DbgInstanceCheck.Contains(hash)) { Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} ok positions={interpreter.Positions.Count} maxNdc={maxNdc:G4}"); return; }
-        Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} BAD indexed={emission.Indexed} indirect={emission.IndirectArgumentsAddress != 0} count={count} instances={instances} firstInstance={firstInstance} vertexOffset={vertexOffset} " +
+        Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} BAD view={(gpuView ? "gpu" : "guest")} indexed={emission.Indexed} indirect={emission.IndirectArgumentsAddress != 0} count={count} instances={instances} firstInstance={firstInstance} vertexOffset={vertexOffset} " +
             $"positions={interpreter.Positions.Count} nan={nan} behind={behind} hugeNdc={huge} maxNdc={maxNdc:G4} w=[{minW:G4},{maxW:G4}] " +
             $"firstLaneV0-23={string.Join(" ", (interpreter.FirstExportRegisters ?? []).Select(v => BitConverter.UInt32BitsToSingle(v) is var f && float.IsFinite(f) && Math.Abs(f) < 1e7f && Math.Abs(f) > 1e-7f ? f.ToString("G5") : $"0x{v:X}"))}");
     }
