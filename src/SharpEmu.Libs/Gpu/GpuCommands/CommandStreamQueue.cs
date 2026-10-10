@@ -203,6 +203,7 @@ public sealed class CommandStreamQueue
     internal static readonly int DbgSyncSubmitMilliseconds =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_SYNC_SUBMIT"), out var dbgSync) ? dbgSync : 0;
     internal static long DbgSyncTimeouts;
+    internal static readonly bool DbgSyncGpu = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SYNC_GPU") == "1"; // TEMP
 
     public void DbgWaitForLastEnqueued()
     {
@@ -597,6 +598,9 @@ public sealed class CommandStreamQueue
             Fail();
             throw;
         }
+
+        if (complete && DbgSyncGpu && submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
+            _host.FlushAndWait(); // TEMP: the GPU finished this submission before its submitter resumes
 
         SliceResult result;
         lock (_gate)

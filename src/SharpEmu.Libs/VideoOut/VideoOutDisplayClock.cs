@@ -17,19 +17,25 @@ internal sealed class VideoOutDisplayClock(long openedAt, ulong processCounter, 
     public ulong TimestampCounter { get; private set; }
     public ulong ProcessMicroseconds => (ulong)((UInt128)ProcessCounter * 1_000_000 / (ulong)Stopwatch.Frequency);
 
+    // SHARPEMU_DBG_GUEST_TIME_SCALE slows the guest timeline: vblanks advance at that fraction of
+    // the display rate, like the process clocks (KernelRuntimeCompatExports.ScaledElapsed).
+    internal static readonly double TimeScale =
+        double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_GUEST_TIME_SCALE"), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var scale) && scale > 0 ? scale : 1.0;
+
     public void Advance(long timestamp, uint refreshRate)
     {
         var interval = RefreshInterval(refreshRate);
-        var count = (ulong)(Math.Max(0, timestamp - openedAt) / interval);
+        var count = (ulong)(Math.Max(0, timestamp - openedAt) * TimeScale / interval);
         if (count <= Count) return;
         Count = count;
         var elapsed = (ulong)interval * count;
-        LastTimestamp = openedAt + (long)elapsed;
+        LastTimestamp = openedAt + (long)(elapsed / TimeScale);
         ProcessCounter = processCounter + elapsed;
         TimestampCounter = timestampCounter + (ulong)((UInt128)elapsed * timestampFrequency / (ulong)Stopwatch.Frequency);
     }
 
-    public long NextTimestamp(uint refreshRate) => openedAt + checked((long)(Count + 1) * RefreshInterval(refreshRate));
+    public long NextTimestamp(uint refreshRate) => openedAt + checked((long)((Count + 1) * (ulong)RefreshInterval(refreshRate) / TimeScale));
 
     internal static long RefreshInterval(uint refreshRate) => Math.Max(1, Stopwatch.Frequency / Math.Max(1L, refreshRate));
 

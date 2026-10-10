@@ -249,6 +249,44 @@ public sealed partial class RenderExecutor
 
         _host.RunPendingOperations();
         var compute = banks.Shader.Compute;
+        if (Diagnostics.ReferenceCheck.Enabled) // TEMP: CPU reference check, at a point where nothing of this dispatch is recorded
+        {
+            if (Diagnostics.ReferenceCheck.Pending is { } pending)
+            {
+                Diagnostics.ReferenceCheck.Pending = null;
+                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_REF_SCALAR_COHERENCE") == "1") // TEMP: are the constants the interpreter read still the GPU's?
+                {
+                    var seen = new HashSet<ulong>();
+                    var reported = 0;
+                    var gpuWord = new byte[4];
+                    Span<byte> guestWord = stackalloc byte[4];
+                    foreach (var (pc, loadAddress, value) in pending.Interpreter.ScalarLoads)
+                    {
+                        if (!seen.Add(loadAddress) || reported >= 24) continue;
+                        var guest = _host.TryReadGuest(loadAddress, guestWord) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(guestWord) : (uint?)null;
+                        var gpu = _host.DebugReadGpuCopy(loadAddress, gpuWord) ? BitConverter.ToUInt32(gpuWord) : (uint?)null;
+                        if (guest != value || (gpu is { } g && g != value))
+                        {
+                            reported++;
+                            Console.Error.WriteLine($"[DBG][REF] scalar pc=0x{pc:X} addr=0x{loadAddress:X} interp=0x{value:X8} guestNow=0x{guest:X8} gpuCopy={(gpu is { } x ? $"0x{x:X8}" : "none")}");
+                        }
+                    }
+                    Console.Error.WriteLine($"[DBG][REF] scalar coherence checked={seen.Count} differing={reported}");
+                }
+                Diagnostics.ReferenceCheck.Compare(pending.Hash, pending.Interpreter, address =>
+                {
+                    Span<byte> word = stackalloc byte[4];
+                    return _host.TryReadGuest(address, word) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(word) : null;
+                });
+            }
+
+            if (indirectArgumentsAddress == 0 &&
+                Diagnostics.ReferenceCheck.Begin(compute.Address, (address, destination) => _host.TryReadGuest(address, destination),
+                    compute.UserScalars.Values[..(int)Math.Min(compute.UserScalarCount, 32u)], compute.ThreadsX, compute.ThreadsY, compute.ThreadsZ,
+                    groupsX, groupsY, groupsZ, Pipelines.ShaderPipelineCache.DecodeComputeSystemRegisters(compute), compute.ThreadIdComponentCount + 1,
+                    compute.WaveSize) is { } reference && Diagnostics.ReferenceCheck.Programs.TryGetValue(compute.Address, out var referenced))
+                Diagnostics.ReferenceCheck.Pending = (referenced.Hash, reference);
+        }
         _host.SetDebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
         if (compute.Address == 0)
         {
@@ -670,6 +708,7 @@ public sealed partial class RenderExecutor
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
+
             }
             _host.ShaderAccessBarrier();
             foreach (var (fillHash, fillSlot, fillValue) in DbgFillAfter) // TEMP: SHARPEMU_DBG_FILL_AFTER=hash:slot:value,... overwrites a bound buffer after the dispatch

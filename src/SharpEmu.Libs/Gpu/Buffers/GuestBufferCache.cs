@@ -336,6 +336,23 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return true;
     }
 
+    // TEMP: the GPU copy of any cached range, whether or not the GPU wrote it.
+    public bool DbgReadGpuCopy(ulong address, byte[] destination)
+    {
+        var owner = _registry.FindContainingBuffer(address, (ulong)destination.Length);
+        if (!owner.IsValid || AsyncReadback is not { } readback)
+            return false;
+        var buffer = _registry.GetBuffer(owner);
+        _scheduler.Flush();
+        byte[]? result = null;
+        readback.Read([new Vulkan.ReadbackPiece(buffer, buffer.Offset(address), (ulong)destination.Length)], _scheduler.CurrentTick - 1,
+            (_, bytes) => result = bytes.ToArray());
+        if (result is null || result.Length != destination.Length)
+            return false;
+        Array.Copy(result, destination, result.Length);
+        return true;
+    }
+
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
         TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.CpuReadSynchronization);
 
@@ -1169,7 +1186,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A guest buffer the GPU reads through pointers (a per-frame ring, for one) is reached a
     // page at a time, and every first touch reads zeros for that frame. A fault therefore
     // brings in the aligned window around it, clipped to the guest mapping that holds it.
-    internal const ulong DeviceAddressFaultWindow = 2UL << 20;
+    // SHARPEMU_BDA_FAULT_WINDOW_MB sizes the span a device-address fault maps at once (default 2 MiB).
+    internal static readonly ulong DeviceAddressFaultWindow = ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_FAULT_WINDOW_MB"), out var windowMb) && windowMb > 0 ? System.Numerics.BitOperations.RoundUpToPowerOf2(windowMb) << 20 : 2UL << 20;
 
     internal static GuestSpan DeviceAddressFaultSpan(ulong pageAddress, ulong pageSize, ulong mappingStart, ulong mappingLength)
     {

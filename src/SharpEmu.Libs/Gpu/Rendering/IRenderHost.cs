@@ -179,6 +179,7 @@ public interface IRenderHost
     // One indexed draw whose counts the GPU reads from the buffer (VkDrawIndexedIndirectCommand layout).
     void DebugCaptureIndirectArguments(BufferBinding arguments) { } // TEMP
     bool DebugReadGpu(ulong address, byte[] destination) => false; // TEMP
+    bool DebugReadGpuCopy(ulong address, byte[] destination) => false; // TEMP
     bool DebugCapturing => false; // TEMP
     void DebugCopyBuffer(ulong address, ulong size, string label) { } // TEMP
     void DebugNote(string line) { } // TEMP

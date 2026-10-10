@@ -2580,7 +2580,7 @@ public static partial class Gen5ShaderTranslator
                     "DsMinF32" or "DsMaxF32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
-                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector((Environment.GetEnvironmentVariable("SHARPEMU_DBG_REVERT") ?? "").Contains("ds") ? vectorData1 : vectorData0), // TEMP
                     ],
                     _ when IsDataShareAtomic(opcode) => [
                         Gen5Operand.Vector(vectorAddress),

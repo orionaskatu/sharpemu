@@ -8,7 +8,7 @@ namespace SharpEmu.Libs.Tests.Gpu.Buffers;
 
 public sealed class DeviceAddressFaultSpanTests
 {
-    private const ulong Window = GuestBufferCache.DeviceAddressFaultWindow;
+    private static readonly ulong Window = GuestBufferCache.DeviceAddressFaultWindow;
     private const ulong Page = 0x4000;
 
     // One fault brings in the whole aligned window around it, not a single page.

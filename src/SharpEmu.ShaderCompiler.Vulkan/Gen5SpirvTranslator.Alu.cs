@@ -2383,110 +2383,37 @@ public static partial class Gen5SpirvTranslator
             var opcode = instruction.Opcode;
             if (opcode is "VCmpClassF32" or "VCmpxClassF32")
             {
-                var source = GetFloatSource(instruction, 0);
+                // V_CMP_CLASS classifies the raw bits, as the hardware does: float tests (IsNan,
+                // FOrdEqual against 0, a denormal threshold) depend on the driver's NaN, infinity and
+                // denormal handling, which may flush or fold them. Mask bits: 0 signaling NaN, 1 quiet
+                // NaN, 2/9 -/+infinity, 3/8 -/+normal, 4/7 -/+denormal, 5/6 -/+zero.
                 var raw = GetRawSource(instruction, 0);
+                if (instruction.Control is Gen5Vop3Control { AbsoluteMask: var absMask, NegateMask: var negMask })
+                {
+                    if ((absMask & 1) != 0) raw = BitwiseAnd(raw, UInt(0x7FFF_FFFF));
+                    if ((negMask & 1) != 0) raw = BitwiseXor(raw, UInt(0x8000_0000));
+                }
+
                 var mask = GetRawSource(instruction, 1);
+                var exponent = BitwiseAnd(ShiftRightLogical(raw, UInt(23)), UInt(0xFF));
+                var mantissa = BitwiseAnd(raw, UInt(0x7F_FFFF));
                 var negative = IsNotZero(BitwiseAnd(raw, UInt(0x8000_0000)));
-                var positive = _module.AddInstruction(
-                    SpirvOp.LogicalNot,
-                    _boolType,
-                    negative);
-                var nan = _module.AddInstruction(SpirvOp.IsNan, _boolType, source);
-                var infinity =
-                    _module.AddInstruction(SpirvOp.IsInf, _boolType, source);
-                var zero = _module.AddInstruction(
-                    SpirvOp.FOrdEqual,
-                    _boolType,
-                    source,
-                    Float(0));
-                var absolute = Ext(4, _floatType, source);
-                var nonzero = _module.AddInstruction(
-                    SpirvOp.FOrdGreaterThan,
-                    _boolType,
-                    absolute,
-                    Float(0));
-                var belowNormal = _module.AddInstruction(
-                    SpirvOp.FOrdLessThan,
-                    _boolType,
-                    absolute,
-                    Bitcast(_floatType, UInt(0x0080_0000)));
-                var subnormal = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    nonzero,
-                    belowNormal);
-                var special = _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    nan,
-                    _module.AddInstruction(
-                        SpirvOp.LogicalOr,
-                        _boolType,
-                        infinity,
-                        _module.AddInstruction(
-                            SpirvOp.LogicalOr,
-                            _boolType,
-                            zero,
-                            subnormal)));
-                var normal = _module.AddInstruction(
-                    SpirvOp.LogicalNot,
-                    _boolType,
-                    special);
-
-                uint MaskedClass(uint bits, uint value)
-                {
-                    var enabled = IsNotZero(BitwiseAnd(mask, UInt(bits)));
-                    return _module.AddInstruction(
-                        SpirvOp.LogicalAnd,
-                        _boolType,
-                        enabled,
-                        value);
-                }
-
-                uint SignedClass(uint negativeBit, uint positiveBit, uint value)
-                {
-                    var negativeClass = MaskedClass(
-                        negativeBit,
-                        _module.AddInstruction(
-                            SpirvOp.LogicalAnd,
-                            _boolType,
-                            negative,
-                            value));
-                    var positiveClass = MaskedClass(
-                        positiveBit,
-                        _module.AddInstruction(
-                            SpirvOp.LogicalAnd,
-                            _boolType,
-                            positive,
-                            value));
-                    return _module.AddInstruction(
-                        SpirvOp.LogicalOr,
-                        _boolType,
-                        negativeClass,
-                        positiveClass);
-                }
-
-                condition = MaskedClass(0x003, nan);
-                condition = _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    condition,
-                    SignedClass(0x004, 0x200, infinity));
-                condition = _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    condition,
-                    SignedClass(0x008, 0x100, normal));
-                condition = _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    condition,
-                    SignedClass(0x010, 0x080, subnormal));
-                condition = _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    condition,
-                    SignedClass(0x020, 0x040, zero));
+                var maxExponent = _module.AddInstruction(SpirvOp.IEqual, _boolType, exponent, UInt(0xFF));
+                var zeroExponent = _module.AddInstruction(SpirvOp.IEqual, _boolType, exponent, UInt(0));
+                var zeroMantissa = _module.AddInstruction(SpirvOp.IEqual, _boolType, mantissa, UInt(0));
+                var nonzeroMantissa = LogicalNot(zeroMantissa);
+                var quietBit = IsNotZero(BitwiseAnd(raw, UInt(0x40_0000)));
+                var nan = LogicalAnd(maxExponent, nonzeroMantissa);
+                var classIndex = _module.AddInstruction(SpirvOp.Select, _uintType, LogicalAnd(nan, quietBit), UInt(1),
+                    _module.AddInstruction(SpirvOp.Select, _uintType, nan, UInt(0),
+                    _module.AddInstruction(SpirvOp.Select, _uintType, maxExponent,
+                        _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(2), UInt(9)),
+                    _module.AddInstruction(SpirvOp.Select, _uintType, LogicalAnd(zeroExponent, zeroMantissa),
+                        _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(5), UInt(6)),
+                    _module.AddInstruction(SpirvOp.Select, _uintType, zeroExponent,
+                        _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(4), UInt(7)),
+                        _module.AddInstruction(SpirvOp.Select, _uintType, negative, UInt(3), UInt(8)))))));
+                condition = IsNotZero(BitwiseAnd(mask, ShiftLeftLogical(UInt(1), classIndex)));
             }
             else if (opcode is
                      "VCmpFF32" or "VCmpxFF32" or
@@ -4209,6 +4136,12 @@ public static partial class Gen5SpirvTranslator
         // A DPP16 source lane is valid when it lies in the row and, without FETCH_INACTIVE,
         // is active: valid = in_row && (exec[src] || fi). An invalid source reads zero, and
         // writes only with BOUND_CTRL (see IsDppWriteEnabled).
+        private uint GetDppSourceInRange(Gen5DppControl control)
+        {
+            GetDppSourceLane(control, out _, out var inRange);
+            return inRange;
+        }
+
         private uint GetDppSourceValid(Gen5DppControl control, out uint safeTarget)
         {
             GetDppSourceLane(control, out var targetLane, out var inRange);
@@ -4397,8 +4330,13 @@ public static partial class Gen5SpirvTranslator
 
         // V_MAD_F32 / V_MAC_F32: the product is rounded to f32 before the add; NoContraction
         // keeps the driver from fusing the pair back into an FMA.
+        // TEMP: SHARPEMU_DBG_REVERT=dpp,ds,mad reverts recent semantic changes to compare.
+        internal static readonly HashSet<string> DbgRevert = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_REVERT") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries).ToHashSet();
+
         private uint EmitUnfusedMultiplyAdd(uint left, uint right, uint addend)
         {
+            if (DbgRevert.Contains("mad")) return Ext(50, _floatType, left, right, addend);
             var product = _module.AddInstruction(SpirvOp.FMul, _floatType, left, right);
             _module.AddDecoration(product, SpirvDecoration.NoContraction);
             var sum = _module.AddInstruction(SpirvOp.FAdd, _floatType, product, addend);
@@ -4421,7 +4359,7 @@ public static partial class Gen5SpirvTranslator
                 ShiftLeftLogical(UInt(1), bank)));
             var sourceAllowsWrite = control.BoundControl
                 ? _module.ConstantBool(true)
-                : GetDppSourceValid(control, out _);
+                : DbgRevert.Contains("dpp") ? GetDppSourceInRange(control) : GetDppSourceValid(control, out _);
             return _module.AddInstruction(
                 SpirvOp.LogicalAnd,
                 _boolType,
@@ -4648,7 +4586,10 @@ public static partial class Gen5SpirvTranslator
         }
 
         // Graphics stages without subgroup operations run every invocation as a one-lane wave.
-        private bool IsSingleLaneWave => _subgroupInvocationIdInput == 0 && _stage != Gen5SpirvStage.Compute;
+        // SHARPEMU_ONE_LANE_CLAMP: "pixel" (default) clamps pixel shaders only, "all" every graphics stage, "0" none.
+        private static readonly string OneLaneClamp = Environment.GetEnvironmentVariable("SHARPEMU_ONE_LANE_CLAMP") ?? "pixel";
+        private bool IsSingleLaneWave => _subgroupInvocationIdInput == 0 && _stage != Gen5SpirvStage.Compute &&
+            (OneLaneClamp == "all" || (OneLaneClamp == "pixel" && _stage == Gen5SpirvStage.Pixel));
 
         private uint DoubleType()
         {

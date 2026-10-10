@@ -32,7 +32,7 @@ public static unsafe class RenderDocCapture
         long.TryParse(
             Environment.GetEnvironmentVariable("SHARPEMU_RENDERDOC_CAPTURE_TIMEOUT_SECONDS"),
             out var captureTimeoutSeconds) && captureTimeoutSeconds > 0
-            ? Math.Clamp(captureTimeoutSeconds, 1, 120) * 1_000
+            ? Math.Clamp(captureTimeoutSeconds, 1, 3600) * 1_000
             : 15_000;
 
     public static bool IsAvailable => _api is not null;

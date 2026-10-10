@@ -86,6 +86,14 @@ public static class KernelAprCompatExports
 
         if (!_submittedCommandBuffers.TryRemove(submissionId, out var submission))
         {
+            // Every submission completes synchronously, so an ID that was issued and already waited
+            // on (or reaped) is complete: waiting on it again succeeds, as for a finished buffer.
+            if (submissionId != 0 && submissionId <= unchecked((uint)Volatile.Read(ref _nextSubmissionId)))
+            {
+                TraceApr(ctx, "wait_completed", submissionId, 0, waitArg1, waitArg2);
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
             TraceAprWaitFailure(ctx, "wait_missing", submissionId, commandBuffer: 0, waitArg1, waitArg2);
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }

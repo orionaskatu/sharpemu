@@ -1408,9 +1408,16 @@ public static partial class Gen5SpirvTranslator
                         (uint)_physicalAxisOfLogical[2]);
                     if (registers.ThreadGroupSizeRegister is { } sizeRegister)
                     {
+                        // TG_SIZE packs the wave count of the threadgroup in bits [5:0] and this wave's
+                        // index in it in bits [11:6] (as ACO/RADV read it), not the thread count.
+                        var threads = checked(_localSizeX * _localSizeY * _localSizeZ);
+                        var waves = (threads + _waveLaneCount - 1) / _waveLaneCount;
+                        var waveIndex = _localInvocationIndexInput != 0
+                            ? _module.AddInstruction(SpirvOp.UDiv, _uintType, Load(_uintType, _localInvocationIndexInput), UInt(_waveLaneCount))
+                            : UInt(0);
                         StoreS(
                             sizeRegister,
-                            UInt(checked(_localSizeX * _localSizeY * _localSizeZ)));
+                            BitwiseOr(UInt(waves & 0x3F), ShiftLeftLogical(BitwiseAnd(waveIndex, UInt(0x3F)), UInt(6))));
                     }
                 }
                 if (_request.TessellationHull is not null) EmitHullInputState();

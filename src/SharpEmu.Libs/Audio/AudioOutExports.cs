@@ -97,7 +97,7 @@ public static class AudioOutExports
                 delay = _nextSilentOutput - now;
                 _nextSilentOutput += checked(
                     (long)Math.Ceiling(
-                        Stopwatch.Frequency * (double)BufferLength / Frequency));
+                        Stopwatch.Frequency * (double)BufferLength / Frequency / VideoOut.VideoOutDisplayClock.TimeScale));
             }
 
             if (delay > 0)
@@ -157,7 +157,12 @@ public static class AudioOutExports
         try
         {
             var streamFactory = Volatile.Read(ref _streamFactoryForTests);
-            if (streamFactory is not null)
+            if (VideoOut.VideoOutDisplayClock.TimeScale < 1.0)
+            {
+                // A dilated guest clock (SHARPEMU_DBG_GUEST_TIME_SCALE) paces audio in silence at the scaled rate.
+                backendName = "dilated-silent";
+            }
+            else if (streamFactory is not null)
             {
                 backend = streamFactory(frequency);
                 backendName = "test";

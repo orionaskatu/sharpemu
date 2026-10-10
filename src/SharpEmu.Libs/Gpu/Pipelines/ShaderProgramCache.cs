@@ -179,6 +179,7 @@ internal sealed class ShaderProgramCache
         }
 
         _decoded.Add(key, program);
+        if (Diagnostics.ReferenceCheck.Enabled) Diagnostics.ReferenceCheck.Programs[source.Address] = (source.Hash, program!); // TEMP
         if (recording is not null)
         {
             _codeCaptures[key] = new ShaderCodeCapture
@@ -676,7 +677,7 @@ internal sealed class ShaderProgramCache
                 var info = options.VertexInfo!;
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
-                    WaveSize = 32,
+                    WaveSize = 32, ForceGenericBufferFormats = DbgGenericFormats,
                     Tessellation = options.Tessellation,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
@@ -712,7 +713,7 @@ internal sealed class ShaderProgramCache
                 Array.Copy(info.InterpolatorSettings, interpolators, interpolators.Length);
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
-                    WaveSize = 32,
+                    WaveSize = 32, ForceGenericBufferFormats = DbgGenericFormats,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
@@ -746,10 +747,10 @@ internal sealed class ShaderProgramCache
                 var info = options.ComputeInfo!;
                 return new ShaderCompileRequest(entry.Plan, resources, layout)
                 {
-                    WaveSize = info.WaveSize,
+                    WaveSize = info.WaveSize, ForceGenericBufferFormats = DbgGenericFormats,
                     TessellationHull = options.TessellationHull,
-                    CooperativeWave64Workgroup = options.TessellationHull is not null,
-                    NativeWave64 = options.TessellationHull is null &&
+                    CooperativeWave64Workgroup = options.TessellationHull is not null || DbgCooperativeHashes.Contains(entry.Plan.Hash),
+                    NativeWave64 = options.TessellationHull is null && !DbgCooperativeHashes.Contains(entry.Plan.Hash) &&
                         ComputeWaveModel.UsesNativeWave64(info, _host.ComputeSubgroup64Required, _host.MaxComputeWorkgroupSubgroups),
                     EnableExecGuardElision = info.WaveSize != 64 || _host.ExecGuardElisionEnabled,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
@@ -796,13 +797,21 @@ internal sealed class ShaderProgramCache
             usesRenderScale: Images.RenderScalePolicy.Enabled &&
                              (stage == ShaderStage.Pixel || resources.Info.Images.Count != 0));
 
+    // TEMP: SHARPEMU_DBG_GENERIC_FORMATS=1 decodes formatted buffer accesses from the live descriptor at run time.
+    private static readonly bool DbgGenericFormats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_GENERIC_FORMATS") == "1";
+
+    // TEMP: SHARPEMU_DBG_COOP_WAVE64=hash,... compiles those wave64 compute programs with the cooperative half-wave
+    // model (shared-memory exchange) instead of native 64-lane subgroups, to compare the two.
+    private static readonly HashSet<ulong> DbgCooperativeHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_COOP_WAVE64") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
+
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, IShaderPipelineHost host) =>
         new(plan, resources, layout)
         {
             NativeHalfConversionExact = host.NativeHalfConversionExact,
             ZeroOutOfBoundsBufferReads = host.ZeroOutOfBoundsBufferReads,
-            WaveSize = info.WaveSize,
+            WaveSize = info.WaveSize, ForceGenericBufferFormats = DbgGenericFormats,
             NativeWave64 = ComputeWaveModel.UsesNativeWave64(info, host.ComputeSubgroup64Required, host.MaxComputeWorkgroupSubgroups),
             EnableExecGuardElision = info.WaveSize != 64 || host.ExecGuardElisionEnabled,
             TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,

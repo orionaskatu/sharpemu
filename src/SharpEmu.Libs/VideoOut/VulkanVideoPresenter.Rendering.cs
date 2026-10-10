@@ -1014,6 +1014,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _vk.CmdBindPipeline(command, bindPoint, entry.Pipeline);
             _profileComputePipeline = entry.Id;
+            _dbgComputeHash = entry.ProfileComputeHash; // TEMP: names the dispatch for SHARPEMU_CAPTURE_BUFFERS_AT
         }
 
         private void CountDraw()
@@ -1160,6 +1161,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void Dispatch(uint groupsX, uint groupsY, uint groupsZ)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            CaptureSnapshotBuffersAt(); // TEMP: SHARPEMU_CAPTURE_BUFFERS_AT copies buffers before the nth dispatch
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
