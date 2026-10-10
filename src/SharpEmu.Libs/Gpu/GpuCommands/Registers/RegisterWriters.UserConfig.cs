@@ -50,6 +50,17 @@ internal static partial class RegisterWriters
         indirect[GdsOaCounter] = OrderedAppendEntry;
         indirect[GdsOaAddress] = OrderedAppendEntry;
         indirect[GeStereoCntl] = IgnoreEntry;
+        indirect[UserConfigUndocumented191] = UndocumentedUserConfigEntry;
+    }
+
+    private static long _lastUndocumentedUserConfigValue = -1;
+
+    private static void UndocumentedUserConfigEntry(RegisterBanks banks, uint offset, uint value)
+    {
+        if (Interlocked.Exchange(ref _lastUndocumentedUserConfigValue, value) != value)
+        {
+            Console.Error.WriteLine($"[GPU][WARN] Undocumented user-config register written: offset=0x{offset:X4} value=0x{value:X8}; it is not applied.");
+        }
     }
 
     private static uint PrimitiveTypePacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values) =>
