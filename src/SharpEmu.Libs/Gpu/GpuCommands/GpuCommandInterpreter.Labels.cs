@@ -218,10 +218,37 @@ public sealed partial class GpuCommandInterpreter
             $"index={eventIndex} bits={(is64Bit ? 64 : 32)} interrupt={interruptSelector} destination=0x{destination:X16}.");
     }
 
+    // An end-of-pipe label tells the guest the GPU finished everything before it, so the guest then
+    // reuses the memory those commands read (per-frame constant and bone-matrix rings). Written at
+    // interpret time, the label released memory the GPU had not consumed yet: with buffers the GPU
+    // reads in place, characters exploded into polygon shards whenever the GPU lagged. The label is
+    // written when the submission completes with SHARPEMU_EOP_AT_COMPLETION=1 (opt-in: on Yotei it did
+    // not remove the character shards, which come from the cloth simulation).
+    private static readonly bool LabelsAtCompletion =
+        Environment.GetEnvironmentVariable("SHARPEMU_EOP_AT_COMPLETION") == "1";
+
+    // Queued ahead of the end-of-pipe record, so a label lands before the interrupt that reports it.
+    private void QueueLabelWrite(ulong destination, ulong value, int size)
+    {
+        var host = _host;
+        host.QueueGuestWriteAtCompletion(() =>
+        {
+            Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(bytes, value);
+            var data = bytes[..size];
+            if (!host.TryWriteThrough(destination, data) && !host.Memory.TryWrite(destination, data))
+                throw host.Fatal($"The end-of-pipe label cannot be written: address=0x{destination:X16} size={size}.");
+            host.NoteCommandProcessorWrite(destination, (ulong)size);
+        });
+    }
+
     private void Write32(ulong destination, uint value, bool withWriteBack, bool withInterrupt, int eventId, uint contextId)
     {
         _host.PublishGpuResults();
-        WriteDword(destination, value);
+        if (!LabelsAtCompletion)
+            WriteDword(destination, value);
+        else
+            QueueLabelWrite(destination, value, sizeof(uint));
         var kind = withInterrupt
             ? (withWriteBack ? EndOfPipeWriteKind.InterruptWriteBack32 : EndOfPipeWriteKind.Interrupt32)
             : (withWriteBack ? EndOfPipeWriteKind.WriteBack32 : EndOfPipeWriteKind.Write32);
@@ -231,7 +258,10 @@ public sealed partial class GpuCommandInterpreter
     private void Write64(ulong destination, ulong value, bool withWriteBack, bool withInterrupt, int eventId, uint contextId)
     {
         _host.PublishGpuResults();
-        WriteQword(destination, value);
+        if (!LabelsAtCompletion)
+            WriteQword(destination, value);
+        else
+            QueueLabelWrite(destination, value, sizeof(ulong));
         var kind = withInterrupt
             ? (withWriteBack ? EndOfPipeWriteKind.InterruptWriteBack64 : EndOfPipeWriteKind.Interrupt64)
             : (withWriteBack ? EndOfPipeWriteKind.WriteBack64 : EndOfPipeWriteKind.Write64);

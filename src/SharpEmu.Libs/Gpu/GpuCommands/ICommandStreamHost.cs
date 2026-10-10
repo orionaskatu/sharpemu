@@ -130,6 +130,10 @@ public interface ICommandStreamHost
 
     void RecordEndOfPipe(in EndOfPipeWrite write);
 
+    // Runs a guest-memory write when the GPU completes the commands recorded so far (an end-of-pipe
+    // label). Hosts without completion tracking write at once.
+    void QueueGuestWriteAtCompletion(Action write) => write();
+
     // Delivers the interrupt now, without waiting for the GPU.
     void TriggerInterrupt(int eventId, uint contextId);
 

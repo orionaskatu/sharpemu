@@ -473,6 +473,12 @@ internal static unsafe partial class VulkanVideoPresenter
         public void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount) =>
             EndOfPipe.ReadGdsWords(_bufferCache.GdsBuffer.Mapped, destination, wordOffset, wordCount);
 
+        public void QueueGuestWriteAtCompletion(Action write)
+        {
+            _ = BeginBatchedGuestCommands();
+            _scheduler.QueuePriorityCompletionAction(write);
+        }
+
         public void RecordEndOfPipe(in EndOfPipeWrite write)
         {
             using var completionScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandEndOfPipe);
