@@ -23,6 +23,7 @@ internal static partial class RegisterWriters
     [
         SpiShaderPaceIdPs, SpiGraphicsShaderControlPs, SpiShaderPaceIdGs, SpiShaderPgmRsrc4Gs, SpiGraphicsShaderControlGs,
         SpiShaderUserDataAddrLoGs, SpiShaderUserDataAddrHiGs, SpiShaderPgmChksumHs, SpiShaderPgmRsrc4Hs, SpiGraphicsShaderControlHs,
+        SpiShaderUndocumented192,
     ];
 
     public static void FillShader(RegisterPacketWriter?[] direct, RegisterWriter?[] indirect)
