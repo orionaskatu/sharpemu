@@ -16,6 +16,7 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 
 public sealed partial class RenderExecutor
 {
+    private static readonly HashSet<ulong> LoggedTessellationConfigs = []; // TEMP
     private void DrawTessellationIndexed(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments)
     {
         var count = arguments.IndexCount;
@@ -61,6 +62,8 @@ public sealed partial class RenderExecutor
         var layout = tessellation.HullConfiguration;
         var patches = count / layout.InputControlPoints;
         if (patches == 0) { _host.ResetBindings(); return; }
+        if (LoggedTessellationConfigs.Add(state.Programs.VertexInput.Stage.Program?.Hash ?? 0)) // TEMP
+            Console.Error.WriteLine($"[DBG][TESS] ds=0x{state.Programs.VertexInput.Stage.Program?.Hash ?? 0:X16} hs=0x{input.Stage.Program?.Hash ?? 0:X16} config={tessellation.Configuration} layout={layout} count={count} instances={instances}");
         var factorIndex = input.Stage.Program!.TessellationFactorBuffer;
         if (factorIndex < 0 || factorIndex >= input.Stage.Resources.Buffers.Length)
             throw _host.Fatal("The tessellation factor buffer is missing from the hull resources.");

@@ -525,11 +525,12 @@ public sealed partial class RenderExecutor
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
     };
 
-    // The water deferred draws (vertex shader 4D314AF5..., pixel shader 459074A8...) took 5 s of GPU time per frame in an EXEC
-    // waterfall that never ended in one-lane graphics waves; fixed in the translator, so nothing is skipped by default.
+    // The water (tessellated triangle patches, domain shader 4D314AF5..., pixel shader 459074A8...). Its pixel shader's 5 s per
+    // frame (an EXEC waterfall that never ended in one-lane graphics waves) is fixed, but drawn it still covers the scene with
+    // dark planes and smeared streaks, so it stays skipped by default; SHARPEMU_DBG_SKIP_VS=off draws it.
     private static readonly HashSet<ulong> DbgSkipVertexHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") switch
     {
-        null => [],
+        null => [0x4D314AF535375953UL],
         var text => text.Split(',', StringSplitOptions.RemoveEmptyEntries).Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet(),
     };
