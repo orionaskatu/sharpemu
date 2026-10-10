@@ -84,6 +84,46 @@ public sealed class Gen5ReferenceInterpreter
     public int FailedPageReads { get; private set; }
     private Wave? _currentWave;
 
+    // Position exports of vertex waves: (lane, x, y, z, w) per active lane, in run order.
+    public List<(int Lane, uint X, uint Y, uint Z, uint W)> Positions { get; } = new();
+    public uint[]? FirstExportRegisters { get; private set; } // v0..v23 of the first lane at the first position export
+
+    private void ExecuteExport(Wave wave, Gen5ShaderInstruction instruction)
+    {
+        if (instruction.Control is not Gen5ExportControl control || control.Target != 12) return;
+        for (var lane = 0; lane < _waveSize; lane++)
+        {
+            if ((wave.ExecMask >> lane & 1) == 0) continue;
+            uint Component(int index) => instruction.Sources.Count > index && instruction.Sources[index].Kind == Gen5OperandKind.VectorRegister
+                ? GetV(wave, instruction.Sources[index].Value, lane) : 0u;
+            Positions.Add((lane, Component(0), Component(1), Component(2), Component(3)));
+            if (FirstExportRegisters is null) { FirstExportRegisters = new uint[24]; for (var r = 0; r < 24; r++) FirstExportRegisters[r] = GetV(wave, (uint)r, lane); }
+        }
+    }
+
+    // Runs one vertex wave: user data from s[userDataBase], vertex ids in v5, instance ids in v8 (NGG ES layout).
+    public void RunVertexWave(uint[] userData, int userDataBase, uint[] vertexIds, uint[] instanceIds, int maxInstructions = 10_000_000)
+    {
+        var wave = new Wave { V = new uint[256 * _waveSize], Wave32 = _waveSize == 32 };
+        Array.Copy(userData, 0, wave.S, userDataBase, Math.Min(userData.Length, 104 - userDataBase));
+        ulong exec = 0;
+        for (var lane = 0; lane < vertexIds.Length && lane < _waveSize; lane++)
+        {
+            exec |= 1UL << lane;
+            SetV(wave, 5, lane, vertexIds[lane]);
+            SetV(wave, 8, lane, instanceIds[lane]);
+        }
+        wave.S[3] = (uint)vertexIds.Length | ((uint)vertexIds.Length << 8); // merged wave info: vertex and primitive counts
+        wave.ExecMask = exec;
+        var executed = 0;
+        while (!wave.Done)
+        {
+            Step(wave);
+            if (++executed > maxInstructions) throw new InvalidOperationException("instruction budget exceeded");
+        }
+        ExecutedInstructions += executed;
+    }
+
     // Runs one workgroup: user data in s0..s[n-1], then the workgroup id registers, thread ids in v0..v2.
     public void RunWorkgroup(uint[] userData, uint localX, uint localY, uint localZ, uint groupX, uint groupY, uint groupZ,
         Gen5ComputeSystemRegisters? systemRegisters, int threadIdCount, int maxInstructions = 400_000_000)
@@ -293,6 +333,9 @@ public sealed class Gen5ReferenceInterpreter
             case Gen5ShaderEncoding.Flat:
                 ExecuteGlobal(wave, instruction);
                 break;
+            case Gen5ShaderEncoding.Exp:
+                ExecuteExport(wave, instruction);
+                break;
             default:
                 ExecuteVector(wave, instruction);
                 break;
@@ -323,6 +366,7 @@ public sealed class Gen5ReferenceInterpreter
             case "SCbranchExecz": return wave.ExecMask == 0 ? Target(instruction) : next;
             case "SCbranchExecnz": return wave.ExecMask != 0 ? Target(instruction) : next;
             case "SWaitcnt": case "SNop": case "SInstPrefetch": case "SSetprio": case "SSleep": case "SWaitcntDepctr": case "SClause": case "SCodeEnd":
+            case "SSendmsg": case "SSendmsghalt":
                 return next;
             default: throw new NotSupportedException(instruction.Opcode);
         }
@@ -393,6 +437,8 @@ public sealed class Gen5ReferenceInterpreter
             case "SCselectB64": SetS64(wave, dst, wave.Scc ? A64() : B64()); return;
             case "SBfmB32": SetS(wave, dst, ((1u << (int)(A() & 31)) - 1) << (int)(B() & 31)); return;
             case "SBfeU32": { var b = B(); var off = (int)(b & 31); var w = (int)((b >> 16) & 0x7F); var v = w == 0 ? 0 : (A() >> off) & (w >= 32 ? uint.MaxValue : (1u << w) - 1); R32(v); return; }
+            case "SBfeU64": { var b = B(); var off = (int)(b & 63); var w = (int)((b >> 16) & 0x7F); var v = w == 0 ? 0 : (A64() >> off) & (w >= 64 ? ulong.MaxValue : (1UL << w) - 1); R64(v); return; }
+            case "SBfeI64": { var b = B(); var off = (int)(b & 63); var w = Math.Min((int)((b >> 16) & 0x7F), 64); var v = w == 0 || off + w > 64 ? 0 : (long)(A64() << (64 - off - w)) >> (64 - w); R64((ulong)v); return; }
             case "SBfeI32": { var b = B(); var off = (int)(b & 31); var w = (int)((b >> 16) & 0x7F); var v = w == 0 ? 0 : (int)(A() << (32 - off - w)) >> (32 - w); R32((uint)v); return; }
             case "SBitcmp0B32": wave.Scc = ((A() >> (int)(B() & 31)) & 1) == 0; return;
             case "SBitcmp1B32": wave.Scc = ((A() >> (int)(B() & 31)) & 1) != 0; return;
@@ -1076,6 +1122,8 @@ public sealed class Gen5ReferenceInterpreter
                 case "VLshlAddU32": r = (a << (int)(b & 31)) + c; break;
                 case "VAddLshlU32": r = (a + b) << (int)(c & 31); break;
                 case "VLshlOrB32": case "VLshlOrU32": r = (a << (int)(b & 31)) | c; break;
+                case "VCvtPkU16U32": r = Math.Min(a, 0xFFFFu) | (Math.Min(b, 0xFFFFu) << 16); break;
+                case "VCvtPkI16I32": r = (uint)(ushort)Math.Clamp((int)a, short.MinValue, short.MaxValue) | ((uint)(ushort)Math.Clamp((int)b, short.MinValue, short.MaxValue) << 16); break;
                 case "VXor3B32": r = a ^ b ^ c; break;
                 case "VXadU32": r = (a ^ b) + c; break;
                 case "VAlignbitB32": r = (uint)((((ulong)a << 32) | b) >> (int)(c & 31)); break;

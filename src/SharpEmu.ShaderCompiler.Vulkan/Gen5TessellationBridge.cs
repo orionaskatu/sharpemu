@@ -10,6 +10,8 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 // the domain shader still reads the original guest control-point ring.
 public static class Gen5TessellationBridge
 {
+    private static readonly bool DbgNoCull = System.Environment.GetEnvironmentVariable("SHARPEMU_DBG_TESS_NOCULL") == "1"; // TEMP
+
     public static uint FactorCount(Gen5TessellationDomain domain) => domain switch
     {
         Gen5TessellationDomain.Isolines => 2,
@@ -84,7 +86,8 @@ public static class Gen5TessellationBridge
                 var lower = Op(SpirvOp.Select, floatType, Op(SpirvOp.FOrdLessThan, boolType, level, minimum), minimum, level);
                 var clamped = Op(SpirvOp.Select, floatType, Op(SpirvOp.FOrdGreaterThan, boolType, lower, maximum), maximum, lower);
                 // Nonpositive or NaN outer factors must still cull the patch.
-                value = Op(SpirvOp.Select, floatType, Op(SpirvOp.FOrdGreaterThan, boolType, level, zero), clamped, level);
+                value = DbgNoCull ? clamped // TEMP: SHARPEMU_DBG_TESS_NOCULL=1 never culls a patch
+                    : Op(SpirvOp.Select, floatType, Op(SpirvOp.FOrdGreaterThan, boolType, level, zero), clamped, level);
             }
             module.AddStatement(SpirvOp.Store, Op(SpirvOp.AccessChain, outputFloat, output, UInt(index)), value);
         }

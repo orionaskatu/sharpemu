@@ -240,6 +240,10 @@ public sealed partial class RenderExecutor
         }
 
         Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
+        if (DbgInstanceCheck.Count != 0 && (DbgInstanceCheck.Contains(0) || DbgInstanceCheck.Contains(vertexInput.Stage.Program?.Hash ?? 0)) && // TEMP
+            vertexInput.Stage.Program is not null && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds > 300 &&
+            DbgVrefSeen.GetValueOrDefault(vertexInput.Stage.Program.Hash) is var seen && seen < 2 && (DbgVrefSeen[vertexInput.Stage.Program.Hash] = seen + 1) > 0)
+            DbgReferenceVertices(vertexInput.Stage.Program!.Hash, vertexInput.Stage.Program!.UserDataBase, vertexInput.Stage.Resources.UserData, draw, emission, indexSource);
         if (DbgProbeOn) // TEMP
         {
             if (emission.IndirectArgumentsAddress != 0)
@@ -534,6 +538,111 @@ public sealed partial class RenderExecutor
         var text => text.Split(',', StringSplitOptions.RemoveEmptyEntries).Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet(),
     };
+
+    // TEMP: SHARPEMU_DBG_INST_CHECK=vsHash,... scans the 64-byte per-instance matrices the draw reads through the V# at
+    // user-data pointer *(s[8:9] + 88) and logs entries that are not finite or are far outside the world.
+    private static readonly HashSet<ulong> DbgInstanceCheck = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_INST_CHECK") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(item => item == "all" ? 0UL : Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet();
+    private static readonly Dictionary<ulong, int> DbgVrefSeen = new();
+    private static long _dbgInstanceChecks;
+    private void DbgCheckInstanceMatrices(ulong hash, uint[] userData, uint instances)
+    {
+        if (userData.Length < 2 || Interlocked.Increment(ref _dbgInstanceChecks) > 4000) return;
+        var table = (userData[0] | ((ulong)userData[1] << 32)) & 0xFFFFFFFFFFFFUL;
+        Span<byte> words = stackalloc byte[16];
+        Span<byte> pointerBytes = stackalloc byte[8];
+        if (!_host.TryReadGuest(table + 88, pointerBytes)) { Console.Error.WriteLine($"[DBG][INST] vs=0x{hash:X16} table=0x{table:X} unreadable"); return; }
+        var descriptorAddress = BitConverter.ToUInt64(pointerBytes) & 0xFFFFFFFFFFFFUL;
+        if (!_host.TryReadGuest(descriptorAddress, words)) { Console.Error.WriteLine($"[DBG][INST] vs=0x{hash:X16} V# at 0x{descriptorAddress:X} unreadable"); return; }
+        var w0 = BitConverter.ToUInt32(words); var w1 = BitConverter.ToUInt32(words[4..]); var w2 = BitConverter.ToUInt32(words[8..]); var w3 = BitConverter.ToUInt32(words[12..]);
+        var baseAddress = w0 | ((ulong)(w1 & 0xFFFF) << 32);
+        var stride = (w1 >> 16) & 0x3FFF;
+        var bytes = Math.Min(stride == 0 ? w2 : (ulong)w2 * stride, 4UL << 20);
+        var data = new byte[bytes];
+        if (bytes == 0 || !_host.TryReadGuest(baseAddress, data)) { Console.Error.WriteLine($"[DBG][INST] vs=0x{hash:X16} V#=0x{baseAddress:X}/stride{stride}/rec{w2}/w3=0x{w3:X} unreadable"); return; }
+        var step = stride == 0 ? 64u : stride;
+        int count = 0, bad = 0, zero = 0, firstBad = -1;
+        for (ulong offset = 0; offset + 64 <= bytes; offset += step, count++)
+        {
+            var allZero = true; var ok = true;
+            for (var i = 0; i < 16; i++)
+            {
+                var value = BitConverter.ToSingle(data, (int)offset + i * 4);
+                if (value != 0) allZero = false;
+                if (!float.IsFinite(value) || Math.Abs(value) > 1e6f) ok = false;
+            }
+            if (allZero) zero++;
+            if (!ok) { bad++; if (firstBad < 0) firstBad = count; }
+        }
+        var sample = firstBad < 0 ? "" : " first=" + string.Join(",", Enumerable.Range(0, 16).Select(i => BitConverter.ToSingle(data, (int)(firstBad * step) + i * 4).ToString("G4")));
+        Console.Error.WriteLine($"[DBG][INST] vs=0x{hash:X16} instances={instances} V#=0x{baseAddress:X}/stride{stride}/rec{w2} matrices={count} bad={bad} zero={zero} firstBad={firstBad}{sample}");
+    }
+
+    // TEMP: runs the vertex program on the CPU (Gen5ReferenceInterpreter) for the draw's indices and instances and logs
+    // the clip-space position statistics, to tell bad inputs from a bad GPU translation.
+    private void DbgReferenceVertices(ulong hash, uint userDataBase, uint[] userData, in DrawCall draw, in DrawEmission emission, in IndexSource indexSource)
+    {
+        if (Interlocked.Increment(ref _dbgInstanceChecks) > 3000) return;
+        SharpEmu.ShaderCompiler.Gen5ShaderProgram? program = null;
+        foreach (var (programHash, candidate) in Diagnostics.ReferenceCheck.Programs.Values)
+            if (programHash == hash) { program = candidate; break; }
+        if (program is null) { Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} program not registered (set SHARPEMU_DBG_REF_CS)"); return; }
+        uint count = draw.Count, instances = draw.InstanceCount, firstIndex = 0, firstInstance = emission.FirstInstance;
+        var vertexOffset = emission.VertexOffset;
+        if (emission.IndirectArgumentsAddress != 0)
+        {
+            Span<byte> args = stackalloc byte[20];
+            if (!_host.TryReadGuest(emission.IndirectArgumentsAddress, args)) return;
+            count = BitConverter.ToUInt32(args); instances = BitConverter.ToUInt32(args[4..]);
+            if (emission.Indexed) { firstIndex = BitConverter.ToUInt32(args[8..]); vertexOffset = BitConverter.ToInt32(args[12..]); firstInstance = BitConverter.ToUInt32(args[16..]); }
+            else { vertexOffset = (int)BitConverter.ToUInt32(args[8..]); firstInstance = BitConverter.ToUInt32(args[12..]); }
+        }
+        var vertexLimit = Math.Min(count, 3072u);
+        if (vertexLimit == 0 || instances == 0) return;
+        var ids = new uint[vertexLimit];
+        if (emission.Indexed && indexSource.Enabled)
+        {
+            var size = indexSource.Type == Silk.NET.Vulkan.IndexType.Uint32 ? 4u : 2u;
+            var bytes = new byte[vertexLimit * size];
+            if (indexSource.HostData is { } host) Array.Copy(host, Math.Min(host.Length, firstIndex * size), bytes, 0, Math.Min(bytes.Length, Math.Max(0, host.Length - (int)(firstIndex * size))));
+            else if (!_host.TryReadGuest(indexSource.Address + firstIndex * size, bytes)) return;
+            for (var i = 0; i < vertexLimit; i++) ids[i] = (uint)((size == 4 ? BitConverter.ToUInt32(bytes, i * 4) : BitConverter.ToUInt16(bytes, i * 2)) + vertexOffset);
+        }
+        else for (var i = 0u; i < vertexLimit; i++) ids[i] = (uint)(i + vertexOffset);
+        var interpreter = new SharpEmu.ShaderCompiler.Reference.Gen5ReferenceInterpreter(program, (address, destination) => _host.TryReadGuest(address, destination));
+        var instanceLimit = Math.Max(1u, Math.Min(instances, 6144u / Math.Max(1u, vertexLimit)));
+        try
+        {
+            for (var instance = 0u; instance < instanceLimit; instance++)
+                for (var start = 0; start < ids.Length; start += 64)
+                {
+                    var lanes = Math.Min(64, ids.Length - start);
+                    var instanceIds = Enumerable.Repeat(firstInstance + instance, lanes).ToArray();
+                    interpreter.RunVertexWave(userData, (int)userDataBase, ids[start..(start + lanes)], instanceIds);
+                }
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} interpreter failed: {exception.GetType().Name}: {exception.Message}");
+            return;
+        }
+        int nan = 0, huge = 0, behind = 0;
+        float minW = float.MaxValue, maxW = float.MinValue, maxNdc = 0;
+        foreach (var (_, x, y, z, w) in interpreter.Positions)
+        {
+            float fx = BitConverter.UInt32BitsToSingle(x), fy = BitConverter.UInt32BitsToSingle(y), fw = BitConverter.UInt32BitsToSingle(w);
+            if (!float.IsFinite(fx) || !float.IsFinite(fy) || !float.IsFinite(fw)) { nan++; continue; }
+            if (fw <= 0) { behind++; continue; }
+            minW = Math.Min(minW, fw); maxW = Math.Max(maxW, fw);
+            var ndc = Math.Max(Math.Abs(fx / fw), Math.Abs(fy / fw));
+            maxNdc = Math.Max(maxNdc, ndc);
+            if (ndc > 50) huge++;
+        }
+        if (nan == 0 && huge == 0 && !DbgInstanceCheck.Contains(hash)) { Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} ok positions={interpreter.Positions.Count} maxNdc={maxNdc:G4}"); return; }
+        Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} BAD indexed={emission.Indexed} indirect={emission.IndirectArgumentsAddress != 0} count={count} instances={instances} firstInstance={firstInstance} vertexOffset={vertexOffset} " +
+            $"positions={interpreter.Positions.Count} nan={nan} behind={behind} hugeNdc={huge} maxNdc={maxNdc:G4} w=[{minW:G4},{maxW:G4}] " +
+            $"firstLaneV0-23={string.Join(" ", (interpreter.FirstExportRegisters ?? []).Select(v => BitConverter.UInt32BitsToSingle(v) is var f && float.IsFinite(f) && Math.Abs(f) < 1e7f && Math.Abs(f) > 1e-7f ? f.ToString("G5") : $"0x{v:X}"))}");
+    }
 
     private const ulong IndexedIndirectArgumentsSize = 20;
     private const ulong IndirectArgumentsSize = 16;

@@ -388,7 +388,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             CaptureCheckFrame();
             if (_captureState == 1)
-                _captureManifest.Add($"drawcall pass={_capturePass} marker='{SharpEmu.Libs.Diagnostics.DbgSequence.Marker}' active={_renderingActive} kind={kind} count={count} instances={instances} pipeline={_boundGraphicsPipeline?.Id ?? 0} ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} {_dbgDepthState}");
+                _captureManifest.Add($"drawcall pass={_capturePass} marker='{SharpEmu.Libs.Diagnostics.DbgSequence.Marker}' active={_renderingActive} kind={kind} count={count} instances={instances} pipeline={_boundGraphicsPipeline?.Id ?? 0} ps=0x{_boundGraphicsPipeline?.ProfilePixelHash ?? 0:X} vs=0x{_boundGraphicsPipeline?.ProfileVertexHash ?? 0:X} {_dbgDepthState}");
         }
 
         private void CaptureNotePass(in Gpu.Rendering.RenderingState state)
