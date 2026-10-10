@@ -230,6 +230,11 @@ public sealed class ShaderCompileRequest
     public IReadOnlyList<(float X, float Y)> PixelCustomSampleOffsets { get; init; } = [];
     public bool EarlyFragmentTests { get; init; }
 
+    // A wave64 compute program whose host subgroups are required to be 64 lanes wide: each host
+    // subgroup is one guest wave, so lane masks, ballots, READLANE and EXEC tests are plain
+    // 64-lane subgroup operations, without the two-half exchange through shared memory.
+    public bool NativeWave64 { get; init; }
+
     // DB_SHADER_CONTROL.PRIMITIVE_ORDERED_PIXEL_SHADER on a device with fragment shader
     // interlock: the whole pixel shader is an ordered critical section, as POPS makes it, so
     // overlapping fragments read-modify-write their images in primitive order.

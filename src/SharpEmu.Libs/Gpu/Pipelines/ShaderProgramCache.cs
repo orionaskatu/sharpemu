@@ -749,6 +749,8 @@ internal sealed class ShaderProgramCache
                     WaveSize = info.WaveSize,
                     TessellationHull = options.TessellationHull,
                     CooperativeWave64Workgroup = options.TessellationHull is not null,
+                    NativeWave64 = options.TessellationHull is null &&
+                        ComputeWaveModel.UsesNativeWave64(info, _host.ComputeSubgroup64Required, _host.MaxComputeWorkgroupSubgroups),
                     EnableExecGuardElision = info.WaveSize != 64 || _host.ExecGuardElisionEnabled,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
                     ScratchDwords = info.ScratchDwords,
@@ -801,6 +803,7 @@ internal sealed class ShaderProgramCache
             NativeHalfConversionExact = host.NativeHalfConversionExact,
             ZeroOutOfBoundsBufferReads = host.ZeroOutOfBoundsBufferReads,
             WaveSize = info.WaveSize,
+            NativeWave64 = ComputeWaveModel.UsesNativeWave64(info, host.ComputeSubgroup64Required, host.MaxComputeWorkgroupSubgroups),
             EnableExecGuardElision = info.WaveSize != 64 || host.ExecGuardElisionEnabled,
             TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
             ScratchDwords = info.ScratchDwords,

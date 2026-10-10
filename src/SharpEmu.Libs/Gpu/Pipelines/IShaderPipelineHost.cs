@@ -61,6 +61,9 @@ internal interface IShaderPipelineHost
     bool PerVertexPixelInputsSupported => true;
     bool ClipDistanceEnabled => false;
     bool PostDepthCoverageSupported => false;
+    // The device can require 64-lane compute subgroups (see ComputeWaveModel).
+    bool ComputeSubgroup64Required => false;
+    uint MaxComputeWorkgroupSubgroups => 0;
     // fragmentShaderPixelInterlock: primitive-ordered pixel shaders run under an ordered interlock.
     bool FragmentShaderInterlockSupported => false;
     bool NativeTwoSampleMixedSupported => false;

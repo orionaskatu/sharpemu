@@ -38,9 +38,10 @@ internal static class DbgSequence
 
     [ThreadStatic] private static List<string>? _markers;
     public static string Marker => _markers is { Count: > 0 } ? string.Join("/", _markers.Skip(Math.Max(0, _markers.Count - 2))) : "";
-    // Particle simulation (emit, update, sort, ribbons, wind) runs on one frame out of SHARPEMU_PARTICLE_EVERY (default 4; 1 = every
-    // frame): the many tiny dispatches cost far more than their GPU work. Skipped frames reuse the previous particle buffers.
-    private static readonly int ParticleEvery = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PARTICLE_EVERY"), out var every) ? Math.Max(1, every) : 4;
+    // Particle simulation (emit, update, sort, ribbons, wind) can run on one frame out of SHARPEMU_PARTICLE_EVERY (default 1 =
+    // every frame, as the guest does): the many tiny dispatches cost far more than their GPU work. Skipped frames reuse the
+    // previous particle buffers, which loses effects.
+    private static readonly int ParticleEvery = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PARTICLE_EVERY"), out var every) ? Math.Max(1, every) : 1;
     private static readonly string[] ParticleSimMarkers = ["Particle Update", "Particle Emit", "Particle No Deps", "Particle Sort", "Particle Ribbon",
         "Particle Post-Update", "ParticleWind", "Particle Wait For Velocity", "Particle CS Frame"];
     private static int _frames;

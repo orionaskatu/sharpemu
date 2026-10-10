@@ -75,6 +75,8 @@ public static partial class Gen5SpirvTranslator
         private readonly bool _zeroOutOfBoundsBufferReads;
         private readonly uint _waveLaneCount;
         private readonly bool _emulateWave64;
+        // One host subgroup of 64 lanes is one guest wave (ShaderCompileRequest.NativeWave64).
+        private readonly bool _nativeWave64;
 
         // Safety valve for the PC-dispatcher loop. Each iteration executes one
         // GCN basic block; a correctly-translated shader always reaches its
@@ -8722,6 +8724,11 @@ public static partial class Gen5SpirvTranslator
 
         private uint GuestWaveLane()
         {
+            if (_nativeWave64 && _subgroupInvocationIdInput != 0)
+            {
+                return BitwiseAnd(Load(_uintType, _subgroupInvocationIdInput), UInt(63));
+            }
+
             if (_waveLaneCount == 64 && _localInvocationIndexInput != 0)
             {
                 return BitwiseAnd(
@@ -8808,7 +8815,7 @@ public static partial class Gen5SpirvTranslator
         // using those guest indices directly in OpGroupNonUniformShuffle is undefined.
         // Preserve the current physical half on devices whose subgroup is wider than 32.
         private uint ShuffleHalfWaveLane(uint value, uint guestLane) =>
-            _subgroupInvocationIdInput == 0 ? value : ShuffleLane(value,
+            _subgroupInvocationIdInput == 0 ? value : _nativeWave64 ? ShuffleLane(value, BitwiseAnd(guestLane, UInt(63))) : ShuffleLane(value,
                 BitwiseOr(BitwiseAnd(Load(_uintType, _subgroupInvocationIdInput), UInt(0xFFFF_FFE0)),
                     BitwiseAnd(guestLane, UInt(31))));
 
@@ -8826,7 +8833,7 @@ public static partial class Gen5SpirvTranslator
                     SpirvOp.UConvert,
                     _ulongType,
                     maskedLane));
-            return _emulateWave64
+            return _emulateWave64 || _nativeWave64
                 ? shifted
                 : _module.AddInstruction(
                     SpirvOp.Select,
@@ -8885,6 +8892,11 @@ public static partial class Gen5SpirvTranslator
             if (_waveLaneCount != 64)
             {
                 return widened;
+            }
+
+            if (_nativeWave64)
+            {
+                return Pair64(low, _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, ballot, 1));
             }
 
             return _module.AddInstruction(

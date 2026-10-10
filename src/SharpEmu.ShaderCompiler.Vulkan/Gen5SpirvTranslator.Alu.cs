@@ -77,6 +77,13 @@ public static partial class Gen5SpirvTranslator
                             activeLanes,
                             0);
                         var firstActiveLane = Ext(73, _uintType, activeLow);
+                        if (_nativeWave64)
+                        {
+                            var activeHigh = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, activeLanes, 1);
+                            firstActiveLane = _module.AddInstruction(SpirvOp.Select, _uintType, IsNotZero(activeLow),
+                                firstActiveLane, IAdd(Ext(73, _uintType, activeHigh), UInt(32)));
+                        }
+
                         value = _module.AddInstruction(
                             SpirvOp.GroupNonUniformBroadcast,
                             _uintType,
@@ -3039,6 +3046,11 @@ public static partial class Gen5SpirvTranslator
                     Store(_scc, IsNotZero(result));
                     return true;
                 }
+                case "SWqmB32" when IsSingleLaneWave:
+                    result = BitwiseAnd(left, UInt(1));
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
                 case "SWqmB32":
                 {
                     var quadAny = BitwiseAnd(
@@ -3858,6 +3870,11 @@ public static partial class Gen5SpirvTranslator
             {
                 value = left;
             }
+            else if (instruction.Opcode == "SWqmB64" && IsSingleLaneWave)
+            {
+                // The quad's other lanes do not exist in a one-lane wave: WQM keeps lane 0 only.
+                value = _module.AddInstruction(SpirvOp.BitwiseAnd, _ulongType, left, _module.Constant64(_ulongType, 1));
+            }
             else if (instruction.Opcode == "SWqmB64")
             {
                 var quadAny = _module.AddInstruction(
@@ -4610,6 +4627,15 @@ public static partial class Gen5SpirvTranslator
 
         private void StoreS64(uint register, uint value)
         {
+            // A one-lane graphics wave has no other lanes: EXEC can only hold lane 0, as hardware
+            // EXEC only covers lanes that exist. Without this, S_WQM_B64 EXEC or S_MOV_B64 EXEC, -1
+            // give EXEC bits that no comparison ever clears, and waterfall loops over EXEC
+            // (S_FF1 / V_READLANE / S_ANDN2 until zero) never end.
+            if (register == 126 && IsSingleLaneWave)
+            {
+                value = _module.AddInstruction(SpirvOp.BitwiseAnd, _ulongType, value, _module.Constant64(_ulongType, 1));
+            }
+
             StoreS(
                 register,
                 _module.AddInstruction(SpirvOp.UConvert, _uintType, value));
@@ -4620,6 +4646,9 @@ public static partial class Gen5SpirvTranslator
                 register + 1,
                 _module.AddInstruction(SpirvOp.UConvert, _uintType, high));
         }
+
+        // Graphics stages without subgroup operations run every invocation as a one-lane wave.
+        private bool IsSingleLaneWave => _subgroupInvocationIdInput == 0 && _stage != Gen5SpirvStage.Compute;
 
         private uint DoubleType()
         {

@@ -104,6 +104,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var invocations = (ulong)Math.Max(input.ThreadsX, 1) * Math.Max(input.ThreadsY, 1) * Math.Max(input.ThreadsZ, 1);
+            if (ComputeWaveModel.UsesNativeWave64(input, _canRequireComputeSubgroup64, _maxComputeWorkgroupSubgroups))
+            {
+                return 64u;
+            }
+
             return _canRequireComputeSubgroup64 && input.WaveSize == 64 && invocations == 64 &&
                    Environment.GetEnvironmentVariable("SHARPEMU_REQUIRE_SUBGROUP64") != "0" ? 64u : 0u;
         }
@@ -113,6 +118,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var invocations = (ulong)Math.Max(input.ThreadsX, 1) * Math.Max(input.ThreadsY, 1) * Math.Max(input.ThreadsZ, 1);
             return _canRequireComputeSubgroup32 &&
                    !(input.WaveSize == 64 && invocations == 64) &&
+                   !ComputeWaveModel.UsesNativeWave64(input, _canRequireComputeSubgroup64, _maxComputeWorkgroupSubgroups) &&
                    invocations <= (ulong)_maxComputeWorkgroupSubgroups * RdnaSubgroupSize;
         }
 
@@ -135,6 +141,8 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.ClipDistanceEnabled => _supportsShaderClipDistance;
         private bool _postDepthCoverageEnabled;
         bool IShaderPipelineHost.PostDepthCoverageSupported => _postDepthCoverageEnabled;
+        bool IShaderPipelineHost.ComputeSubgroup64Required => _canRequireComputeSubgroup64;
+        uint IShaderPipelineHost.MaxComputeWorkgroupSubgroups => _maxComputeWorkgroupSubgroups;
         bool IShaderPipelineHost.FragmentShaderInterlockSupported => _fragmentShaderInterlockEnabled;
         public bool NativeTwoSampleMixedSupported => _supportsNativeTwoSampleMixed;
 
