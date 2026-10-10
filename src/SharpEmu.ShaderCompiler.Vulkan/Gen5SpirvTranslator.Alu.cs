@@ -4696,9 +4696,12 @@ public static partial class Gen5SpirvTranslator
         {
             var left = GetFloatSource(instruction, reverse ? 1 : 0);
             var right = GetFloatSource(instruction, reverse ? 0 : 1);
-            return EmitFloatResult(
-                instruction,
-                _module.AddInstruction(operation, _floatType, left, right));
+            var value = _module.AddInstruction(operation, _floatType, left, right);
+            // Separate guest add/sub/mul instructions round their f32 result before
+            // the next instruction. Driver contraction would instead retain an FMA
+            // residual, changing comparisons and transformed positions.
+            _module.AddDecoration(value, SpirvDecoration.NoContraction);
+            return EmitFloatResult(instruction, value);
         }
 
         // v_min_f32 and v_max_f32 return the other operand when one is NaN. GLSL FMin and FMax
