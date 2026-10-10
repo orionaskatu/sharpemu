@@ -483,6 +483,7 @@ public static partial class Gen5SpirvTranslator
 
 
                 EmitDeviceFormatLoadFunctions();
+                EmitRuntimeLookupFunctions();
 
 
                 var model = _stage switch

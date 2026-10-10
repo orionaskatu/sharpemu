@@ -765,9 +765,56 @@ public static partial class Gen5SpirvTranslator
             return _runtimeSamplerArray;
         }
 
-        // The heap slot of a descriptor key, from a bounded linear probe of the host table;
-        // slot 0 and a recorded miss when the table does not hold the key.
+        // One shared lookup function per table (image, sampler), emitted after the program.
+        private readonly uint[] _runtimeLookupFunctions = new uint[2];
+
+        // The heap slot of a descriptor key. Every access calls one shared function: inlined, the
+        // hash and probes of each lookup made a shader with many runtime descriptor accesses
+        // several times larger and its pipeline many times slower to compile.
         private uint LookupRuntimeDescriptor(uint[] key, bool image)
+        {
+            var kind = image ? 0 : 1;
+            if (_runtimeLookupFunctions[kind] == 0)
+            {
+                _runtimeLookupFunctions[kind] = _module.AllocateId();
+            }
+
+            var active = _module.AddInstruction(SpirvOp.Select, _uintType, Load(_boolType, _exec), UInt(1), UInt(0));
+            return _module.AddInstruction(SpirvOp.FunctionCall, _uintType, [_runtimeLookupFunctions[kind], .. key, active]);
+        }
+
+        private void EmitRuntimeLookupFunctions()
+        {
+            for (var kind = 0; kind < _runtimeLookupFunctions.Length; kind++)
+            {
+                var function = _runtimeLookupFunctions[kind];
+                if (function == 0)
+                {
+                    continue;
+                }
+
+                var image = kind == 0;
+                var keyWords = image ? 1 + (int)RuntimeDescriptorTable.ImageWordCount : (int)RuntimeDescriptorTable.SamplerWordCount;
+                var type = _module.TypeFunction(_uintType, [.. Enumerable.Repeat(_uintType, keyWords + 1)]);
+                _module.BeginFunction(_uintType, type, function, SpirvFunctionControl.DontInline);
+                _module.AddName(function, image ? "lookupRuntimeImage" : "lookupRuntimeSampler");
+                var key = new uint[keyWords];
+                for (var word = 0; word < keyWords; word++)
+                {
+                    key[word] = _module.AddFunctionParameter(_uintType);
+                }
+
+                var active = _module.AddFunctionParameter(_uintType);
+                _module.AddLabel();
+                _module.AddStatement(SpirvOp.ReturnValue, EmitRuntimeDescriptorProbe(key, image,
+                    _module.AddInstruction(SpirvOp.INotEqual, _boolType, active, UInt(0))));
+                _module.EndFunction();
+            }
+        }
+
+        // A bounded linear probe of the host table; slot 0 and a recorded miss when the table
+        // does not hold the key.
+        private uint EmitRuntimeDescriptorProbe(uint[] key, bool image, uint active)
         {
             var table = _runtimeDescriptorTable;
             var capacity = LoadBlockWord(table, UInt(image ? RuntimeDescriptorTable.ImageCapacityDword : RuntimeDescriptorTable.SamplerCapacityDword));
@@ -801,7 +848,7 @@ public static partial class Gen5SpirvTranslator
 
             var missing = _module.AddInstruction(SpirvOp.IEqual, _boolType, slotPlusOne, UInt(0));
             // Only an active lane reads its descriptor; an inactive one may hold anything.
-            EmitConditional(_module.AddInstruction(SpirvOp.LogicalAnd, _boolType, missing, Load(_boolType, _exec)),
+            EmitConditional(_module.AddInstruction(SpirvOp.LogicalAnd, _boolType, missing, active),
                 () => RecordRuntimeDescriptorMiss(key, image));
             return _module.AddInstruction(SpirvOp.Select, _uintType, missing, UInt(0),
                 _module.AddInstruction(SpirvOp.ISub, _uintType, slotPlusOne, UInt(1)));
