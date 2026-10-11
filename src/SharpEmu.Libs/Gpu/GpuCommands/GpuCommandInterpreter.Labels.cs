@@ -523,7 +523,11 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
-        WriteDword(destination, value);
+        // The flip label tells the guest the frame's GPU work is done, like an end-of-pipe label.
+        if (!LabelsAtCompletion)
+            WriteDword(destination, value);
+        else
+            QueueLabelWrite(destination, value, sizeof(uint));
         var flip = PendingFlip;
         var requestId = _host.PrepareFlip(flip.Handle, flip.Index, flip.FlipMode, flip.FlipArgument);
         _host.RecordEndOfPipe(new EndOfPipeWrite(
@@ -544,7 +548,11 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
-        WriteDword(destination, value);
+        // The flip label tells the guest the frame's GPU work is done, like an end-of-pipe label.
+        if (!LabelsAtCompletion)
+            WriteDword(destination, value);
+        else
+            QueueLabelWrite(destination, value, sizeof(uint));
         var flip = PendingFlip;
         var requestId = _host.PrepareFlip(flip.Handle, flip.Index, flip.FlipMode, flip.FlipArgument);
         _host.RecordEndOfPipe(new EndOfPipeWrite(

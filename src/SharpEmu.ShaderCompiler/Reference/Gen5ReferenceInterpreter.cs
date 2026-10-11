@@ -302,10 +302,21 @@ public sealed class Gen5ReferenceInterpreter
         return text.ToString();
     }
 
+    // First-lane VGPRs v0..v23 and SGPRs s0..s23 the first time the wave reaches CapturePc.
+    public ulong CapturePc { get; set; } = ulong.MaxValue;
+    public uint[]? CapturedV { get; private set; }
+    public uint[]? CapturedS { get; private set; }
+
     private void Step(Wave wave)
     {
         if (wave.Pc >= _program.Instructions.Count) { wave.Done = true; return; }
         var instruction = _program.Instructions[wave.Pc];
+        if (instruction.Pc == CapturePc && CapturedV is null)
+        {
+            var lane = System.Numerics.BitOperations.TrailingZeroCount(wave.ExecMask == 0 ? 1UL : wave.ExecMask);
+            CapturedV = new uint[24]; CapturedS = new uint[24];
+            for (var r = 0; r < 24; r++) { CapturedV[r] = GetV(wave, (uint)r, lane); CapturedS[r] = wave.S[r]; }
+        }
         var next = wave.Pc + 1;
         var op = instruction.Opcode;
         switch (instruction.Encoding)

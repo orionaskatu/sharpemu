@@ -618,6 +618,7 @@ public sealed partial class RenderExecutor
         }
         var gpuView = Environment.GetEnvironmentVariable("SHARPEMU_DBG_VREF_GPU") == "1";
         var interpreter = new SharpEmu.ShaderCompiler.Reference.Gen5ReferenceInterpreter(program, gpuView ? ReadGpuView : (address, destination) => _host.TryReadGuest(address, destination));
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_VREF_PC") is { Length: > 0 } capturePc) interpreter.CapturePc = Convert.ToUInt64(capturePc.Replace("0x", ""), 16);
         var instanceLimit = Math.Max(1u, Math.Min(instances, 6144u / Math.Max(1u, vertexLimit)));
         try
         {
@@ -647,8 +648,17 @@ public sealed partial class RenderExecutor
             if (ndc > 50) huge++;
         }
         if (nan == 0 && huge == 0 && !DbgInstanceCheck.Contains(hash)) { Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} ok positions={interpreter.Positions.Count} maxNdc={maxNdc:G4}"); return; }
+        if (interpreter.CapturedS is { } capturedS) // the V# in s[0:3] at the capture pc: dump its first records
+        {
+            var vBase = capturedS[0] | ((ulong)(capturedS[1] & 0xFFFF) << 32);
+            var vStride = (capturedS[1] >> 16) & 0x3FFF;
+            var head = new byte[512];
+            if (vBase != 0 && ReadGpuView(vBase, head))
+                Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} V#=0x{vBase:X}/stride{vStride}/rec{capturedS[2]}/w3=0x{capturedS[3]:X} head={string.Join(" ", Enumerable.Range(0, 128).Select(i => BitConverter.ToSingle(head, i * 4)).Select(f => float.IsFinite(f) && (f == 0 || (Math.Abs(f) > 1e-6f && Math.Abs(f) < 1e7f)) ? f.ToString("G4") : "x"))}");
+        }
         Console.Error.WriteLine($"[DBG][VREF] vs=0x{hash:X16} BAD view={(gpuView ? "gpu" : "guest")} indexed={emission.Indexed} indirect={emission.IndirectArgumentsAddress != 0} count={count} instances={instances} firstInstance={firstInstance} vertexOffset={vertexOffset} " +
             $"positions={interpreter.Positions.Count} nan={nan} behind={behind} hugeNdc={huge} maxNdc={maxNdc:G4} w=[{minW:G4},{maxW:G4}] " +
+            $"captured v={string.Join(",", (interpreter.CapturedV ?? []).Select(v => v.ToString("X")))} s={string.Join(",", (interpreter.CapturedS ?? []).Select(v => v.ToString("X")))} index_type={indexSource.Type} " +
             $"firstLaneV0-23={string.Join(" ", (interpreter.FirstExportRegisters ?? []).Select(v => BitConverter.UInt32BitsToSingle(v) is var f && float.IsFinite(f) && Math.Abs(f) < 1e7f && Math.Abs(f) > 1e-7f ? f.ToString("G5") : $"0x{v:X}"))}");
     }
 
