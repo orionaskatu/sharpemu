@@ -584,12 +584,11 @@ public sealed partial class RenderExecutor
 
         if (indirectArgumentsAddress == 0)
         {
-            // A dispatch that reads and rewrites metadata in place is not a proven full
-            // overwrite, so it runs as written; its clear is still recorded for the next
-            // draw. Titles clear each shadow map's HTile with such a dispatch, and without
-            // the recorded clear the depth target is never cleared and every caster fails
-            // the reverse-Z test.
-            RecordMetadataRewriteClear(input);
+            // A dispatch that reads and rewrites HTile in place runs as written; the depth
+            // target's clear state is then read from the words it wrote. Titles clear each
+            // shadow map's HTile this way, and a target never seen cleared fails every
+            // caster's reverse-Z test.
+            RecordHtileRewrite(input);
             if (TryConsumeMetadataClear(input))
             {
                 _host.ResetBindings();
@@ -851,12 +850,12 @@ public sealed partial class RenderExecutor
         ((programStride & BufferSpecialization.StrideMask) == 0 ||
          (programStride & BufferSpecialization.StrideMask) == (descriptorStride & BufferSpecialization.StrideMask));
 
-    // A dispatch that reads and rewrites one metadata surface in place (a shadow-map HTile
-    // clear written by reading every word and storing it back) is recorded as a clear without
-    // dropping the dispatch: the rewrite is not a proven overwrite, but the words it writes
-    // are. Several metadata surfaces or a write-only clear leave the decision to the
-    // consumption paths.
-    private void RecordMetadataRewriteClear(ComputeInputInfo input)
+    // A dispatch that reads and rewrites one HTile surface in place (a shadow-map HTile clear
+    // written by reading every word and storing it back) marks that HTile rewritten. Whether
+    // it cleared the target is decided from the words it wrote, as the hardware decides from
+    // ZMask, not from the shape of the program. Several metadata surfaces or a write-only
+    // clear leave the decision to the consumption paths.
+    private void RecordHtileRewrite(ComputeInputInfo input)
     {
         var program = input.Stage.Program!;
         var resources = input.Stage.Resources;
@@ -887,12 +886,12 @@ public sealed partial class RenderExecutor
             metadataAddress = descriptor.Address;
         }
 
-        if (metadataAddress != 0 && _host.ClearMetadata(metadataAddress))
+        if (metadataAddress != 0 && _host.IsHtile(metadataAddress) && _host.MarkHtileRewritten(metadataAddress))
         {
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
             {
                 RenderTrace.Write(
-                    $"Recorded a metadata rewrite clear: shader=0x{program.Hash:X16} address=0x{metadataAddress:X16}");
+                    $"Marked an HTile rewritten in place: shader=0x{program.Hash:X16} address=0x{metadataAddress:X16}");
             }
         }
     }

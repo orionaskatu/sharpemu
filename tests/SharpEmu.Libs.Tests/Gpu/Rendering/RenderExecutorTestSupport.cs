@@ -430,6 +430,12 @@ internal sealed class RecordingRenderHost : IRenderHost
         return ClearableMetadata.Contains(address);
     }
 
+    public bool MarkHtileRewritten(ulong address)
+    {
+        Calls.Add($"htile_rewritten {address:X}");
+        return HtileAddresses.Contains(address);
+    }
+
     public bool ExpandMetadata(ulong address)
     {
         Calls.Add($"expand_metadata {address:X}");

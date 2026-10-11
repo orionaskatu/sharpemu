@@ -441,6 +441,14 @@ public sealed partial class GuestImageCache
 
     internal GpuTiler TilerForTest => _tiler;
 
+    internal void RegisterHtileMetadataForTest(ulong address, ulong size, uint layers)
+    {
+        RegisterHtileMetadataForTest(address);
+        using var held = _lock.Hold();
+        _surfaceMetadata[address].Size = size;
+        _surfaceMetadata[address].Layers = layers;
+    }
+
     internal void RegisterHtileMetadataForTest(ulong address)
     {
         using var held = _lock.Hold();

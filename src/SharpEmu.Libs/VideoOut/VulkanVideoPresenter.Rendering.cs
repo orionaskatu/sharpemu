@@ -1414,6 +1414,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool ExpandMetadata(ulong address) => _imageCache.ExpandMetadata(address);
 
+        public bool MarkHtileRewritten(ulong address) => _imageCache.MarkHtileRewritten(address);
+
         public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)
         {
             _ = BeginBatchedGuestCommands();

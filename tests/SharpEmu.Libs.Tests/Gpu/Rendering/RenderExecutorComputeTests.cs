@@ -380,7 +380,23 @@ public sealed class RenderExecutorComputeTests : IDisposable
     }
 
     [Fact]
-    public void MetadataClear_RecordsAReadModifyWriteKernelAndStillDispatches()
+    public void MetadataClear_MarksAnHtileRewrittenInPlaceWithoutAssumingAClear()
+    {
+        _host.MetadataAddresses.Add(MetadataAddress);
+        _host.HtileAddresses.Add(MetadataAddress);
+        _host.ClearableMetadata.Add(MetadataAddress);
+        var readWrite = new BufferResourceInfo(true, true, false, false, false, 4, 0);
+        _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, buffers: [readWrite]), buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
+        _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
+
+        // The words it writes decide the clear later; the dispatch itself proves nothing.
+        Assert.Contains($"htile_rewritten {MetadataAddress:X}", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("clear_metadata", StringComparison.Ordinal));
+        AssertDispatched(4, 1, 1);
+    }
+
+    [Fact]
+    public void MetadataClear_LeavesARewriteOfNonHtileMetadataAlone()
     {
         _host.MetadataAddresses.Add(MetadataAddress);
         _host.ClearableMetadata.Add(MetadataAddress);
@@ -388,7 +404,8 @@ public sealed class RenderExecutorComputeTests : IDisposable
         _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, buffers: [readWrite]), buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
         _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
 
-        Assert.Contains($"clear_metadata {MetadataAddress:X}", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("htile_rewritten", StringComparison.Ordinal));
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("clear_metadata", StringComparison.Ordinal));
         AssertDispatched(4, 1, 1);
     }
 
@@ -406,6 +423,7 @@ public sealed class RenderExecutorComputeTests : IDisposable
         _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
 
         Assert.DoesNotContain(_host.Calls, c => c.StartsWith("clear_metadata", StringComparison.Ordinal));
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("htile_rewritten", StringComparison.Ordinal));
         AssertDispatched(4, 1, 1);
     }
 

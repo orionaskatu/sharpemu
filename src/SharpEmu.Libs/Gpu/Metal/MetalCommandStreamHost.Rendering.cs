@@ -1198,6 +1198,12 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
         return false;
     }
 
+    bool IRenderHost.MarkHtileRewritten(ulong address)
+    {
+        _ = address;
+        return false;
+    }
+
     bool IRenderHost.ExpandMetadata(ulong address)
     {
         _ = address;
