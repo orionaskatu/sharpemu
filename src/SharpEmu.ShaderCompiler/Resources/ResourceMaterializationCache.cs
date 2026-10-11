@@ -1906,6 +1906,7 @@ public sealed class ResourceMaterializationCache
         private readonly List<(ulong Address, uint Word, bool Clean, bool Table)> _reads = new();
         private readonly Dictionary<ulong, int> _readIndex = new();
         private readonly Dictionary<ulong, bool> _mappingProbes = new();
+        private const int MinimumReadIndexCapacity = 256;
         private bool _inTable;
         private GuestWordReader? _reader;
         private GuestWordReader? _cleanReader;
@@ -1935,6 +1936,11 @@ public sealed class ResourceMaterializationCache
         public void Reset()
         {
             _reads.Clear();
+            // Clearing a dictionary zeroes its whole capacity, which keeps the size of the largest walk
+            // ever recorded: after a walk far smaller than that, shrink it so ordinary walks clear little.
+            var used = Math.Max(_readIndex.Count, MinimumReadIndexCapacity);
+            if (_readIndex.EnsureCapacity(0) > used * 4)
+                _readIndex.TrimExcess(used);
             _readIndex.Clear();
             _mappingProbes.Clear();
             // Retain ordinary descriptor walks without keeping unusually large
