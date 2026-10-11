@@ -858,6 +858,32 @@ public sealed partial class GuestImageCacheTests
     }
 
     [Fact]
+    public void DepthTiledTextureReadback_WritesItsGuestBytes()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        const uint width = 3, height = 2, pitch = 4;
+        const ulong size = 0x10000;
+        const uint clear = 0x3f200000u;
+        const uint stale = 0xdeadbeefu;
+        var address = harness.MapBacked(0x20000, ReadWrite);
+        harness.Write(address, Bytes(Enumerable.Repeat(stale, (int)(size / 4)).ToArray()));
+        // A single-channel float texture laid out in the depth tiling, as a depth copy sampled later.
+        var request = LinearRequest(address, size, Format.R32Sfloat, GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(width, height, 1), 1, 4, 1);
+        request.Description.Pitch = pitch;
+        request.Description.TileMode = GuestTileMode.Depth;
+        request.Description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = size, Pitch = pitch, Height = height };
+        var imageIdentifier = harness.Find(ref request);
+        Assert.True(harness.Worker.Run(() => harness.Images.TryClearImageFromBuffer(address, size, clear)));
+
+        Assert.True(harness.Worker.Run(() => harness.Images.TryDownloadForTest(imageIdentifier)));
+        harness.Finish();
+        var after = harness.Read(address, (int)size).Chunk(4).Select(chunk => BitConverter.ToUInt32(chunk)).ToArray();
+        Assert.Equal((int)(width * height), after.Count(value => value == clear));
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void TiledD16Readback_ConvertsAndPreservesStencil()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;

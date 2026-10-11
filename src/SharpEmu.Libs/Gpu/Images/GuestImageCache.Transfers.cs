@@ -126,7 +126,8 @@ public sealed unsafe partial class GuestImageCache
             }
 
             format = role == ImageRole.ColorTarget ? ImageDescription.RenderTargetTransferFormat(info.BytesPerBlock) : info.GuestFormat;
-            allowDepthTile = role is ImageRole.StorageImage or ImageRole.ColorTarget;
+            // A depth-tiled texture (a depth copy sampled as R32F) retiles like its upload detiles.
+            allowDepthTile = role is ImageRole.Texture or ImageRole.StorageImage or ImageRole.ColorTarget;
             plan.SwapBgra16 = info.Bgra16;
         }
 
