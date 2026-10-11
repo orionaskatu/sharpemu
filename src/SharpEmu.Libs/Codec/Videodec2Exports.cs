@@ -105,7 +105,7 @@ public static class Videodec2Exports
             !ctx.TryWriteUInt64(memoryInfoAddress + 0x20, 0) ||
             !ctx.TryWriteUInt64(memoryInfoAddress + 0x28, MinimumMemoryBytes) ||
             !ctx.TryWriteUInt64(memoryInfoAddress + 0x30, 0) ||
-            !ctx.TryWriteUInt64(memoryInfoAddress + 0x38, MinimumMemoryBytes) ||
+            !ctx.TryWriteUInt64(memoryInfoAddress + 0x38, MaxFrameBufferBytes(ctx, configAddress)) ||
             !ctx.TryWriteUInt32(memoryInfoAddress + 0x40, FrameBufferAlignment) ||
             !ctx.TryWriteUInt32(memoryInfoAddress + 0x44, 0))
         {
@@ -113,6 +113,32 @@ public static class Videodec2Exports
         }
 
         return SetReturn(ctx, Ok);
+    }
+
+    // Games carve their picture pool into slots of maxFrameBufferSize bytes and refuse to play when fewer
+    // than four fit (Ghost of Yotei tears the decoder down right after creating it), so the size must be
+    // the real pitched NV12 frame for the configured maximum resolution, not a generous constant.
+    private static ulong MaxFrameBufferBytes(CpuContext ctx, ulong configAddress)
+    {
+        const uint DefaultWidth = 1920;
+        const uint DefaultHeight = 1088;
+        if (!ctx.TryReadUInt32(configAddress + 0x18, out var width) || width is 0 or > 8192)
+        {
+            width = DefaultWidth;
+        }
+
+        if (!ctx.TryReadUInt32(configAddress + 0x1C, out var height) || height is 0 or > 8192)
+        {
+            height = DefaultHeight;
+        }
+
+        // Matches the decoder's output: 256-byte aligned pitch, luma rows plus half as many chroma rows.
+        var pitch = (width + 255UL) & ~255UL;
+        var rows = (height + 15UL) & ~15UL;
+        var bytes = pitch * rows + pitch * (rows / 2);
+        var size = (bytes + FrameBufferAlignment - 1) & ~(ulong)(FrameBufferAlignment - 1);
+        Trace($"query_decoder_memory max_frame={width}x{height} frame_buffer_bytes=0x{size:X}");
+        return size;
     }
 
     private const ulong DecoderToken = 0x56D2_C0DE_0002UL;
