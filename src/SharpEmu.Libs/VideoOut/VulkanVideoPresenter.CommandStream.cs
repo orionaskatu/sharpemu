@@ -445,15 +445,14 @@ internal static unsafe partial class VulkanVideoPresenter
         public void RunPendingCommands()
         {
             // With the stream on its own thread the render thread runs them between its items.
-            if (OnCommandThread)
+            // The relay is usually empty; a post always wakes the render loop, so skipping
+            // the empty case cannot lose a command.
+            if (OnCommandThread || !_relay.HasPendingCommands)
             {
                 return;
             }
 
-            if (_relay.HasPendingCommands)
-            {
-                DrainDraws();
-            }
+            DrainDraws();
 
             using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
             _relay.RunPendingCommands();

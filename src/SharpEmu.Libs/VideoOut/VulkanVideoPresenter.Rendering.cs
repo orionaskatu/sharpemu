@@ -1032,6 +1032,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void EndRendering()
         {
+            // Uploads recorded while no render pass was open still owe their closing barrier
+            // before the next work that reads them.
+            _bufferCache?.EndUploadBatch();
             if (!_renderingActive)
             {
                 return;

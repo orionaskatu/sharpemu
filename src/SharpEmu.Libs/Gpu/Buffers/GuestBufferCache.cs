@@ -3487,46 +3487,21 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             }
 
             var command = _scheduler.Current;
-            command.EndRendering();
-            var native = new CommandBuffer(command.Handle);
-            var vk = _device.Vk;
-            if (_uploadBatchActive)
+            if (!_uploadBatchActive)
             {
-                OpenUploadBatch(native);
-                var batched = CollectionsMarshal.AsSpan(copies);
-                fixed (BufferCopy* pointer = batched)
-                {
-                    vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)batched.Length, pointer);
-                }
-            }
-            else
-            {
-            var before = new BufferMemoryBarrier2
-            {
-                SType = StructureType.BufferMemoryBarrier2,
-                SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
-                DstAccessMask = AccessFlags2.TransferWriteBit,
-                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                Buffer = buffer.Handle,
-                Offset = 0,
-                Size = buffer.Size,
-            };
-            VulkanSynchronization.PipelineBarrier(vk,
-                native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
-                0, null, 1, &before, 0, null);
-            var regions = CollectionsMarshal.AsSpan(copies);
-            fixed (BufferCopy* pointer = regions)
-            {
-                vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
+                // A buffer copy cannot be recorded inside a render pass. Consecutive uploads
+                // between two renders share one barrier pair: the copies run back to back and
+                // the closing barrier lands before the next draw or dispatch begins.
+                command.EndRendering();
+                BeginUploadBatch();
             }
 
-            var after = before;
-            after.SrcAccessMask = AccessFlags2.TransferWriteBit;
-            after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
-            VulkanSynchronization.PipelineBarrier(vk,
-                native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
-                0, null, 1, &after, 0, null);
+            var native = new CommandBuffer(command.Handle);
+            OpenUploadBatch(native);
+            var batched = CollectionsMarshal.AsSpan(copies);
+            fixed (BufferCopy* pointer = batched)
+            {
+                _device.Vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)batched.Length, pointer);
             }
         }
 
@@ -3555,6 +3530,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     // A sweep uploads many buffers back to back: one global barrier before the first copy and one
     // after the last replace a barrier pair per buffer, so the copies share one transfer pass.
+    // The batch now also covers uploads between draws: it opens lazily on the first upload and the
+    // presenter closes it before the next render pass or dispatch (EndUploadBatch).
     private bool _uploadBatchActive;
     private ulong _uploadBatchCommand;
 
@@ -3583,10 +3560,16 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         _uploadBatchCommand = (ulong)native.Handle;
     }
 
-    private void EndUploadBatch()
+    // Closes the open batch, if any. The presenter calls this before every render pass and
+    // dispatch, so the copies complete before the work that reads them; a batch with nothing
+    // recorded costs two field writes. Re-entrant: the closing barrier must run outside a
+    // render pass, so the pass is ended before it is recorded.
+    internal void EndUploadBatch()
     {
+        var batchedCommand = _uploadBatchCommand;
         _uploadBatchActive = false;
-        if (_uploadBatchCommand == 0)
+        _uploadBatchCommand = 0;
+        if (batchedCommand == 0 || !_scheduler.Active || _scheduler.Current.IsInvalid)
         {
             return;
         }
@@ -3603,7 +3586,6 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         };
         VulkanSynchronization.PipelineBarrier(_device.Vk,
             new CommandBuffer(command.Handle), PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, 0, 1, &barrier, 0, null, 0, null);
-        _uploadBatchCommand = 0;
     }
 
     // The copies of one synchronization; the tracker forbids nesting, so one list per thread is reused.

@@ -791,16 +791,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
             prepared.ShaderData = shaderData;
+            var userData = stage.Resources.UserData;
             for (var index = 0; index < layout.UserDataRegisters.Count; index++)
             {
                 var register = layout.UserDataRegisters[index];
                 var userIndex = (int)(register - program.UserDataBase);
-                if (register < program.UserDataBase || userIndex >= snapshot.UserData.Length)
+                if (register < program.UserDataBase || userIndex >= userData.Length)
                 {
-                    throw SubmissionScheduler.Fatal($"A user register is outside the draw's user data: register={register} base={program.UserDataBase} count={snapshot.UserData.Length} hash=0x{program.Hash:X16}.");
+                    throw SubmissionScheduler.Fatal($"A user register is outside the draw's user data: register={register} base={program.UserDataBase} count={userData.Length} hash=0x{program.Hash:X16}.");
                 }
 
-                shaderData[index] = snapshot.UserData[userIndex];
+                shaderData[index] = userData[userIndex];
             }
 
             if (layout.UsesShaderBase)

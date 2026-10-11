@@ -527,16 +527,17 @@ internal sealed partial class MetalCommandStreamHost : IRenderHost, IShaderPipel
 
         prepared.Samplers = samplers;
         var shaderData = new uint[layout.ShaderDataDwordCount];
+        var userData = stage.Resources.UserData;
         for (var index = 0; index < layout.UserDataRegisters.Count; index++)
         {
             var register = layout.UserDataRegisters[index];
             var userIndex = (int)(register - program.UserDataBase);
-            if (register < program.UserDataBase || userIndex >= snapshot.UserData.Length)
+            if (register < program.UserDataBase || userIndex >= userData.Length)
             {
-                throw Fatal($"A user register is outside the draw's user data: register={register} base={program.UserDataBase} count={snapshot.UserData.Length} hash=0x{program.Hash:X16}.");
+                throw Fatal($"A user register is outside the draw's user data: register={register} base={program.UserDataBase} count={userData.Length} hash=0x{program.Hash:X16}.");
             }
 
-            shaderData[index] = snapshot.UserData[userIndex];
+            shaderData[index] = userData[userIndex];
         }
 
         if (layout.UsesShaderBase)

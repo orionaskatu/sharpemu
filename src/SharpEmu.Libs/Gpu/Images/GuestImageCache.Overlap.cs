@@ -277,6 +277,66 @@ public sealed partial class GuestImageCache
         alias.Samples == image.Samples && alias.BytesPerBlock == image.BytesPerBlock && alias.TileMode == image.TileMode &&
         alias.Resources == image.Resources && SameMipLayout(alias, image);
 
+    // Two sizes of one surface, as a dynamic-resolution title alternates between them.
+    private static bool IsResizeSibling(in ImageDescription image, in ImageDescription candidate) =>
+        !candidate.IsDepth && candidate.Data.Address == image.Data.Address && candidate.Data.Size != image.Data.Size &&
+        !SameExtent(candidate.Extent, image.Extent) && candidate.Type == image.Type &&
+        candidate.Samples == image.Samples && candidate.BytesPerBlock == image.BytesPerBlock &&
+        candidate.TileMode == image.TileMode && candidate.Resources == image.Resources &&
+        candidate.PixelFormat == image.PixelFormat;
+
+    // A freshly created size of a surface copies the shared rectangle of the newest
+    // GPU-written sibling, so switching the render resolution keeps the previous
+    // frame's content instead of starting from stale guest bytes.
+    private void SyncResizedSibling(ResourceSlotIdentifier imageIdentifier)
+    {
+        var image = _slots[imageIdentifier];
+        if (image.Description.IsDepth || ImageDescription.IsEmptyRange(image.Description.Data) ||
+            image.Description.Resources.Layers != 1 || image.Backing.Samples != 1)
+        {
+            return;
+        }
+
+        var newest = ResourceSlotIdentifier.Invalid;
+        var newestContents = image.ContentSequence;
+        foreach (var candidateIdentifier in FindImagesInRange(image.Description.Data.Address, image.Description.Data.Size, pageOverlap: false))
+        {
+            if (candidateIdentifier == imageIdentifier || _slots.TryGet(candidateIdentifier) is not { } candidate || !candidate.Registered ||
+                candidate.DepthOwner.IsValid || candidate.ContentSequence <= newestContents || !candidate.IsGpuModified ||
+                !IsResizeSibling(image.Description, candidate.Description))
+            {
+                continue;
+            }
+
+            newest = candidateIdentifier;
+            newestContents = candidate.ContentSequence;
+        }
+
+        if (!newest.IsValid)
+        {
+            return;
+        }
+
+        var source = _slots[newest];
+        // Newer guest bytes reach the image through its own refresh; copying the sibling
+        // would paint stale GPU contents over them.
+        if (source.Backing.Format != image.Backing.Format || source.IsBufferModified || source.IsCpuDirty || image.IsBufferModified)
+        {
+            return;
+        }
+
+        var width = Math.Min(source.Description.Extent.Width, image.Description.Extent.Width);
+        var height = Math.Min(source.Description.Extent.Height, image.Description.Extent.Height);
+        if (width == 0 || height == 0)
+        {
+            return;
+        }
+
+        WatchImage(imageIdentifier);
+        image.CopyRegionFrom(source, 0, 0, 0, width, height);
+        image.MarkGpuModified();
+    }
+
     private void CopyIntoMip(ResourceSlotIdentifier destinationImageIdentifier, ResourceSlotIdentifier sourceImageIdentifier, uint mip, uint layer)
     {
         RefreshCopySource(sourceImageIdentifier);
@@ -561,6 +621,21 @@ public sealed partial class GuestImageCache
                 requested.Extent.Depth >= cachedInfo.Extent.Depth && ViewFormatRules.AreCompatible(cachedInfo.PixelFormat, requested.PixelFormat))
             {
                 return new OverlapResolution(GrowImage(requested, cachedImageIdentifier));
+            }
+
+            // Dynamic resolution: the same surface at another size. Both sizes stay alive,
+            // and the lookup syncs the requested one from the most recently written sibling,
+            // so a size switch neither drops the other image nor reuses it with the wrong
+            // extent (which would paint the target at a mismatched resolution). An equal
+            // allocation re-described with another extent is the growth case above, not a
+            // resolution switch.
+            if (requested.Data.Address == cachedInfo.Data.Address && requested.Data.Size != cachedInfo.Data.Size &&
+                requested.PixelFormat == cachedInfo.PixelFormat &&
+                requested.Type == cachedInfo.Type && requested.Samples == cachedInfo.Samples &&
+                requested.BytesPerBlock == cachedInfo.BytesPerBlock && requested.TileMode == cachedInfo.TileMode &&
+                requested.Resources == cachedInfo.Resources && !SameExtent(requested.Extent, cachedInfo.Extent))
+            {
+                return new OverlapResolution(ResourceSlotIdentifier.Invalid);
             }
 
             if (requested.PixelFormat != cachedInfo.PixelFormat || requested.Data.Size <= cachedInfo.Data.Size)
