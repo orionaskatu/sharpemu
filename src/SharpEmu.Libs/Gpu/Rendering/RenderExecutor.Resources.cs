@@ -521,20 +521,19 @@ public sealed partial class RenderExecutor
 
     private static readonly HashSet<ulong> SkippedPixelHashes = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_PS") switch
     {
-        // The skin subsurface composites (white skin). The grass pixel shader F23F7E7F... used to hang the GPU in an
-        // EXEC waterfall that never ended in one-lane graphics waves; fixed in the translator, so it draws again.
-        null => [0x722412AB9E88B57EUL, 0xD8CB0512A0ACB2A0UL, 0x8C2A2B9065B2CA33UL, 0xE2FC69DC66748B17UL, 0x3FABF91EFFC6254DUL, 0x4F17FC98EE8B5640UL],
+        // Nothing is skipped by default: the skin subsurface composites render correctly since end-of-pipe
+        // and flip labels are written at GPU completion. A hash list skips those pixel programs.
+        null => [],
         var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
     };
 
-    // The water (tessellated triangle patches, domain shader 4D314AF5..., pixel shader 459074A8...). Its pixel shader's 5 s per
-    // frame (an EXEC waterfall that never ended in one-lane graphics waves) is fixed, but drawn it still covers the scene with
-    // dark planes and smeared streaks, so it stays skipped by default; SHARPEMU_DBG_SKIP_VS=off draws it.
+    // TEMP: SHARPEMU_DBG_SKIP_VS=hash,... skips draws of those vertex (or domain) programs. The water (domain shader
+    // 4D314AF5...) used to be skipped here; it draws correctly since labels are written at GPU completion.
     private static readonly HashSet<ulong> DbgSkipVertexHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_VS") switch
     {
-        null => [0x4D314AF535375953UL],
+        null => [],
         var text => text.Split(',', StringSplitOptions.RemoveEmptyEntries).Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
             .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet(),
     };
