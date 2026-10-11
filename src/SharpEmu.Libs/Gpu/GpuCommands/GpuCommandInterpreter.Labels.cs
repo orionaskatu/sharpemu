@@ -222,10 +222,12 @@ public sealed partial class GpuCommandInterpreter
     // reuses the memory those commands read (per-frame constant and bone-matrix rings). Written at
     // interpret time, the label released memory the GPU had not consumed yet: with buffers the GPU
     // reads in place, characters exploded into polygon shards whenever the GPU lagged. The label is
-    // written when the submission completes with SHARPEMU_EOP_AT_COMPLETION=1 (opt-in: on Yotei it did
-    // not remove the character shards, which come from the cloth simulation).
+    // written when the submission completes. Flip labels follow the same rule: they were the frame
+    // fence Yotei recycles its per-frame instance rings on, and written early they let the CPU
+    // rewrite instance matrices before the GPU read them (dark polygon shards).
+    // SHARPEMU_EOP_AT_COMPLETION=0 writes them at interpret time again.
     private static readonly bool LabelsAtCompletion =
-        Environment.GetEnvironmentVariable("SHARPEMU_EOP_AT_COMPLETION") == "1";
+        Environment.GetEnvironmentVariable("SHARPEMU_EOP_AT_COMPLETION") != "0";
 
     // Queued ahead of the end-of-pipe record, so a label lands before the interrupt that reports it.
     private void QueueLabelWrite(ulong destination, ulong value, int size)
