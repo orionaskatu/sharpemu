@@ -27,6 +27,11 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
     }
 
     private readonly Dictionary<ulong, Shadow> _pages = new();
+
+    // The 2 MiB blocks that hold at least one shadow: uploads skip whole blocks without one instead
+    // of looking up every page (shadows are never removed, so the set only grows).
+    private const int BlockShift = 21;
+    private readonly HashSet<ulong> _blocks = new();
     private readonly object _gate = new();
     private int _count;
     private long _mergedBytes;
@@ -75,6 +80,7 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
             }
 
             _pages.Add(page, new Shadow(owner, gpuPage.ToArray()) { StagedTick = tick });
+            _blocks.Add(page >> BlockShift);
             Volatile.Write(ref _count, _pages.Count);
             return true;
         }
@@ -109,6 +115,12 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
         {
             for (var page = address & ~(pageBytes - 1); page < end; page += pageBytes)
             {
+                if (!_blocks.Contains(page >> BlockShift))
+                {
+                    page = (((page >> BlockShift) + 1) << BlockShift) - pageBytes;
+                    continue;
+                }
+
                 if (!_pages.TryGetValue(page, out var shadow))
                 {
                     continue;
@@ -214,6 +226,13 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
                 var emitted = begin;
                 for (var page = begin & ~(pageBytes - 1); page < end; page += pageBytes)
                 {
+                    if (!_blocks.Contains(page >> BlockShift))
+                    {
+                        // No shadow in this block: continue at the next block's first page.
+                        page = (((page >> BlockShift) + 1) << BlockShift) - pageBytes;
+                        continue;
+                    }
+
                     if (!_pages.TryGetValue(page, out var shadow))
                     {
                         continue;
