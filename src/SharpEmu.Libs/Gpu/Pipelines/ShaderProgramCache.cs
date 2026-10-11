@@ -180,6 +180,9 @@ internal sealed class ShaderProgramCache
 
         _decoded.Add(key, program);
         if (Diagnostics.ReferenceCheck.Enabled) Diagnostics.ReferenceCheck.Programs[source.Address] = (source.Hash, program!); // TEMP
+        if (Diagnostics.ReferenceCheck.Enabled && Diagnostics.ReferenceCheck.Hashes.Contains(source.Hash) && Environment.GetEnvironmentVariable("SHARPEMU_DBG_REF_DISASM") is { Length: > 0 } dbgDisasmDir) // TEMP
+            System.IO.File.WriteAllLines(System.IO.Path.Combine(dbgDisasmDir, $"prog_{source.Hash:X16}.txt"), program!.Instructions.Select(i =>
+                $"{i.Pc:X4} {i.Opcode} d[{string.Join(' ', i.Destinations.Select(o => $"{o.Kind}:{o.Value}"))}] s[{string.Join(' ', i.Sources.Select(o => $"{o.Kind}:{o.Value}"))}] {i.Control}"));
         if (recording is not null)
         {
             _codeCaptures[key] = new ShaderCodeCapture

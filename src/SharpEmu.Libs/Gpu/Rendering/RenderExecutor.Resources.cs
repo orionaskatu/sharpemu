@@ -241,8 +241,8 @@ public sealed partial class RenderExecutor
 
         Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
         if (DbgInstanceCheck.Count != 0 && (DbgInstanceCheck.Contains(0) || DbgInstanceCheck.Contains(vertexInput.Stage.Program?.Hash ?? 0)) && // TEMP
-            vertexInput.Stage.Program is not null && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds > 300 &&
-            DbgVrefSeen.GetValueOrDefault(vertexInput.Stage.Program.Hash) is var seen && seen < 2 && (DbgVrefSeen[vertexInput.Stage.Program.Hash] = seen + 1) > 0)
+            vertexInput.Stage.Program is not null && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds > DbgVrefAfter &&
+            DbgVrefSeen.GetValueOrDefault(vertexInput.Stage.Program.Hash) is var seen && seen < DbgVrefMax && (DbgVrefSeen[vertexInput.Stage.Program.Hash] = seen + 1) > 0)
             DbgReferenceVertices(vertexInput.Stage.Program!.Hash, vertexInput.Stage.Program!.UserDataBase, vertexInput.Stage.Resources.UserData, draw, emission, indexSource);
         if (DbgProbeOn) // TEMP
         {
@@ -543,6 +543,8 @@ public sealed partial class RenderExecutor
     private static readonly HashSet<ulong> DbgInstanceCheck = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_INST_CHECK") ?? "")
         .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(item => item == "all" ? 0UL : Convert.ToUInt64(item.Replace("0x", ""), 16)).ToHashSet();
     private static readonly Dictionary<ulong, int> DbgVrefSeen = new();
+    private static readonly double DbgVrefAfter = double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_VREF_AFTER"), out var dbgVrefAfter) ? dbgVrefAfter : 300; // TEMP
+    private static readonly int DbgVrefMax = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_VREF_MAX"), out var dbgVrefMax) ? dbgVrefMax : 2; // TEMP
     private static long _dbgInstanceChecks;
     private void DbgCheckInstanceMatrices(ulong hash, uint[] userData, uint instances)
     {
