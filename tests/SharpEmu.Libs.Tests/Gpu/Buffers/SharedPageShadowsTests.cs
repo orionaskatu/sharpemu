@@ -204,4 +204,32 @@ public sealed class SharedPageShadowsTests
         Array.Fill(bytes, value);
         return bytes;
     }
+
+    // The vectorized scan agrees with a byte loop on every length and every first-equal position,
+    // including runs that end inside a 32-byte block and spans shorter than one block.
+    [Fact]
+    public void DifferingPrefixLength_MatchesAByteByByteScan()
+    {
+        var random = new System.Random(1234);
+        for (var length = 0; length <= 100; length++)
+        {
+            for (var trial = 0; trial < 40; trial++)
+            {
+                var left = new byte[length];
+                var right = new byte[length];
+                random.NextBytes(left);
+                for (var index = 0; index < length; index++)
+                    right[index] = random.Next(8) == 0 ? left[index] : (byte)(left[index] ^ (1 + random.Next(255)));
+
+                var expected = 0;
+                while (expected < length && left[expected] != right[expected]) expected++;
+                Assert.Equal(expected, SharedPageShadows.DifferingPrefixLength(left, right));
+            }
+        }
+
+        var all = new byte[4096];
+        var none = Enumerable.Repeat((byte)1, 4096).ToArray();
+        Assert.Equal(4096, SharedPageShadows.DifferingPrefixLength(all, none));
+        Assert.Equal(0, SharedPageShadows.DifferingPrefixLength(all, new byte[4096]));
+    }
 }
