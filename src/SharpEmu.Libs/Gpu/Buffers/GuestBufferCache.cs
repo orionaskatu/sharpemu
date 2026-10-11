@@ -1285,6 +1285,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 continue;
             }
 
+            owner.ReceivesDeviceAddressWrites = true;
             var conflicts = _tracker.MarkGpuWrittenPages(page, TrackerLayout.PageBytes);
             WatchEvent(page, TrackerLayout.PageBytes, conflicts != 0 ? "device-write-on-cpu-dirty-page" : "device-write");
             if (conflicts != 0)
@@ -1334,8 +1335,10 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         }
     }
 
-    // Pages shaders write through device addresses; see SharedPageShadows. 64 MiB of shadows at most.
-    private const int SharedPageCapacity = 16384;
+    // Pages shaders write through device addresses; see SharedPageShadows. 256 MiB of shadows at most.
+    private const int SharedPageCapacity = 65536;
+    // SHARPEMU_SHARED_PAGE_SHADOWING=0 shadows only pages whose shader writes were already reported.
+    private static readonly bool SharedPageShadowing = Environment.GetEnvironmentVariable("SHARPEMU_SHARED_PAGE_SHADOWING") != "0";
     private readonly SharedPageShadows _sharedPages = new(TrackerLayout.PageBytes, SharedPageCapacity);
     private static long _reportedLateSharedPages;
     private static long _reportedSharedPageMerges;
@@ -3160,6 +3163,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         }
 
         newBuffer.CopyFrom(_scheduler.Current, overlap, 0, overlap.CpuAddress - newBuffer.CpuAddress, overlap.Size);
+        newBuffer.ReceivesDeviceAddressWrites |= overlap.ReceivesDeviceAddressWrites;
         _sharedPages.NoteOwnerCopy(overlap, newBuffer, _scheduler.CurrentTick);
         if (Volatile.Read(ref _shaderWrittenPageCount) != 0)
         {
@@ -3255,6 +3259,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             if (copies.Count == 0)
             {
                 source = null;
+            }
+        }
+
+        if (source != null && buffer.ReceivesDeviceAddressWrites && SharedPageShadowing)
+        {
+            // Shaders write this buffer through device addresses, which are reported only after
+            // the GPU ran them. Shadow every page this upload replaces whole: if a shader writes it
+            // before the CPU's next write is uploaded, that upload copies only the CPU's bytes.
+            if (!_sharedPages.AdoptUploaded(copies, buffer, buffer.CpuAddress, source.Mapped, _scheduler.CurrentTick) &&
+                Interlocked.Exchange(ref _reportedSharedPageCapacity, 1) == 0)
+            {
+                Console.Error.WriteLine("[GPU][WARN] The shared page shadows are full; CPU writes to further shader-written pages may lose shader bytes.");
             }
         }
 

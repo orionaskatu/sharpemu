@@ -86,6 +86,40 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
         }
     }
 
+    // Shadows the pages an upload replaces whole, from the uploaded bytes: once the upload has
+    // executed both copies hold them. copies index staged (SrcOffset) and the target at
+    // targetAddress (DstOffset), as in FilterUpload. False when the capacity was reached.
+    public bool AdoptUploaded(List<BufferCopy> copies, object target, ulong targetAddress, ReadOnlySpan<byte> staged, ulong tick)
+    {
+        lock (_gate)
+        {
+            foreach (var copy in copies)
+            {
+                var begin = targetAddress + copy.DstOffset;
+                var end = begin + copy.Size;
+                for (var page = (begin + pageBytes - 1) & ~(pageBytes - 1); page + pageBytes <= end; page += pageBytes)
+                {
+                    if (_pages.ContainsKey(page))
+                    {
+                        continue;
+                    }
+
+                    if (_pages.Count >= capacity)
+                    {
+                        return false;
+                    }
+
+                    var source = staged.Slice(checked((int)(copy.SrcOffset + (page - begin))), (int)pageBytes);
+                    _pages.Add(page, new Shadow(target, source.ToArray()) { StagedTick = tick });
+                    _blocks.Add(page >> BlockShift);
+                }
+            }
+
+            Volatile.Write(ref _count, _pages.Count);
+            return true;
+        }
+    }
+
     // The cache copied the entire old buffer into its replacement. Its shared pages retain
     // the same baseline; treating the replacement as unrelated would upload stale GPU bytes.
     public void NoteOwnerCopy(object source, object target, ulong tick)

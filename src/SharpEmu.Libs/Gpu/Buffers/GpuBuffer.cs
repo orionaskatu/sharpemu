@@ -182,6 +182,10 @@ public unsafe class GpuBuffer : IDisposable
 
     // The guest range whose CPU-write-hot pages a device-address read copied in the current
     // memory visibility generation; the render thread owns these.
+    // Shaders wrote this buffer through device addresses at least once. Its uploaded pages get
+    // shadows (SharedPageShadows) so an upload cannot overwrite a later unreported shader write.
+    public bool ReceivesDeviceAddressWrites;
+
     public long HotSyncGeneration;
     public ulong HotSyncStart;
     public ulong HotSyncEnd;
