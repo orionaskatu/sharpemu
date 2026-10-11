@@ -380,7 +380,7 @@ public sealed class RenderExecutorComputeTests : IDisposable
     }
 
     [Fact]
-    public void MetadataClear_RefusesAReadModifyWriteKernelOverMetadata()
+    public void MetadataClear_RecordsAReadModifyWriteKernelAndStillDispatches()
     {
         _host.MetadataAddresses.Add(MetadataAddress);
         _host.ClearableMetadata.Add(MetadataAddress);
@@ -388,8 +388,97 @@ public sealed class RenderExecutorComputeTests : IDisposable
         _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, buffers: [readWrite]), buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
         _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
 
+        Assert.Contains($"clear_metadata {MetadataAddress:X}", _host.Calls);
+        AssertDispatched(4, 1, 1);
+    }
+
+    [Fact]
+    public void MetadataClear_RefusesARewriteOverSeveralMetadataBuffers()
+    {
+        _host.MetadataAddresses.Add(MetadataAddress);
+        _host.MetadataAddresses.Add(MetadataAddress + 0x100);
+        _host.ClearableMetadata.Add(MetadataAddress);
+        _host.ClearableMetadata.Add(MetadataAddress + 0x100);
+        var readWrite = new BufferResourceInfo(true, true, false, false, false, 4, 0);
+        _pipelines.Compute = ComputeProgram(Stage(
+            Program(ShaderStageKind.Compute, buffers: [readWrite, readWrite]),
+            buffers: [BufferDescriptor(MetadataAddress, 4, 16), BufferDescriptor(MetadataAddress + 0x100, 4, 16)]));
+        _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
+
         Assert.DoesNotContain(_host.Calls, c => c.StartsWith("clear_metadata", StringComparison.Ordinal));
         AssertDispatched(4, 1, 1);
+    }
+
+    [Fact]
+    public void MetadataClear_RefusesARewriteWithBitwiseExclusiveOr()
+    {
+        _host.MetadataAddresses.Add(MetadataAddress);
+        _host.ClearableMetadata.Add(MetadataAddress);
+        var readWrite = new BufferResourceInfo(true, true, false, false, false, 4, 0);
+        _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, buffers: [readWrite], exclusiveOr: true), buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
+        _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
+
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("clear_metadata", StringComparison.Ordinal));
+        AssertDispatched(4, 1, 1);
+    }
+
+    [Fact]
+    public void MetadataClear_DropsAnExpandedHtileFill()
+    {
+        _host.MetadataAddresses.Add(MetadataAddress);
+        _host.HtileAddresses.Add(MetadataAddress);
+        _host.ClearableMetadata.Add(MetadataAddress);
+        var written = new BufferResourceInfo(false, true, false, false, false, 4, 0);
+        var program = new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Compute,
+            Hash = 0xF222,
+            ConstantStoreValue = 0xFFFF_FFFF,
+            Buffers = [written],
+        };
+        _pipelines.Compute = ComputeProgram(Stage(program, buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
+        _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
+
+        Assert.Contains($"expand_metadata {MetadataAddress:X}", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("clear_metadata", StringComparison.Ordinal));
+        AssertDispatched(4, 1, 1);
+    }
+
+    [Fact]
+    public void MetadataClear_KeepsAnHtileFillWhoseZmaskIsCleared()
+    {
+        _host.MetadataAddresses.Add(MetadataAddress);
+        _host.HtileAddresses.Add(MetadataAddress);
+        _host.ClearableMetadata.Add(MetadataAddress);
+        var written = new BufferResourceInfo(false, true, false, false, false, 4, 0);
+        var program = new ShaderProgramInfo
+        {
+            Stage = ShaderStageKind.Compute,
+            Hash = 0xF222,
+            ConstantStoreValue = 0xFFFF_FF00,
+            Buffers = [written],
+        };
+        _pipelines.Compute = ComputeProgram(Stage(program, buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
+        _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
+
+        Assert.Contains($"clear_metadata {MetadataAddress:X}", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("expand_metadata", StringComparison.Ordinal));
+        AssertNotDispatched();
+    }
+
+    [Fact]
+    public void MetadataClear_AcceptsAnHtileFillWithoutAKnownValue()
+    {
+        _host.MetadataAddresses.Add(MetadataAddress);
+        _host.HtileAddresses.Add(MetadataAddress);
+        _host.ClearableMetadata.Add(MetadataAddress);
+        var written = new BufferResourceInfo(false, true, false, false, false, 4, 0);
+        _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, buffers: [written]), buffers: [BufferDescriptor(MetadataAddress, 4, 16)]));
+        _executor.Dispatch(1, Banks(), 4, 1, 1, 0x41);
+
+        Assert.Contains($"clear_metadata {MetadataAddress:X}", _host.Calls);
+        Assert.DoesNotContain(_host.Calls, c => c.StartsWith("expand_metadata", StringComparison.Ordinal));
+        AssertNotDispatched();
     }
 
     [Fact]

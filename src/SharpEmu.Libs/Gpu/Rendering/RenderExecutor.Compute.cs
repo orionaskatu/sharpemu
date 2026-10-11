@@ -582,10 +582,19 @@ public sealed partial class RenderExecutor
                 $"buffers={program.Buffers.Length} images={program.Images.Length} samplers={program.SamplerCount}");
         }
 
-        if (indirectArgumentsAddress == 0 && TryConsumeMetadataClear(input))
+        if (indirectArgumentsAddress == 0)
         {
-            _host.ResetBindings();
-            return;
+            // A dispatch that reads and rewrites metadata in place is not a proven full
+            // overwrite, so it runs as written; its clear is still recorded for the next
+            // draw. Titles clear each shadow map's HTile with such a dispatch, and without
+            // the recorded clear the depth target is never cleared and every caster fails
+            // the reverse-Z test.
+            RecordMetadataRewriteClear(input);
+            if (TryConsumeMetadataClear(input))
+            {
+                _host.ResetBindings();
+                return;
+            }
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeConstantFill(input, groupsX, groupsY, groupsZ))
@@ -842,6 +851,52 @@ public sealed partial class RenderExecutor
         ((programStride & BufferSpecialization.StrideMask) == 0 ||
          (programStride & BufferSpecialization.StrideMask) == (descriptorStride & BufferSpecialization.StrideMask));
 
+    // A dispatch that reads and rewrites one metadata surface in place (a shadow-map HTile
+    // clear written by reading every word and storing it back) is recorded as a clear without
+    // dropping the dispatch: the rewrite is not a proven overwrite, but the words it writes
+    // are. Several metadata surfaces or a write-only clear leave the decision to the
+    // consumption paths.
+    private void RecordMetadataRewriteClear(ComputeInputInfo input)
+    {
+        var program = input.Stage.Program!;
+        var resources = input.Stage.Resources;
+        if (program.HasBitwiseExclusiveOr || resources.Buffers.Length != program.Buffers.Length)
+        {
+            return;
+        }
+
+        ulong metadataAddress = 0;
+        for (var i = 0; i < program.Buffers.Length; i++)
+        {
+            if (!program.Buffers[i].Written)
+            {
+                continue;
+            }
+
+            var descriptor = DecodeBufferDescriptor(resources, i);
+            if (!_host.IsMetadata(descriptor.Address))
+            {
+                continue;
+            }
+
+            if (metadataAddress != 0 || !program.Buffers[i].Read)
+            {
+                return;
+            }
+
+            metadataAddress = descriptor.Address;
+        }
+
+        if (metadataAddress != 0 && _host.ClearMetadata(metadataAddress))
+        {
+            if (RenderTrace.Enabled && RenderTrace.MetadataClear())
+            {
+                RenderTrace.Write(
+                    $"Recorded a metadata rewrite clear: shader=0x{program.Hash:X16} address=0x{metadataAddress:X16}");
+            }
+        }
+    }
+
     // A full overwrite of registered metadata by a compute shader becomes a tracked clear.
     private bool TryConsumeMetadataClear(ComputeInputInfo input)
     {
@@ -876,8 +931,54 @@ public sealed partial class RenderExecutor
             }
 
             var descriptor = DecodeBufferDescriptor(resources, i);
+            // A uniform fill over HTile memory is a clear only when the HTile words say
+            // "cleared" (ZMask, bits 0-3, zero). A fill whose words mean expanded proves the
+            // depth lives in memory: recording a clear would wipe that target's depth at
+            // every next bind. The fill is left to the image-clear paths below.
+            if (_host.IsHtile(descriptor.Address) &&
+                TryResolveFillValue(input, out var fillValue) &&
+                (fillValue & 0xFu) != 0)
+            {
+                _host.ExpandMetadata(descriptor.Address);
+                if (RenderTrace.Enabled && RenderTrace.MetadataClear())
+                {
+                    RenderTrace.Write(
+                        $"Dropped an expanded HTile fill as a clear: shader=0x{program.Hash:X16} address=0x{descriptor.Address:X16} value=0x{fillValue:X8}");
+                }
+
+                return false;
+            }
+
             if (_host.ClearMetadata(descriptor.Address))
             {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The uniform value a metadata fill writes, when the program proves one at dispatch time.
+    private bool TryResolveFillValue(ComputeInputInfo input, out uint value)
+    {
+        value = 0;
+        var program = input.Stage.Program!;
+        var resources = input.Stage.Resources;
+        if (program.ConstantStoreValue is { } constant)
+        {
+            value = constant;
+            return true;
+        }
+
+        if (program.ConstantFill is { } fill &&
+            fill.DestinationScalarResource + 4 <= resources.UserData.Length &&
+            fill.SourceScalarResource + 4 <= resources.UserData.Length)
+        {
+            var source = BufferDescriptorWords.From(resources.UserData.AsSpan((int)fill.SourceScalarResource, 4).ToArray());
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (source.Address != 0 && _host.TryReadGuest(source.Address, bytes))
+            {
+                value = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
                 return true;
             }
         }

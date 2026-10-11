@@ -414,10 +414,27 @@ internal sealed class RecordingRenderHost : IRenderHost
         return MetadataAddresses.Contains(address);
     }
 
+    public HashSet<ulong> HtileAddresses { get; } = new();
+
+    public List<ulong> ExpandedMetadata { get; } = new();
+
+    public bool IsHtile(ulong address)
+    {
+        Calls.Add($"is_htile {address:X}");
+        return HtileAddresses.Contains(address);
+    }
+
     public bool ClearMetadata(ulong address)
     {
         Calls.Add($"clear_metadata {address:X}");
         return ClearableMetadata.Contains(address);
+    }
+
+    public bool ExpandMetadata(ulong address)
+    {
+        Calls.Add($"expand_metadata {address:X}");
+        ExpandedMetadata.Add(address);
+        return true;
     }
 
     public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)

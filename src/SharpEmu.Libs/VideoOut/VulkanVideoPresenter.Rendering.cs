@@ -1404,11 +1404,15 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool IsMetadata(ulong address) => _imageCache.IsMetadata(address);
 
+        public bool IsHtile(ulong address) => _imageCache.IsHtile(address);
+
         public bool ClearMetadata(ulong address)
         {
             _ = BeginBatchedGuestCommands();
             return _imageCache.ClearMetadata(address);
         }
+
+        public bool ExpandMetadata(ulong address) => _imageCache.ExpandMetadata(address);
 
         public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)
         {

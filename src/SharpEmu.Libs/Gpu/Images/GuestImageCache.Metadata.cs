@@ -284,6 +284,12 @@ public sealed unsafe partial class GuestImageCache
         return _surfaceMetadata.TryGetValue(address, out var found) && found.Kind != SurfaceMetadataKind.PendingDcc;
     }
 
+    public bool IsHtile(ulong address)
+    {
+        using var held = _lock.Hold();
+        return _surfaceMetadata.TryGetValue(address, out var found) && found.Kind == SurfaceMetadataKind.HTile;
+    }
+
     public bool IsMetadataCleared(ulong address, uint slice, out uint fillValue)
     {
         fillValue = 0;
@@ -338,6 +344,20 @@ public sealed unsafe partial class GuestImageCache
         }
 
         found.SetFromMask(uint.MaxValue);
+        return true;
+    }
+
+    // An HTile fill whose words say "expanded" proves the depth target is not cleared:
+    // the pending clear is dropped before it turns a later bind into a load-op clear.
+    public bool ExpandMetadata(ulong address)
+    {
+        using var held = _lock.Hold();
+        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind == SurfaceMetadataKind.PendingDcc)
+        {
+            return false;
+        }
+
+        found.SetFromMask(0);
         return true;
     }
 
