@@ -3857,7 +3857,7 @@ public static partial class Gen5SpirvTranslator
             var alignedStart = BitwiseAnd(byteAddress, UInt(~3u));
             for (var index = 0; index < window.Length; index++)
             {
-                window[index] = LoadDeviceBufferWord(baseAddress, size, index == 0 ? alignedStart : IAdd(alignedStart, UInt((uint)index * sizeof(uint))));
+                window[index] = LoadDeviceBufferWindowWord(baseAddress, size, index == 0 ? alignedStart : IAdd(alignedStart, UInt((uint)index * sizeof(uint))));
             }
 
             // For a partial vector, select its source layout before conversion. A

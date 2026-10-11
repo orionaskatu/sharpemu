@@ -160,6 +160,48 @@ public sealed class GlobalMemoryShaderTests(HeadlessVulkanFixture fixture, ITest
         Assert.Equal(expected, RunOnce(vulkan, shader, initial));
     }
 
+    // A V# read from scalar-buffer data is used through its registers on the device. An 8-bit
+    // element in the last dword of a buffer whose size is not a multiple of four is in bounds:
+    // the hardware checks the element, not its dword (Ghost of Yotei's 19-byte state buffers).
+    [Theory]
+    [InlineData(14u, 19u, 5u)]
+    [InlineData(16u, 19u, 0xFFFF_FF81u)]
+    [InlineData(18u, 19u, 0xFFFF_FF81u)]
+    [InlineData(18u, 18u, 0u)]
+    public void DeviceDescriptorByteLoads_InTheLastPartialDwordReadMemory(uint offset, uint size, uint value)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
+
+        var initial = CreateInput();
+        initial.AsSpan(0, 20).Fill(0x81);
+        initial[14] = 5;
+        WriteWord(initial, DescriptorOffset, (uint)(BufferAddress & uint.MaxValue));
+        WriteWord(initial, DescriptorOffset + 4, (uint)(BufferAddress >> 32));
+        WriteWord(initial, DescriptorOffset + 8, size);
+        WriteWord(initial, DescriptorOffset + 12, (Format8Sint << 12) | IdentitySwizzle);
+        var expected = (byte[])initial.Clone();
+        initial.AsSpan(0, 16).CopyTo(expected.AsSpan(MemoryOffset, 16));
+        WriteWord(expected, MemoryOffset, value);
+
+        var words = new List<uint>
+        {
+            0xE0380000, 0x80000400,
+            // v_readfirstlane_b32 s20, v0: a lane-derived offset the plan cannot resolve.
+            0x7E000000u | (20u << 17) | (2u << 9) | 256u,
+            // s_buffer_load_dwordx4 s[16:19], s[0:3], s20 offset:DescriptorOffset
+            0xF4000000u | (10u << 18) | (16u << 6), (20u << 25) | DescriptorOffset,
+            0xBF8CC07F,
+            0xE0000000 | offset, 0x80040400,
+            0xE0780000 | MemoryOffset, 0x80000400,
+            0xBF810000,
+        };
+        var shader = CompileProgram(DecodeProgram(words), BaseScalars());
+        Assert.Equal(expected, RunOnce(vulkan, shader, initial));
+    }
+
+    private const uint Format8Sint = 6;
+
     [Theory]
     [InlineData(1u, 188u, true)]
     [InlineData(2u, 184u, true)]

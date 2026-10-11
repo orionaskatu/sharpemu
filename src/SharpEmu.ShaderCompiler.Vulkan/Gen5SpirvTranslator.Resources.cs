@@ -1294,6 +1294,21 @@ public static partial class Gen5SpirvTranslator
             return Load(_uintType, _deviceBufferWordScratch);
         }
 
+        // A dword of a format element's window, read when any of its bytes is inside the buffer:
+        // the hardware checks the element, not its dword, and each component is bounds checked on
+        // its own bytes afterwards, so a byte in the last dword of a buffer whose size is not a
+        // multiple of four reads memory instead of zero.
+        private uint LoadDeviceBufferWindowWord(uint baseAddress, uint size64, uint alignedOffset)
+        {
+            var inRange = ULessThan64(Widen(alignedOffset), size64);
+            var address = And64(
+                IAdd64(baseAddress, Widen(alignedOffset)),
+                ULong(DeviceAddressMask & ~3ul));
+            Store(_deviceBufferWordScratch, UInt(0));
+            EmitConditional(inRange, () => Store(_deviceBufferWordScratch, LoadDeviceDword(address)));
+            return Load(_uintType, _deviceBufferWordScratch);
+        }
+
         private void StoreDeviceBufferWord(uint baseAddress, uint size64, uint byteOffset, uint value)
         {
             var alignedOffset = BitwiseAnd(byteOffset, UInt(~3u));
