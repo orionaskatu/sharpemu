@@ -205,6 +205,8 @@ public static partial class Gen5SpirvTranslator
         private uint _viewportIndexOutput;
         private uint _clipDistanceCount;
         private uint _invalidPositionClipDistance = uint.MaxValue;
+        // SHARPEMU_NAN_POSITION_CULL=1 culls primitives with a NaN position (opt-in: not yet shown to change a frame).
+        private static readonly bool NanPositionCull = Environment.GetEnvironmentVariable("SHARPEMU_NAN_POSITION_CULL") == "1";
         private uint _cullDistanceCount;
         private uint _vertexIndexInput;
         private uint _instanceIndexInput;
@@ -7148,12 +7150,28 @@ public static partial class Gen5SpirvTranslator
             Store(outputVariable, outputValue);
             if (export.Target == 12 && _invalidPositionClipDistance != uint.MaxValue)
             {
+                var bool4 = _module.TypeVector(_boolType, 4);
                 var equal = _module.AddInstruction(
                     SpirvOp.FOrdEqual,
-                    _module.TypeVector(_boolType, 4),
+                    bool4,
                     outputValue,
                     _module.ConstantNull(_vec4Type));
-                var invalid = _module.AddInstruction(SpirvOp.All, _boolType, equal);
+                var zero = _module.AddInstruction(SpirvOp.All, _boolType, equal);
+                // Guest shaders cull vertices by exporting a NaN position (Ghost of Yotei's
+                // terrain drops the vertices of its holes this way): the hardware discards every
+                // primitive that uses one. The host's result is undefined (stretched walls), so a
+                // NaN position becomes zero and takes the zero position's cull below.
+                var nan = _module.AddInstruction(
+                    SpirvOp.Any, _boolType, _module.AddInstruction(SpirvOp.IsNan, bool4, outputValue));
+                if (NanPositionCull)
+                {
+                    Store(outputVariable, _module.AddInstruction(
+                        SpirvOp.Select, _vec4Type, nan, _module.ConstantNull(_vec4Type), outputValue));
+                }
+
+                var invalid = NanPositionCull
+                    ? _module.AddInstruction(SpirvOp.LogicalOr, _boolType, zero, nan)
+                    : zero;
                 // A zero position has an undefined perspective divide. Collapse its primitive
                 // to the remaining edge, as the guest's clipping-error cull does.
                 var distance = _module.AddInstruction(
