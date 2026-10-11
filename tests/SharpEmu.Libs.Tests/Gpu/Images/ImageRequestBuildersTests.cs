@@ -344,6 +344,25 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
     }
 
     [Fact]
+    public void Texture_MappedMipChainIsTheWholeImageViewedFromTheBaseLevel()
+    {
+        var words = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 64, 64, baseLevel: 1, lastLevel: 2, maxMip: 2);
+        var resident = ImageRequestBuilders.Texture(words, Sampled2D).Request;
+        var whole = ImageRequestBuilders.WithWholeMipChain(resident);
+
+        // The image of a rendered chain whose lower mip a pass samples: all levels, viewed from 1.
+        Assert.Equal(0u, whole.Description.FirstLevel);
+        Assert.Equal(3u, whole.Description.Resources.Levels);
+        Assert.Equal(resident.Description.Data, whole.Description.Data);
+        Assert.Equal(1u, whole.View.BaseLevel);
+        Assert.Equal(2u, whole.View.LevelCount);
+        Assert.Equal(0f, whole.View.MinLod);
+        var again = ImageRequestBuilders.WithWholeMipChain(whole);
+        Assert.Equal(whole.View, again.View);
+        Assert.Equal(whole.Description.Resources, again.Description.Resources);
+    }
+
+    [Fact]
     public void Texture_CubeBecomesALayeredTwoDimensionalImage()
     {
         var words = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 32, 32, GuestImageType.Cube, layers: 6, baseArray: 2);

@@ -154,6 +154,27 @@ public static partial class ImageRequestBuilders
         return view with { MinLod = Math.Min(minLod, view.BaseLevel + view.LevelCount - 1) };
     }
 
+    // The same texture as an image of the whole guest mip chain, viewed from the descriptor's
+    // base level: the request a texture gets when its larger mips are mapped.
+    public static ImageRequest WithWholeMipChain(in ImageRequest request)
+    {
+        var firstLevel = request.Description.FirstLevel;
+        if (firstLevel == 0)
+        {
+            return request;
+        }
+
+        var whole = request;
+        whole.Description.Resources = new SubresourceCount(request.Description.Resources.Levels + firstLevel, request.Description.Resources.Layers);
+        whole.Description.FirstLevel = 0;
+        whole.View = request.View with
+        {
+            BaseLevel = request.View.BaseLevel + firstLevel,
+            MinLod = request.View.MinLod == 0 ? 0 : request.View.MinLod + firstLevel,
+        };
+        return whole;
+    }
+
     public static uint DestinationSwizzle(in TextureDescriptorWords descriptor) =>
         ViewFormatRules.PackDestinationSelect(descriptor.DestinationSelectX, descriptor.DestinationSelectY, descriptor.DestinationSelectZ, descriptor.DestinationSelectW);
 
@@ -400,8 +421,10 @@ public static partial class ImageRequestBuilders
             PopulateTextureMipLayout(ref description);
         }
 
-        // A sampled texture whose descriptor starts past mip 0 is a streamed texture with only
-        // those mips resident: the host image holds them alone instead of the whole chain.
+        // A sampled texture whose descriptor starts past mip 0 may be a streamed texture whose
+        // larger mips are not mapped: the request then holds only the levels from there. The
+        // image cache returns it to the whole chain when those mips are mapped after all
+        // (WithWholeMipChain), as a view of a lower mip of a rendered image is.
         var firstLevel = !storage && !volume && samples == 1 && baseLevel > 0 && baseLevel < levels ? baseLevel : 0u;
         if (firstLevel != 0)
         {

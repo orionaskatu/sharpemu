@@ -201,6 +201,15 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             throw SubmissionScheduler.Fatal("An image lookup needs a command buffer that is recording.");
         }
 
+        // Only the mips a streamed texture has mapped are resident. When the whole chain is
+        // mapped, the texture is the same image as any other view of that memory, such as the
+        // render target whose lower mip a downsample pass reads.
+        if (request.Description.FirstLevel != 0 &&
+            _bufferCache.IsGuestRangeMapped(request.Description.Data.Address, request.Description.Data.Size))
+        {
+            request = ImageRequestBuilders.WithWholeMipChain(request);
+        }
+
         ValidateRequest(request);
         if (ImageDescription.IsEmptyRange(request.Description.Data))
         {

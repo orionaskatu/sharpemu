@@ -801,6 +801,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         return ObtainBuffer(guestAddress, size, isWritten: true).Buffer;
     }
 
+    public bool IsGuestRangeMapped(ulong guestAddress, ulong size) =>
+        IsValidRange(guestAddress, size) && _backing.IsBackedRange(guestAddress, size);
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
     {
         if (!IsValidRange(guestAddress, size))
