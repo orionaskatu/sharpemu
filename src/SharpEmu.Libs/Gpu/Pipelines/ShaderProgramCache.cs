@@ -160,6 +160,8 @@ internal sealed class ShaderProgramCache
     private readonly GuestWordReader _readGuestWord;
     private readonly GuestWordReader _readCleanGuestWord;
     private readonly ResidentGuestBytesReader _readResidentGuestBytes;
+    // Bound once: converting the host method to a delegate allocated one per program lookup.
+    private readonly GuestWordsReader _readCleanGuestWords;
     private readonly ResidentGuestBytesReader? _prefetchResidentGuestBytes;
 
     private static readonly bool PrefetchEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_PREFETCH") != "0";
@@ -172,6 +174,7 @@ internal sealed class ShaderProgramCache
         _readGuestWord = host.TryReadGuestWord;
         _readCleanGuestWord = host.TryReadCleanGuestWord;
         _readResidentGuestBytes = host.TryReadResidentGuestBytes;
+        _readCleanGuestWords = host.TryReadCleanGuestWords;
         _prefetchResidentGuestBytes = PrefetchEnabled ? _readResidentGuestBytes : null;
     }
 
@@ -295,7 +298,7 @@ internal sealed class ShaderProgramCache
             ShaderBase = source.Address,
             ReadMemory = _readGuestWord,
             ReadCleanMemory = _readCleanGuestWord,
-            ReadCleanWords = _host.TryReadCleanGuestWords,
+            ReadCleanWords = _readCleanGuestWords,
             ReadResidentMemory = _prefetchResidentGuestBytes,
             IsMapped = _host.IsGuestMapped,
             IsGpuPendingWord = _host.IsGpuPendingGuestWord,
