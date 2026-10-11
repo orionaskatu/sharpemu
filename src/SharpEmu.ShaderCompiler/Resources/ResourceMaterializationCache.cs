@@ -1906,7 +1906,6 @@ public sealed class ResourceMaterializationCache
         private readonly List<(ulong Address, uint Word, bool Clean, bool Table)> _reads = new();
         private readonly Dictionary<ulong, int> _readIndex = new();
         private readonly Dictionary<ulong, bool> _mappingProbes = new();
-        private const int MinimumReadIndexCapacity = 256;
         private bool _inTable;
         private GuestWordReader? _reader;
         private GuestWordReader? _cleanReader;
@@ -1935,17 +1934,25 @@ public sealed class ResourceMaterializationCache
 
         public void Reset()
         {
+            // Clearing a dictionary zeroes its whole capacity, which grows to the largest walk ever
+            // recorded; a walk far smaller than that removes just the addresses it added, so the
+            // dictionary neither clears its capacity nor shrinks and regrows.
+            if (_readIndex.Count * 8 < _readIndex.EnsureCapacity(0))
+            {
+                foreach (var read in _reads)
+                    _readIndex.Remove(read.Address);
+            }
+            else
+            {
+                _readIndex.Clear();
+            }
+
             _reads.Clear();
-            // Clearing a dictionary zeroes its whole capacity, which keeps the size of the largest walk
-            // ever recorded: after a walk far smaller than that, shrink it so ordinary walks clear little.
-            var used = Math.Max(_readIndex.Count, MinimumReadIndexCapacity);
-            if (_readIndex.EnsureCapacity(0) > used * 4)
-                _readIndex.TrimExcess(used);
-            _readIndex.Clear();
             _mappingProbes.Clear();
-            // Retain ordinary descriptor walks without keeping unusually large
-            // tables alive for the lifetime of the renderer.
-            if (_reads.Capacity > 16384)
+            // Retain ordinary descriptor walks without keeping unusually large tables alive for the
+            // lifetime of the renderer. Walks of tens of thousands of words are ordinary in some games;
+            // dropping them at 16K entries regrew the list on every such walk.
+            if (_reads.Capacity > 1 << 18)
             {
                 _reads.Capacity = 0;
                 _readIndex.TrimExcess();
