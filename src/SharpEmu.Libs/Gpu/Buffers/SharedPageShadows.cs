@@ -16,7 +16,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // changed since (the shader's bytes in the GPU copy stay), and the bytes the GPU
 // changed since are merged into guest memory where the CPU left them alone. A byte both changed
 // keeps the CPU's value in guest memory, and the next upload carries it to the GPU copy.
-internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
+internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
 {
     private sealed class Shadow(object owner, byte[] bytes)
     {
@@ -248,6 +248,7 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
             return;
         }
 
+        Span<byte> pageScratch = stackalloc byte[checked((int)pageBytes)];
         lock (_gate)
         {
             List<BufferCopy>? filtered = null;
@@ -289,7 +290,13 @@ internal sealed class SharedPageShadows(ulong pageBytes, int capacity)
                     }
 
                     emitted = to;
-                    var source = staged.Slice(checked((int)(copy.SrcOffset + (from - begin))), checked((int)(to - from)));
+                    // The staging mapping is write-combining: diff a copy read with streaming loads.
+                    var stagedSlice = staged.Slice(checked((int)(copy.SrcOffset + (from - begin))), checked((int)(to - from)));
+                    var source = pageScratch[..stagedSlice.Length];
+                    fixed (byte* stagedPointer = stagedSlice)
+                    {
+                        MappedMemoryReader.Copy(stagedPointer, source);
+                    }
                     var shadowBytes = shadow.Bytes.AsSpan(checked((int)(from - page)), source.Length);
                     if (!ReferenceEquals(shadow.Owner, target))
                     {
