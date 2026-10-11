@@ -6088,6 +6088,13 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (ForceDegamma && instruction.Opcode.StartsWith("ImageSample", StringComparison.Ordinal) &&
+                !instruction.Opcode.StartsWith("ImageSampleC", StringComparison.Ordinal) &&
+                resource.ComponentKind == ImageComponentKind.Float && resource.ComponentType == _floatType)
+            {
+                sampled = ApplySamplerForceDegamma(image, sampled);
+            }
+
             var outputValues = new List<uint>(4);
             for (uint component = 0; component < 4; component++)
             {
@@ -8657,6 +8664,39 @@ public static partial class Gen5SpirvTranslator
         private uint UInt(uint value) => _module.Constant(_uintType, value);
 
         private uint Float(float value) => _module.ConstantFloat(_floatType, value);
+
+        // S# FORCE_DEGAMMA (word0 bit 20) makes the texture unit decode sRGB on RGB channels of a UNORM
+        // texture (8-bit channels and BC1/2/3/7). It is read from the sampler and texture descriptors at
+        // run time, so dynamically selected samplers decode too. SHARPEMU_FORCE_DEGAMMA=0 disables it.
+        private static readonly bool ForceDegamma = Environment.GetEnvironmentVariable("SHARPEMU_FORCE_DEGAMMA") != "0";
+
+        private uint ApplySamplerForceDegamma(Gen5ImageControl image, uint sampled)
+        {
+            var samplerWord0 = LoadS(image.ScalarSampler);
+            var unifiedFormat = BitwiseAnd(ShiftRightLogical(LoadS(image.ScalarResource + 1), UInt(20)), UInt(0x1FF));
+            var eligible = _module.ConstantBool(false);
+            foreach (var format in new uint[] { 1, 14, 56, 169, 171, 173, 181 })
+                eligible = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, eligible,
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, unifiedFormat, UInt(format)));
+            var forced = _module.AddInstruction(SpirvOp.INotEqual, _boolType, BitwiseAnd(samplerWord0, UInt(1u << 20)), UInt(0));
+            var decode = _module.AddInstruction(SpirvOp.LogicalAnd, _boolType, forced, eligible);
+            var result = sampled;
+            for (uint component = 0; component < 3; component++)
+            {
+                var encoded = _module.AddInstruction(SpirvOp.CompositeExtract, _floatType, sampled, component);
+                var low = _module.AddInstruction(SpirvOp.FMul, _floatType, encoded, Float(1f / 12.92f));
+                var high = Ext(26 /* Pow */, _floatType,
+                    _module.AddInstruction(SpirvOp.FMul, _floatType,
+                        _module.AddInstruction(SpirvOp.FAdd, _floatType, encoded, Float(0.055f)), Float(1f / 1.055f)),
+                    Float(2.4f));
+                var linear = _module.AddInstruction(SpirvOp.Select, _floatType,
+                    _module.AddInstruction(SpirvOp.FOrdLessThanEqual, _boolType, encoded, Float(0.04045f)), low, high);
+                var chosen = _module.AddInstruction(SpirvOp.Select, _floatType, decode, linear, encoded);
+                result = _module.AddInstruction(SpirvOp.CompositeInsert, _vec4Type, chosen, result, component);
+            }
+
+            return result;
+        }
 
         private uint Bitcast(uint type, uint value) =>
             _module.AddInstruction(SpirvOp.Bitcast, type, value);
