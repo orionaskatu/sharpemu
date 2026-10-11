@@ -130,15 +130,19 @@ public sealed partial class GpuCommandInterpreter
         return 7;
     }
 
+    // ACQUIRE_MEM makes earlier writes visible to the work after it (its cache actions and the
+    // wait on their completion); the guest emits it where later shaders read earlier results.
     internal uint AcquireMemoryPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {
         if (packet.Header == PacketHeader.Make(8, PacketOpcode.Nop, PacketCustomCode.AcquireMemory))
         {
+            _host.EmitGlobalBarrier();
             return 7;
         }
 
         if (packet.Header == PacketHeader.Make(7, PacketOpcode.AcquireMemory))
         {
+            _host.EmitGlobalBarrier();
             return 6;
         }
 

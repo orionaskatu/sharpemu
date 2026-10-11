@@ -399,12 +399,12 @@ public sealed class GpuCommandInterpreterLabelTests
     }
 
     [Fact]
-    public void AcquireMemory_IsANoOp()
+    public void AcquireMemory_OrdersTheWorkAfterIt()
     {
         var runner = new StreamRunner();
 
         runner.Run(StreamRunner.CustomPacket(Nop, PacketCustomCode.AcquireMemory, 0, 0, 0, 0, 0, 0, 0), StreamRunner.Packet(PacketOpcode.AcquireMemory, 0, 0, 0, 0, 0, 0));
 
-        Assert.Empty(runner.Host.Calls);
+        Assert.Equal(["barrier", "barrier"], runner.Host.Calls);
     }
 }

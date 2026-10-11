@@ -59,7 +59,7 @@ public sealed class RenderExecutorComputeTests : IDisposable
         var expected = new[]
         {
             "pending", "debug DispatchDirect 5 4 2 1 41 200020000", "end_rendering", "preparation_begin", "prepare_bindings Compute -> 1",
-            "bind_resources 1", "commit Compute C1 [1]", "bind_pipeline Compute C1", "dispatch 4 2 1", "access_barrier", "preparation_end", "reset_bindings",
+            "bind_resources 1", "commit Compute C1 [1]", "bind_pipeline Compute C1", "dispatch 4 2 1", "preparation_end", "reset_bindings",
         };
         Assert.Equal(expected, _host.Calls);
         Assert.Equal(["get_compute_program threadDimensions=False", "create_compute_pipeline"], _pipelines.Calls);
@@ -137,23 +137,22 @@ public sealed class RenderExecutorComputeTests : IDisposable
         AssertDispatched(1, 1, 1);
     }
 
+    // Dispatches overlap as on the command processor; the guest's own partial flushes, cache
+    // flushes and memory acquires order them.
     [Fact]
-    public void StorageWrites_InsertTheHazardBarrierBeforeThePipelineBind()
+    public void StorageWrites_LeaveOrderingToTheGuestStream()
     {
         var written = new BufferResourceInfo(false, true, false, false, false, 4, 0);
         _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, buffers: [written]), buffers: [BufferDescriptor(VertexBase, 4, 16)]));
         _executor.Dispatch(1, Banks(), 1, 1, 1, 0x41);
-        Assert.True(_host.Calls.IndexOf("write_hazard_barrier") < _host.Calls.IndexOf("bind_pipeline Compute C1"));
+        Assert.DoesNotContain("write_hazard_barrier", _host.Calls);
+        Assert.DoesNotContain("access_barrier", _host.Calls);
 
         _host.Calls.Clear();
         _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, images: [new ImageResourceInfo(ImageResourceClass.Storage, true)])));
         _executor.Dispatch(1, Banks(), 1, 1, 1, 0x41);
-        Assert.Contains("write_hazard_barrier", _host.Calls);
-
-        _host.Calls.Clear();
-        _pipelines.Compute = ComputeProgram(Stage(Program(ShaderStageKind.Compute, images: [new ImageResourceInfo(ImageResourceClass.Sampled, true)])));
-        _executor.Dispatch(1, Banks(), 1, 1, 1, 0x41);
         Assert.DoesNotContain("write_hazard_barrier", _host.Calls);
+        Assert.Contains("dispatch 1 1 1", _host.Calls);
     }
 
     [Fact]
