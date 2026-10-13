@@ -205,9 +205,9 @@ public sealed class ResourceMaterializerTests
     private const uint AlignedKeyTwoOffset = 4 + AlignedStride * 2000;
     private const uint MisalignedKeyThreeOffset = 4 + AlignedStride * 10 + 8;
 
-    private static (ShaderResourcePlan Plan, ResourceRuntimeInputs Inputs, uint[][] Heap) RecordAlignedTable(uint records, bool incompatibleKeyTwo = false)
+    private static (ShaderResourcePlan Plan, ResourceRuntimeInputs Inputs, uint[][] Heap) RecordAlignedTable(uint records, bool incompatibleKeyTwo = false, (string Opcode, uint Value)? clamp = null)
     {
-        var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false, selectorStride: AlignedStride));
+        var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false, selectorStride: AlignedStride, selectorClamp: clamp));
         var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
         Assert.Equal(AlignedStride, selector.SelectorStride);
         Assert.Equal(4u, selector.SelectorOffset);
@@ -245,7 +245,7 @@ public sealed class ResourceMaterializerTests
     [Theory]
     [InlineData(2259u, true)]
     [InlineData(2260u, false)]
-    public void UnboundedSelectorProbesFallBackToRecordAlignedOffsetsOnlyPastTheCap(uint records, bool exhaustive)
+    public void UnclampedSelectorProbesTheTableRecordsOnlyPastTheCap(uint records, bool exhaustive)
     {
         var (plan, inputs, heap) = RecordAlignedTable(records);
         var snapshot = new ResourceSnapshot();
@@ -264,7 +264,7 @@ public sealed class ResourceMaterializerTests
     [Theory]
     [InlineData(2259u, false)]
     [InlineData(2260u, true)]
-    public void RecordAlignedFallbackReportsTheProbedOffsets(uint records, bool fallback)
+    public void TableBoundedProbeReportsTheProbedOffsets(uint records, bool fallback)
     {
         var (plan, inputs, _) = RecordAlignedTable(records, incompatibleKeyTwo: true);
         var snapshot = new ResourceSnapshot();
@@ -275,7 +275,7 @@ public sealed class ResourceMaterializerTests
             out var failureKind, captures.Add));
         Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failureKind);
         var diagnostic = Assert.IsType<IndirectSelectorDiagnostic>(Assert.Single(captures).SelectorDiagnostic);
-        Assert.Equal(fallback ? "record_aligned_fallback" : "full_domain_no_proof", diagnostic.SelectionMode);
+        Assert.Equal(fallback ? "table_bounded" : "full_domain_no_proof", diagnostic.SelectionMode);
         SelectorKeyProbe[] expected = fallback ?
             [new(AlignedKeyOneOffset, 1), new(AlignedKeyTwoOffset, 2)] :
             [new(AlignedKeyOneOffset, 1), new(MisalignedKeyThreeOffset, 3), new(AlignedKeyTwoOffset, 2)];
@@ -284,7 +284,7 @@ public sealed class ResourceMaterializerTests
 
     // 70000 records leave more than the cap even among the record-aligned offsets.
     [Fact]
-    public void UnboundedSelectorProbesStillFailWhenTheAlignedOffsetsExceedTheCap()
+    public void UnclampedSelectorStillFailsWhenTheTableHoldsMoreRecordsThanTheCap()
     {
         var (plan, inputs, _) = RecordAlignedTable(70000);
         var snapshot = new ResourceSnapshot();
@@ -294,9 +294,63 @@ public sealed class ResourceMaterializerTests
 
         Assert.False(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization, out var failureKind));
         Assert.Equal(ResourceMaterializationFailure.Other, failureKind);
-        Assert.Contains("unbounded selector probes exceed 65536", ResourceMaterializer.LastFailureDetail);
+        Assert.Contains("no selector clamp and the material table holds 70000 records", ResourceMaterializer.LastFailureDetail);
         Assert.Same(previousSnapshot, snapshot);
         Assert.Same(previousSpecialization, specialization);
+    }
+
+    // The shader clamps the selector to [0, 5], so only record offsets 4 + 116 * k for k <= 5 are
+    // reachable: key 1 (k = 3) is found; key 2 (k = 2000) and the misaligned poison key are not,
+    // even though a 2260-record table exceeds the exhaustive cap.
+    [Theory]
+    [InlineData("VMinU32", 5u)]
+    [InlineData("VMed3U32", 5u)]
+    [InlineData("VAndB32", 7u)]
+    public void ClampedSelectorProbesOnlyTheClampedRecords(string opcode, uint value)
+    {
+        var (plan, inputs, heap) = RecordAlignedTable(2260, clamp: (opcode, value));
+        var selector = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
+        Assert.Equal(value, selector.SelectorBound);
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+        Assert.Equal(2, snapshot.Images.Length);
+        Assert.Contains(snapshot.Images, image => image.SequenceEqual(heap[0]));
+        Assert.Contains(snapshot.Images, image => image.SequenceEqual(heap[1]));
+    }
+
+    [Fact]
+    public void ClampedSelectorMaterializesATableOverTheProbeCap()
+    {
+        var (plan, inputs, heap) = RecordAlignedTable(70000, clamp: ("VMinU32", 5u));
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+
+        Assert.True(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization));
+        Assert.Contains(snapshot.Images, image => image.SequenceEqual(heap[1]));
+    }
+
+    [Fact]
+    public void ClampedSelectorReportsTheClampBoundedMode()
+    {
+        var (plan, inputs, _) = RecordAlignedTable(2260, incompatibleKeyTwo: true, clamp: ("VMinU32", 2000u));
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        var captures = new List<IndirectImageFailure>();
+
+        Assert.False(ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization,
+            out var failureKind, captures.Add));
+        var diagnostic = Assert.IsType<IndirectSelectorDiagnostic>(Assert.Single(captures).SelectorDiagnostic);
+        Assert.Equal("clamp_bounded", diagnostic.SelectionMode);
+        Assert.Equal([new SelectorKeyProbe(AlignedKeyOneOffset, 1), new SelectorKeyProbe(AlignedKeyTwoOffset, 2)], diagnostic.KeyProbes);
+    }
+
+    [Fact]
+    public void UnprovenSelectorHasNoBound()
+    {
+        var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false, selectorStride: AlignedStride));
+        Assert.Null(plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!.SelectorBound);
     }
 
     private static IEnumerable<Gen5ShaderInstruction> ImageWords(ref uint pc, uint register, uint address, uint format)

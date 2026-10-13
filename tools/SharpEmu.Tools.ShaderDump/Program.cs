@@ -81,7 +81,11 @@ if (args.Length == 4 && args[0] == "--plan-ir")
         throw new InvalidOperationException(compileError);
     File.WriteAllBytes(args[3], shader.Spirv);
     var runtime = plan.Memory.Entries.Count(entry => entry.RuntimeDescriptor);
-    Console.WriteLine($"hash=0x{hash:X16} instructions={program!.Instructions.Count} runtime_descriptor_accesses={runtime} images={resources.Info.Images.Count} spirv_bytes={shader.Spirv.Length}");
+    var materialTables = plan.DescriptorSources.Select(source => source.IndirectImage).Where(selector => selector is { SelectorStride: not 0 }).ToArray();
+    var selectorSets = materialTables.Count(selector => selector!.SelectorValues is not null);
+    var selectorBounds = materialTables.Count(selector => selector!.SelectorValues is null && selector.SelectorBound is not null);
+    var selectorBoundText = string.Join(",", materialTables.Select(selector => selector!.SelectorBound?.ToString() ?? "-"));
+    Console.WriteLine($"hash=0x{hash:X16} instructions={program!.Instructions.Count} runtime_descriptor_accesses={runtime} images={resources.Info.Images.Count} spirv_bytes={shader.Spirv.Length} material_tables={materialTables.Length} proven_sets={selectorSets} clamp_bounded={selectorBounds} unproven={materialTables.Length - selectorSets - selectorBounds} bounds=[{selectorBoundText}]");
     return;
 }
 

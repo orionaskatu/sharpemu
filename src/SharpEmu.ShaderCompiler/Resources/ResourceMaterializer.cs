@@ -540,21 +540,6 @@ public static class ResourceMaterializer
         }
     }
 
-    private static readonly HashSet<(uint Pc, uint Stride)> ReportedRecordAlignedFallbacks = new();
-
-    // Once per image and material stride, so a table probed every draw does not flood the log.
-    private static void ReportRecordAlignedFallback(uint pc, uint stride, ulong exhaustiveCount, ulong alignedCount)
-    {
-        lock (ReportedRecordAlignedFallbacks)
-        {
-            if (ReportedRecordAlignedFallbacks.Add((pc, stride)))
-            {
-                Console.Error.WriteLine($"[GPU][WARN] indirect image {Hex(pc)}: {exhaustiveCount} unbounded selector probes exceed {MaxIndirectImageProbes}; " +
-                    $"probing the {alignedCount} record-aligned offsets (selectors assumed below 2^32/stride)");
-            }
-        }
-    }
-
     private static bool NullImageDescriptor(ReadOnlySpan<uint> descriptor) =>
         descriptor[0] == 0 && (descriptor[1] & 0xFF) == 0;
 
@@ -746,44 +731,70 @@ public static class ResourceMaterializer
                 diagnostic.ProvenOffsets = provenOffsets ?? [];
             }
         }
-        // Without a proven selector set every offset residue + k * step is reachable, because
-        // selector * stride + offset wraps modulo 2^32 for an unbounded 32-bit selector. A
-        // table whose exhaustive probe count fits the cap keeps that enumeration unchanged.
-        // Past the cap, a non-multiple of the stride needs a selector >= 2^32 / stride, which
-        // no real table index reaches (the hardware reads selector * stride + offset), so the
-        // probe falls back to the record-aligned offsets offset + k * stride inside the table.
-        var probeStart = residue;
-        var probeStep = step;
-        var probeTotal = probeCount;
-        if (provenOffsets is null && probeCount > MaxIndirectImageProbes)
+        // Bound 1, from the shader: a selector it clamps or masks reaches exactly
+        // selector * stride + offset for selector in [0, bound].
+        // Bound 2, from the table: the material V# holds size / stride records and the hardware
+        // reads zero (key 0, always probed) past them, so the reachable record offsets are
+        // offset + k * stride inside the table. Absent a proven bound, the exhaustive
+        // enumeration of every residue + k * step (the product wraps modulo 2^32) stays exact
+        // while it fits the cap; past it the table bound applies, which treats a selector as a
+        // record index rather than one wrapping the 32-bit product. If even that exceeds the
+        // cap the plan fails.
+        IEnumerable<ulong> offsets;
+        if (provenOffsets is not null)
         {
-            var alignedCount = indirect.SelectorStride != 0 && indirect.SelectorOffset <= limit ?
-                (limit - indirect.SelectorOffset) / indirect.SelectorStride + 1 : 0;
-            if (indirect.SelectorStride == 0 || alignedCount > MaxIndirectImageProbes)
+            offsets = provenOffsets.Select(offset => (ulong)offset);
+        }
+        else if (indirect.SelectorBound is { } bound)
+        {
+            var last = (ulong)bound;
+            if (last * indirect.SelectorStride + indirect.SelectorOffset <= uint.MaxValue)
             {
-                return Detail($"indirect image {Hex(image.FirstUsePc)}: {probeCount} unbounded selector probes exceed {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
+                last = indirect.SelectorOffset > limit ? 0 : Math.Min(last, (limit - indirect.SelectorOffset) / indirect.SelectorStride);
             }
 
-            ReportRecordAlignedFallback(image.FirstUsePc, indirect.SelectorStride, probeCount, alignedCount);
+            if (last + 1 > MaxIndirectImageProbes)
+            {
+                return Detail($"indirect image {Hex(image.FirstUsePc)}: selector bound {bound} needs {last + 1} probes, over {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
+            }
+
             if (diagnostic is not null)
             {
-                diagnostic.SelectionMode = "record_aligned_fallback";
+                diagnostic.SelectionMode = "clamp_bounded";
             }
 
-            probeStart = indirect.SelectorOffset;
-            probeStep = indirect.SelectorStride;
-            probeTotal = alignedCount;
+            offsets = Enumerable.Range(0, (int)last + 1)
+                .Select(selector => unchecked((ulong)((uint)selector * indirect.SelectorStride + indirect.SelectorOffset)))
+                .Distinct();
+        }
+        else if (probeCount <= MaxIndirectImageProbes)
+        {
+            offsets = Enumerable.Range(0, (int)probeCount).Select(index => residue + (ulong)index * step);
+        }
+        else
+        {
+            var records = indirect.SelectorOffset <= limit ? (limit - indirect.SelectorOffset) / indirect.SelectorStride + 1 : 0;
+            if (records > MaxIndirectImageProbes)
+            {
+                return Detail($"indirect image {Hex(image.FirstUsePc)}: no selector clamp and the material table holds {records} records, over {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
+            }
+
+            if (diagnostic is not null)
+            {
+                diagnostic.SelectionMode = "table_bounded";
+            }
+
+            offsets = Enumerable.Range(0, (int)records).Select(index => indirect.SelectorOffset + (ulong)index * indirect.SelectorStride);
         }
 
         var keys = new List<uint> { 0 };
         var seen = new HashSet<uint> { 0 };
-        var offsets = provenOffsets is not null ? provenOffsets.Select(offset => (ulong)offset) :
-            Enumerable.Range(0, (int)probeTotal).Select(index => probeStart + (ulong)index * probeStep);
+        var offsetList = offsets as IReadOnlyCollection<ulong> ?? offsets.ToArray();
         // A full-domain scan reads every dword of the table: one bulk read replaces them.
-        var materialWords = provenOffsets is null && probeTotal > MaterialBulkReadThreshold
+        var materialWords = provenOffsets is null && (ulong)offsetList.Count > MaterialBulkReadThreshold
             ? TryReadScalarBuffer(material.Dwords, inputs)
             : null;
-        foreach (var offset in offsets)
+        foreach (var offset in offsetList)
         {
             uint key;
             if (materialWords is not null)
