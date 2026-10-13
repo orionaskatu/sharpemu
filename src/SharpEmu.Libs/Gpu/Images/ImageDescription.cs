@@ -87,7 +87,11 @@ public struct ImageDescription
     public uint Samples;
     public GuestTileMode TileMode;
     public bool Bgra16;
+    // Each MipLayout level describes one layer: Offset is where the level starts inside a layer and
+    // Size is its bytes in that layer. Layers follow each other every SliceStride bytes, each holding
+    // the whole mip chain. A SliceStride of 0 marks a layout whose Size already covers every layer.
     public MipLevelLayouts MipLayout;
+    public ulong SliceStride;
 
     // The first guest mip the image holds. A streamed texture names only its resident mips
     // (base level > 0); the host image starts there, while Extent and MipLayout describe the
@@ -123,6 +127,22 @@ public struct ImageDescription
     public readonly bool IsLayered => !IsVolume && Resources.Layers > 1;
 
     public readonly uint TransferLayers => IsVolume ? Extent.Depth : Resources.Layers;
+
+    // Bytes one layer of the level occupies.
+    public readonly ulong LevelLayerSize(int level) =>
+        SliceStride != 0 || Resources.Layers <= 1 ? MipLayout[level].Size : MipLayout[level].Size / Resources.Layers;
+
+    // Bytes the level holds across every layer, counted as if the layers were packed.
+    public readonly ulong LevelBytes(int level) =>
+        SliceStride != 0 ? MipLayout[level].Size * Math.Max(Resources.Layers, 1u) : MipLayout[level].Size;
+
+    // The first byte past the level in the last layer, from the start of the image.
+    public readonly ulong LevelEnd(int level)
+    {
+        var mip = MipLayout[level];
+        var end = mip.Offset + mip.Size;
+        return SliceStride != 0 && Resources.Layers > 1 ? end + (Resources.Layers - 1) * SliceStride : end;
+    }
 
     public readonly Extent2D BlockExtent
     {
@@ -175,7 +195,7 @@ public struct ImageDescription
         var layout = container.MipLayout[mip];
         if (Extent.Width != Math.Max(container.Extent.Width >> mip, 1) || Extent.Height != Math.Max(container.Extent.Height >> mip, 1) ||
             Extent.Depth != container.Extent.Depth || MipLayout[0].Pitch != layout.Pitch || MipLayout[0].Height != layout.Height ||
-            layout.Size == 0 || layout.Size % container.Resources.Layers != 0 ||
+            layout.Size == 0 || (container.SliceStride == 0 && layout.Size % container.Resources.Layers != 0) ||
             container.Data.Size % container.Resources.Layers != 0 || Data.Size % Resources.Layers != 0)
         {
             return -1;
@@ -185,7 +205,7 @@ public struct ImageDescription
         // storing all slices of one mip contiguously.
         var sliceStride = container.Data.Size / container.Resources.Layers;
         var childStride = Data.Size / Resources.Layers;
-        if (childStride != layout.Size / container.Resources.Layers || layout.Offset >= sliceStride ||
+        if (childStride != container.LevelLayerSize(mip) || layout.Offset >= sliceStride ||
             childStride > sliceStride - layout.Offset || (Resources.Layers > 1 && childStride != sliceStride))
         {
             return -1;

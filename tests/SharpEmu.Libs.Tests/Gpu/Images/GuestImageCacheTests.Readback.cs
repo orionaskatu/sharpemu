@@ -1049,6 +1049,48 @@ public sealed partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // A tiled array holds each layer as a whole mip chain, a layer stride apart. Reading it back
+    // sized the copy from a layout that packed the layers per level, stopped short of the last
+    // layers and aborted the tiler (Ghost of Yotei, a 96-layer 64x64 array of 16-byte texels).
+    [Fact]
+    public void TiledArrayReadback_PlacesTheLastLayerAtItsLayerStride()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new SharpEmu.Libs.Tests.Gpu.Scheduling.FatalScope();
+        const uint width = 64, height = 64, layers = 4, levels = 4;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x200000, ReadWrite);
+        var words = RegisterWords.Texture(address, GuestPixelFormat.Bits32_32_32_32Float, width, height,
+            GuestImageType.Color2DArray, GuestTileMode.Standard4KB, lastLevel: levels - 1, maxMip: levels - 1, layers: layers);
+        var shape = new ShaderImageShape(false, false, false, false, TextureNumericClass.Float);
+        var request = ImageRequestBuilders.Texture(words, shape).Request;
+        var description = request.Description;
+        Assert.Equal(new SubresourceCount(levels, layers), description.Resources);
+        var stride = description.SliceStride;
+        Assert.Equal(description.Data.Size / layers, stride);
+        var mip0 = description.MipLayout[0];
+        var size = description.Data.Size;
+
+        var input = new byte[size];
+        new System.Random(1234).NextBytes(input);
+        harness.Write(address, input);
+        var identifier = harness.Acquire(ref request);
+        harness.MarkGpuWritten(identifier);
+
+        var result = harness.Worker.Run(() =>
+        {
+            using var output = new GpuBuffer(harness.Vulkan.DeviceInfo, harness.Scheduler,
+                GpuBufferUsage.DeviceLocal, address, GpuBuffer.AllFlags, size);
+            output.Fill(0, size, 0x5a5a5a5a);
+            Assert.True(harness.Images.TrySynchronizeBufferFromImage(output, address, size));
+            return harness.CopyFromDevice(output.Handle, 0, size);
+        });
+
+        var start = (layers - 1) * stride + mip0.Offset;
+        Assert.Equal(input.AsSpan((int)start, (int)mip0.Size).ToArray(), result.AsSpan((int)start, (int)mip0.Size).ToArray());
+        harness.Finish();
+        harness.Shutdown();
+    }
     [Fact]
     public void LinearReadback_LargerThanItsGuestRange_IsNotCopied()
     {

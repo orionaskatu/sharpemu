@@ -359,7 +359,7 @@ public sealed partial class GuestImageCache
     {
         var current = info.Resources.Layers;
         if (info.Resources.Levels != 1 || current == 0 || layers <= current ||
-            info.MipLayout[0].Offset != 0 || info.MipLayout[0].Size != info.Data.Size)
+            info.MipLayout[0].Offset != 0 || info.LevelBytes(0) != info.Data.Size)
         {
             return false;
         }
@@ -388,7 +388,11 @@ public sealed partial class GuestImageCache
             return false;
         }
 
-        grown.MipLayout[0].Size = grown.Data.Size;
+        if (grown.SliceStride == 0)
+        {
+            grown.MipLayout[0].Size = grown.Data.Size;
+        }
+
         grown.Resources = grown.Resources with { Layers = layers };
         info = grown;
         return true;
@@ -400,7 +404,7 @@ public sealed partial class GuestImageCache
         {
             var a = left.MipLayout[level];
             var b = right.MipLayout[level];
-            if (a.Offset != b.Offset || a.Size != b.Size || a.Pitch != b.Pitch || a.Height != b.Height)
+            if (left.SliceStride != right.SliceStride || a.Offset != b.Offset || a.Size != b.Size || a.Pitch != b.Pitch || a.Height != b.Height)
             {
                 return false;
             }
@@ -440,7 +444,7 @@ public sealed partial class GuestImageCache
             requested.Resources.Layers < cachedInfo.Resources.Layers &&
             requested.Type == cachedInfo.Type && requested.Pitch == cachedInfo.Pitch && requested.TileMode == cachedInfo.TileMode &&
             requested.MipLayout[0].Offset == 0 && cachedInfo.MipLayout[0].Offset == 0 &&
-            requested.MipLayout[0].Size == requested.Data.Size && cachedInfo.MipLayout[0].Size == cachedInfo.Data.Size &&
+            requested.LevelBytes(0) == requested.Data.Size && cachedInfo.LevelBytes(0) == cachedInfo.Data.Size &&
             requested.Data.Size % requested.Resources.Layers == 0 && cachedInfo.Data.Size % cachedInfo.Resources.Layers == 0 &&
             requested.Data.Size / requested.Resources.Layers == cachedInfo.Data.Size / cachedInfo.Resources.Layers &&
             !requested.HasStencil && !cachedInfo.HasStencil && (!requested.HasMetadata || separateDepthMetadata) && !cachedInfo.HasMetadata;
@@ -479,6 +483,7 @@ public sealed partial class GuestImageCache
             replacementInfo.Data = cachedInfo.Data;
             replacementInfo.Resources = cachedInfo.Resources;
             replacementInfo.MipLayout = cachedInfo.MipLayout;
+            replacementInfo.SliceStride = cachedInfo.SliceStride;
         }
         else
         {

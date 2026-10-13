@@ -328,6 +328,46 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Equal(ImageRequestBuilders.DestinationSwizzle(new TextureDescriptorWords(words)), resolution.Swizzle);
     }
 
+    // Each layer of a tiled array is a whole mip chain, so a level is described once for one layer
+    // and the layers sit a stride apart.
+    [Fact]
+    public void Texture_ArrayMipLayoutDescribesOneLayerAndTheLayerStride()
+    {
+        var single = ImageRequestBuilders.Texture(RegisterWords.Texture(Base, GuestPixelFormat.Bits32_32_32_32Float, 64, 64,
+            GuestImageType.Color2D, GuestTileMode.Standard4KB, lastLevel: 3, maxMip: 3), Sampled2D).Request.Description;
+        var array = ImageRequestBuilders.Texture(RegisterWords.Texture(Base, GuestPixelFormat.Bits32_32_32_32Float, 64, 64,
+            GuestImageType.Color2DArray, GuestTileMode.Standard4KB, lastLevel: 3, maxMip: 3, layers: 96), Sampled2D).Request.Description;
+
+        Assert.Equal(96u, array.Resources.Layers);
+        Assert.Equal(0x16000UL, array.SliceStride);
+        Assert.Equal(96 * array.SliceStride, array.Data.Size);
+        for (var level = 0; level < 4; level++)
+        {
+            Assert.Equal(single.MipLayout[level], array.MipLayout[level]);
+            Assert.True(array.MipLayout[level].Offset + array.MipLayout[level].Size <= array.SliceStride);
+            Assert.Equal(95 * array.SliceStride + array.MipLayout[level].Offset + array.MipLayout[level].Size, array.LevelEnd(level));
+        }
+
+        Assert.Equal(0x6000UL, array.MipLayout[0].Offset);
+        Assert.Equal(0x10000UL, array.MipLayout[0].Size);
+        Assert.Equal(array.Data.Size, array.LevelEnd(0));
+    }
+
+    [Fact]
+    public void ColorTarget_ArrayMipLayoutDescribesOneLayerAndTheLayerStride()
+    {
+        var single = ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, GuestTileMode.Standard4KB, maxMip: 2), 0xF, 0, false)!.Value.Request.Description;
+        var array = ImageRequestBuilders.ColorTarget(RegisterWords.Color(Base, 64, 64, GuestTileMode.Standard4KB, maxMip: 2, sliceMax: 3), 0xF, 0, false)!.Value.Request.Description;
+
+        Assert.Equal(4u, array.Resources.Layers);
+        Assert.Equal(single.Data.Size, array.SliceStride);
+        Assert.Equal(4 * array.SliceStride, array.Data.Size);
+        for (var level = 0; level < 3; level++)
+        {
+            Assert.Equal(single.MipLayout[level], array.MipLayout[level]);
+            Assert.Equal(3 * array.SliceStride + array.MipLayout[level].Offset + array.MipLayout[level].Size, array.LevelEnd(level));
+        }
+    }
     [Fact]
     public void Texture_MipWindowFollowsTheDescriptor()
     {

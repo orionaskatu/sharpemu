@@ -95,13 +95,18 @@ public static partial class ImageRequestBuilders
         var (spans, padded) = MipLayoutScratch.Rent();
         TileGeometry.TryGetTextureSize(
             description.GuestFormat, description.Extent.Width, description.Extent.Height, description.Resources.Levels, description.TileMode,
-            out _, spans, padded);
+            out var sliceSize, spans, padded);
+        // Each layer is a whole mip chain, so a level is described once and repeats every slice.
+        description.SliceStride = sliceSize.Size;
         for (var level = 0; level < description.Resources.Levels; level++)
         {
             var span = spans[level];
             var offset = span.SourceSize != 0 ? span.SourceOffset : span.Offset;
             ulong size = span.SourceSize != 0 ? span.SourceSize : span.Size;
-            size *= description.IsVolume ? Math.Max(description.Extent.Depth >> level, 1) : description.Resources.Layers;
+            if (description.IsVolume)
+            {
+                size *= Math.Max(description.Extent.Depth >> level, 1);
+            }
             description.MipLayout[level] = new MipLevelLayout
             {
                 Offset = offset,
@@ -405,7 +410,8 @@ public static partial class ImageRequestBuilders
 
         if (samples > 1)
         {
-            description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = size.Size, Pitch = pitch, Height = height };
+            description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = size.Size / imageLayers, Pitch = pitch, Height = height };
+            description.SliceStride = size.Size / imageLayers;
         }
         else
         {

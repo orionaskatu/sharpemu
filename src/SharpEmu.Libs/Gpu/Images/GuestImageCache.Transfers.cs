@@ -63,7 +63,7 @@ public sealed unsafe partial class GuestImageCache
         var slice = info.MipLayout[0];
         if (slice.Size == 0 || slice.Pitch < info.Extent.Width || slice.Height < info.Extent.Height ||
             (ulong)slice.Pitch * slice.Height * info.BytesPerBlock > slice.Size ||
-            slice.Size * info.Resources.Layers > info.Data.Size)
+            (info.SliceStride != 0 ? info.LevelBytes(0) : slice.Size * info.Resources.Layers) > info.Data.Size)
         {
             return [];
         }
@@ -999,13 +999,12 @@ public sealed unsafe partial class GuestImageCache
         {
             for (; levels < info.Resources.Levels; levels++)
             {
-                var mip = info.MipLayout[(int)levels];
-                if (mip.Size == 0 || mip.Offset > available || mip.Size > available - mip.Offset)
+                if (info.MipLayout[(int)levels].Size == 0 || info.LevelEnd((int)levels) > available)
                 {
                     break;
                 }
 
-                copySize = Math.Max(copySize, mip.Offset + mip.Size);
+                copySize = Math.Max(copySize, info.LevelEnd((int)levels));
             }
         }
 
@@ -1049,37 +1048,9 @@ public sealed unsafe partial class GuestImageCache
             return false;
         }
 
-        // The mip layout can end before the tile plan does (Silent Hill: a 128x128 slice planned at
-        // the exact end of the mip chain aborted the process). Cover the whole plan when the buffer
-        // holds it; otherwise keep the guest bytes instead of copying a partial image.
-        if (!plan.Depth && plan.Color.Tiled)
-        {
-            var tiledEnd = TiledEndOf(plan.Color.Tiles);
-            if (tiledEnd > copySize)
-            {
-                if (tiledEnd > available)
-                {
-                    return false;
-                }
-
-                copySize = tiledEnd;
-            }
-        }
-
         DownloadToBuffer(image, buffer, bufferOffset, copySize, plan);
         image.MarkBufferHoldsGpuContents();
         return true;
-    }
-
-    private static ulong TiledEndOf(List<TileTransfer> tiles)
-    {
-        var end = 0UL;
-        foreach (var tile in tiles)
-        {
-            end = Math.Max(end, tile.TiledOffset + tile.TiledSize);
-        }
-
-        return end;
     }
 
     // Publishes a GPU-owned image to guest memory after its tick completes; false when it cannot.
