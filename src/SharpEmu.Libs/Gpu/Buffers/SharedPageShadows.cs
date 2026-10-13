@@ -290,13 +290,10 @@ internal sealed unsafe class SharedPageShadows(ulong pageBytes, int capacity)
                     }
 
                     emitted = to;
-                    // The staging mapping is write-combining: diff a copy read with streaming loads.
+                    // The staging mapping is write-combining: diff a copy, not the mapping itself.
                     var stagedSlice = staged.Slice(checked((int)(copy.SrcOffset + (from - begin))), checked((int)(to - from)));
                     var source = pageScratch[..stagedSlice.Length];
-                    fixed (byte* stagedPointer = stagedSlice)
-                    {
-                        MappedMemoryReader.Copy(stagedPointer, source);
-                    }
+                    stagedSlice.CopyTo(source);
                     var shadowBytes = shadow.Bytes.AsSpan(checked((int)(from - page)), source.Length);
                     if (!ReferenceEquals(shadow.Owner, target))
                     {
