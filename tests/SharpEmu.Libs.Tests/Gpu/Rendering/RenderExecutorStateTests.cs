@@ -164,6 +164,24 @@ public sealed class RenderExecutorStateTests : IDisposable
         Assert.Equal(state.FrontStencil, state.BackStencil);
     }
 
+    // A draw that writes stencil marks the depth image written, which carries the mark to the
+    // guest stencil plane; a draw that only tests it does not.
+    [Theory]
+    [InlineData(3, true)]
+    [InlineData(0, false)]
+    public void Attachments_AStencilWritingDrawMarksTheDepthImageWritten(int passOperation, bool marked)
+    {
+        var banks = Banks(withDepth: true);
+        banks.Context.DepthTarget = RegisterWords.Depth(DepthBase, 64, 64, stencilBase: StencilBase) with { DepthControl = 0x1 | 0x2 | 0x4 | (7u << 4) | (7u << 8) };
+        banks.Context.StencilMask = new StencilMaskRegisters { TestValue = 0x10, Mask = 0xF0, WriteMask = 0xFF, TestValueBack = 0x10, MaskBack = 0xF0, WriteMaskBack = 0xFF };
+        banks.Context.StencilControl = new StencilControlRegisters { Pass = (byte)passOperation, PassBack = (byte)passOperation };
+        _executor.DrawIndexed(1, banks, Indexed(3));
+
+        var transition = Assert.Single(_host.Calls, call => call.StartsWith("transition_depth ", StringComparison.Ordinal));
+        Assert.Equal(marked, transition.Contains(nameof(ImageAspectFlags.StencilBit), StringComparison.Ordinal));
+        Assert.Equal(marked, _host.Calls.Contains("mark_written 2"));
+    }
+
     // A slot without a mask nibble is never bound, so every bound attachment writes.
     [Fact]
     public void DynamicState_ColorWriteEnableFollowsTheTargetMaskNibbleOfTheBoundSlot()

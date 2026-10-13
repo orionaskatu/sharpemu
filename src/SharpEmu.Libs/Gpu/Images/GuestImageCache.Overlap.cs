@@ -692,8 +692,11 @@ public sealed partial class GuestImageCache
             // Only an image of exactly this span can stand for the plane: the stencil upload
             // detiles the whole depth extent from it. A stencil proxy of another span is left
             // over from an earlier surface at this address and is replaced; any other image of
-            // another size (a texture reading part of the plane) is a separate resource.
-            if (owner.Description.Data.Size == stencil.Size)
+            // another size (a texture reading part of the plane) is a separate resource. A proxy
+            // of this span that another depth image owns holds that image's writes, not this
+            // one's: it is replaced too (Ghost of Yotei copies its depth buffer into a second
+            // depth image that shares the stencil plane).
+            if (owner.Description.Data.Size == stencil.Size && (!owner.DepthOwner.IsValid || owner.DepthOwner == depthImageIdentifier))
             {
                 association = imageIdentifier;
             }
@@ -704,7 +707,8 @@ public sealed partial class GuestImageCache
         }
 
         // The replaced plane belongs to another depth image. What the GPU wrote to it reaches
-        // guest memory before the association goes, as when a depth image changes planes.
+        // guest memory before the association goes, as when a depth image changes planes, and
+        // the new association loads it from there.
         foreach (var imageIdentifier in stale)
         {
             var proxy = _slots[imageIdentifier];

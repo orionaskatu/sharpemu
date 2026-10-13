@@ -324,6 +324,12 @@ public sealed unsafe partial class GuestImageCache
         return info;
     }
 
+    // Whether the depth image's stencil aspect can be written back now: a single-sample native
+    // image while commands are recorded. A multisample plane has no guest layout here.
+    private bool CanWriteBackStencilPlane(CachedImage depth) =>
+        _scheduler.Active && !depth.DepthOwner.IsValid && depth.Description.IsDepth && depth.Description.HasStencil &&
+        depth.Backing.Exists && depth.Description.Samples == 1 && depth.Backing.Samples == 1;
+
     // Writes the stencil aspect back to its guest plane once the current tick completes.
     private void WriteBackStencilPlane(CachedImage depth, GuestSpan plane)
     {
