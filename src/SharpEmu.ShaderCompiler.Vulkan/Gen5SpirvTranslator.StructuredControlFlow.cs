@@ -29,11 +29,6 @@ public static partial class Gen5SpirvTranslator
         // The merge of a loop with several exit blocks: a switch on the loop's selector follows it.
         private const int MultiExitNode = -2;
 
-        private static readonly bool ForceDispatcher = string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_SHADER_CONTROL_FLOW"),
-            "dispatcher",
-            StringComparison.OrdinalIgnoreCase);
-
 
         private enum TerminatorKind
         {
@@ -94,7 +89,7 @@ public static partial class Gen5SpirvTranslator
         private void PrepareControlFlow(IReadOnlyList<ShaderBlock> blocks)
         {
             var reason = "forced";
-            var forced = ForceDispatcher || _request.ForceDispatcher || _request.CooperativeWave64Workgroup;
+            var forced = _request.ForceDispatcher || _request.CooperativeWave64Workgroup;
             if (!forced && TryPlanStructuredControlFlow(blocks, out var plan, out reason))
             {
                 _structuredPlan = plan;

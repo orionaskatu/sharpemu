@@ -676,12 +676,6 @@ public sealed partial class RenderExecutor
                 hasStorageWrites |= image.Written && image.Class == ImageResourceClass.Storage;
             }
 
-            if (hasStorageWrites && GuestOrdersDispatches is false)
-            {
-                // Every earlier read of the written resources completes before this dispatch writes.
-                _host.ShaderWriteHazardBarrier();
-            }
-
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
             // The shader's local workgroup axes may have been remapped at compile time
             // (see Gen5SpirvTranslator.ComputeWorkgroupAxisOrder) so the largest NUM_THREAD
@@ -719,11 +713,6 @@ public sealed partial class RenderExecutor
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
 
             }
-            if (!GuestOrdersDispatches)
-            {
-                _host.ShaderAccessBarrier();
-            }
-
             foreach (var (fillHash, fillSlot, fillValue) in DbgFillAfter) // TEMP: SHARPEMU_DBG_FILL_AFTER=hash:slot:value,... overwrites a bound buffer after the dispatch
             {
                 if (fillHash != program.Hash || fillSlot >= input.Stage.Resources.Buffers.Length || input.Stage.Resources.Buffers[fillSlot].Length < 4)
@@ -858,9 +847,6 @@ public sealed partial class RenderExecutor
     // dispatches overlap unless the command stream orders them with a partial flush, a cache
     // flush, ACQUIRE_MEM or RELEASE_MEM, each of which records a global barrier here. Ordering
     // every dispatch on its own serialized the compute queue the guest meant to overlap.
-    // SHARPEMU_DISPATCH_BARRIERS=always restores a barrier before and after every dispatch.
-    private static readonly bool GuestOrdersDispatches =
-        Environment.GetEnvironmentVariable("SHARPEMU_DISPATCH_BARRIERS") != "always";
 
     // A dispatch that reads and rewrites one HTile surface in place (a shadow-map HTile clear
     // written by reading every word and storing it back) marks that HTile rewritten. Whether

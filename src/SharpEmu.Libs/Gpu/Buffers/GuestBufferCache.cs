@@ -894,11 +894,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // The command worker can read the stable backing alias without changing CPU page
     // permissions. A GPU counter elsewhere on the same page is not a dependency of
     // the packet bytes being decoded. Actual GPU-written bytes retain the slow path.
-    private static readonly bool CommandBackingReadsEnabled =
-        Environment.GetEnvironmentVariable("SHARPEMU_COMMAND_BACKING_READS") != "0";
-
     public bool TryReadCommandBacking(ulong address, Span<byte> destination) =>
-        CommandBackingReadsEnabled && destination.Length != 0 &&
+        destination.Length != 0 &&
         !_gpuModifiedRanges.Overlaps(address, (ulong)destination.Length) &&
         ImageCache is { } images && !images.HasGpuModifiedImageBytes(address, (ulong)destination.Length) &&
         _backing.TryReadBacking(address, destination);
@@ -920,25 +917,22 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
         // Registered buffers are ordered and disjoint: walk only the ones the write overlaps.
         var end = guestAddress + (ulong)data.Length;
-        if (DeferHostWrites)
+        // When no GPU-written byte shares the written pages, the pages can simply turn
+        // CPU-dirty: every later GPU reader synchronizes CPU-dirty pages first (bound buffers
+        // on obtain, device-address programs at the next visibility point), so the bytes
+        // arrive in command order without a staging copy that ends the rendering scope.
+        var firstPage = guestAddress & ~(TrackerLayout.PageBytes - 1);
+        var pagesEnd = (end + TrackerLayout.PageBytes - 1) & ~(TrackerLayout.PageBytes - 1);
+        if (!_gpuModifiedRanges.Overlaps(firstPage, pagesEnd - firstPage) &&
+            !_tracker.HasGpuDirtyPages(firstPage, pagesEnd - firstPage))
         {
-            // When no GPU-written byte shares the written pages, the pages can simply turn
-            // CPU-dirty: every later GPU reader synchronizes CPU-dirty pages first (bound buffers
-            // on obtain, device-address programs at the next visibility point), so the bytes
-            // arrive in command order without a staging copy that ends the rendering scope.
-            var firstPage = guestAddress & ~(TrackerLayout.PageBytes - 1);
-            var pagesEnd = (end + TrackerLayout.PageBytes - 1) & ~(TrackerLayout.PageBytes - 1);
-            if (!_gpuModifiedRanges.Overlaps(firstPage, pagesEnd - firstPage) &&
-                !_tracker.HasGpuDirtyPages(firstPage, pagesEnd - firstPage))
+            if (IsRegionRegistered(guestAddress, (ulong)data.Length))
             {
-                if (IsRegionRegistered(guestAddress, (ulong)data.Length))
-                {
-                    _tracker.MarkCpuDirtyPages(guestAddress, (ulong)data.Length);
-                    NoteMemoryVisibilityPoint();
-                }
-
-                return;
+                _tracker.MarkCpuDirtyPages(guestAddress, (ulong)data.Length);
+                NoteMemoryVisibilityPoint();
             }
+
+            return;
         }
 
         for (var index = _registry.FindFirstOverlappingIndex(guestAddress);
@@ -1669,7 +1663,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             // for every page the guest streams while the stream is being translated.
             // Hot pages remain writable, so later CPU writes need not advance CpuDirtyEpoch.
             // Every visibility point must revisit their dirty ranges even with an unchanged epoch.
-            if (mapping != _bdaSweepMapping || _bdaVisibilityPending || SweepBdaOnEveryDraw)
+            if (mapping != _bdaSweepMapping || _bdaVisibilityPending)
             {
                 BeginUploadBatch();
                 try
@@ -1712,14 +1706,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // Called once per presented frame; see GuestPageTracker.DecayCpuWriteHeat.
     public void DecayCpuWriteHeat()
     {
-        if (!KeepCpuWriteHeatAcrossFrames)
-        {
-            _tracker.DecayCpuWriteHeat();
-        }
+        _tracker.DecayCpuWriteHeat();
     }
-
-    private static readonly bool KeepCpuWriteHeatAcrossFrames =
-        Environment.GetEnvironmentVariable("SHARPEMU_KEEP_CPU_WRITE_HEAT") == "1";
 
     public void NoteMemoryVisibilityPoint()
     {
@@ -1757,9 +1745,6 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // Advances at every memory visibility point; starts above a new buffer's zero generation.
     private long _visibilityGeneration = 1;
 
-    private static readonly bool ResyncHotPagesOnEveryDraw =
-        Environment.GetEnvironmentVariable("SHARPEMU_BDA_RESYNC_HOT_EVERY_DRAW") == "1";
-
     private static long _reportedVisibilityPoints;
     private static long _reportedHotSyncFull;
     private static long _reportedHotSyncSkipped;
@@ -1775,7 +1760,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // that fault dirty are still copied on every call.
     public void SynchronizeDeviceAddressRange(ulong guestAddress, ulong size)
     {
-        if (ResyncHotPagesOnEveryDraw || GuestGpuMemoryHook.TraceAddress != 0)
+        if (GuestGpuMemoryHook.TraceAddress != 0)
         {
             SynchronizeBuffersInRange(guestAddress, size);
             return;
@@ -1824,7 +1809,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             }
 
             _ = SynchronizeBuffer(buffer, start, finish - start, false, false,
-                preserveCpuWriteHotPages: PreserveHotPagesInSweeps, skipCpuWriteHotPages: covered);
+                preserveCpuWriteHotPages: true, skipCpuWriteHotPages: covered);
         }
     }
 
@@ -1849,7 +1834,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             // Hot pages stay writable and are copied again on the next sweep: a few hundred KiB of
             // ring memory per sweep costs far less than a protection fault per page per frame.
             if (start < finish && _tracker.MayHaveCpuDirtyPages(start, finish - start))
-                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: PreserveHotPagesInSweeps);
+                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: true);
         }
     }
 
@@ -1875,7 +1860,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 // SynchronizeBuffer takes for this read-only call), and the block summary
                 // answers that without a lock for the common all-clean case.
                 if (_tracker.HasCpuDirtyPages(start, finish - start))
-                    _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: PreserveHotPagesInSweeps);
+                    _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: true);
             }
         }
     }
@@ -2049,7 +2034,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 $"unsupported buffer readback from an asynchronous GPU completion, addr=0x{guestAddress:X16} size=0x{size:X16}");
         }
 
-        if (!_relay.IsGpuQueueThread && GuestReadsAwaitOffQueue && (AsyncReadback is not null || MainQueuePendingReads))
+        if (!_relay.IsGpuQueueThread && GuestReadsAwaitOffQueue)
         {
             for (var attempt = 0; ; attempt++)
             {
@@ -2582,7 +2567,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         buffer = null!;
         offsets = [];
         writeTicks = [];
-        if (!MainQueuePendingReads || copies.Count == 0)
+        if (copies.Count == 0)
         {
             return false;
         }
@@ -2621,9 +2606,6 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         writeTicks = ticks;
         return true;
     }
-
-    private static readonly bool MainQueuePendingReads =
-        Environment.GetEnvironmentVariable("SHARPEMU_MAIN_QUEUE_PENDING_READS") != "0";
 
     // Pending reads a guest thread re-issues before it lets the worker read synchronously.
     private const int PendingReadAttempts = 4;

@@ -541,9 +541,6 @@ public sealed partial class GuestImageCache
         return replacementImageIdentifier;
     }
 
-    private static readonly bool DropWithoutPublishing =
-        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_DROP_WITHOUT_PUBLISH") == "1";
-
     // Memory keeps its bytes when another image or a buffer write reuses part of it. An image
     // whose GPU contents never reached guest memory moves them into the buffer over its range
     // before it is dropped, so a later image over those bytes starts from them, not from stale
@@ -551,7 +548,7 @@ public sealed partial class GuestImageCache
     private bool PublishBeforeDrop(ResourceSlotIdentifier imageIdentifier)
     {
         var image = _slots[imageIdentifier];
-        if (DropWithoutPublishing || !image.IsGpuModified || image.DepthOwner.IsValid || !image.SafeToDownload)
+        if (!image.IsGpuModified || image.DepthOwner.IsValid || !image.SafeToDownload)
         {
             return false;
         }
