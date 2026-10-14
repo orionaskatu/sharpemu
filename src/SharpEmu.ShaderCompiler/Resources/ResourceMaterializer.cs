@@ -540,6 +540,21 @@ public static class ResourceMaterializer
         }
     }
 
+    private static readonly HashSet<(uint Pc, uint Stride)> ReportedTableBoundedFallbacks = new();
+
+    // Once per image and material stride, so a table probed every draw does not flood the log.
+    private static void ReportTableBoundedFallback(uint pc, uint stride, ulong exhaustiveCount, ulong records)
+    {
+        lock (ReportedTableBoundedFallbacks)
+        {
+            if (ReportedTableBoundedFallbacks.Add((pc, stride)))
+            {
+                Console.Error.WriteLine($"[GPU][WARN] indirect image {Hex(pc)}: {exhaustiveCount} unbounded selector probes exceed {MaxIndirectImageProbes}; " +
+                    $"probing the {records} records of the material table");
+            }
+        }
+    }
+
     private static bool NullImageDescriptor(ReadOnlySpan<uint> descriptor) =>
         descriptor[0] == 0 && (descriptor[1] & 0xFF) == 0;
 
@@ -769,8 +784,25 @@ public static class ResourceMaterializer
         }
         else
         {
-            // Material-table size does not bound the selector before the wrapping 32-bit product.
-            return Detail($"indirect image {Hex(image.FirstUsePc)}: {probeCount} unbounded selector probes exceed {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
+            // Material-table size does not bound the selector before the wrapping 32-bit product,
+            // but a real table index stays inside the table: past the cap, probe the record-aligned
+            // offsets the table holds (Ghost of Yotei's water particles have no selector clamp, and
+            // failing the plan stopped the emulator). The plan fails only when even those exceed it.
+            var records = indirect.SelectorStride != 0 && indirect.SelectorOffset <= limit
+                ? (limit - indirect.SelectorOffset) / indirect.SelectorStride + 1
+                : 0;
+            if (records == 0 || records > MaxIndirectImageProbes)
+            {
+                return Detail($"indirect image {Hex(image.FirstUsePc)}: {probeCount} unbounded selector probes exceed {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
+            }
+
+            ReportTableBoundedFallback(image.FirstUsePc, indirect.SelectorStride, probeCount, records);
+            if (diagnostic is not null)
+            {
+                diagnostic.SelectionMode = "table_bounded";
+            }
+
+            offsets = Enumerable.Range(0, (int)records).Select(index => indirect.SelectorOffset + (ulong)index * indirect.SelectorStride);
         }
 
         var keys = new List<uint> { 0 };

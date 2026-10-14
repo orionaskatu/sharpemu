@@ -60,19 +60,29 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly Dictionary<RuntimeDescriptorKey, RuntimeImageEntry> Images = new();
             public readonly Dictionary<RuntimeDescriptorKey, RuntimeSamplerEntry> Samplers = new();
             public readonly ConcurrentQueue<(bool Image, uint[] Key)> Misses = new();
-            // A consumed miss buffer is cleared and reused by a later submission.
-            public readonly TickOwnedResources<GpuBuffer> MissBuffers = new(static buffer =>
-            {
-                buffer.Mapped.Clear();
-                if (!buffer.IsCoherent)
-                {
-                    buffer.Flush(0, buffer.Size);
-                }
-            });
             public GpuBuffer? Table;
             public bool TableDirty = true;
+            // The tick whose miss arena holds this set's slot, and the slot.
             public ulong MissScanTick = ulong.MaxValue;
+            public BufferView MissSlot;
         }
+
+        // Miss feedback of every runtime descriptor set a submission binds shares one mapped
+        // arena per tick, a slot per set. One dedicated allocation per set and tick ran into
+        // the host's mapping limit (vkMapMemory failed) once submissions became finer grained.
+        private sealed class MissArena(GpuBuffer buffer, int slots)
+        {
+            public readonly GpuBuffer Buffer = buffer;
+            public readonly RuntimeDescriptorSet?[] Owners = new RuntimeDescriptorSet?[slots];
+            public int Used;
+        }
+
+        private const int MissArenaSlots = 256;
+        private const int MaxSpareMissArenas = 16;
+        private readonly Dictionary<ulong, List<MissArena>> _missArenas = new();
+        private readonly Stack<MissArena> _spareMissArenas = new();
+        private readonly object _missArenaGate = new();
+        private ulong _missSlotBytes;
 
         // Feedback is owned by the shader that generated it, not by the process.
         // In particular, a new scene must not acquire every older shader's textures.
@@ -229,10 +239,8 @@ internal static unsafe partial class VulkanVideoPresenter
             // will actually execute the draw, after all image allocations.
             var descriptors = RuntimeDescriptorsFor(prepared.Program);
             var table = RuntimeDescriptorTableBuffer(descriptors);
-            var misses = RuntimeDescriptorMissBuffer(descriptors);
             prepared.Descriptors.RuntimeTable = new BufferView(table.Handle, 0, table.Size);
-            prepared.Descriptors.RuntimeMisses = new BufferView(misses.Handle, 0, misses.Size);
-            ScanRuntimeDescriptorMissesAfterTick(descriptors);
+            prepared.Descriptors.RuntimeMisses = RuntimeDescriptorMissSlot(descriptors);
         }
 
         private void RegisterRuntimeDescriptorMisses(RuntimeDescriptorSet descriptors)
@@ -296,47 +304,110 @@ internal static unsafe partial class VulkanVideoPresenter
             return buffer;
         }
 
-        private GpuBuffer RuntimeDescriptorMissBuffer(RuntimeDescriptorSet descriptors)
+        // The set's slot in the current tick's miss arena; the arena is read when the tick completes.
+        private BufferView RuntimeDescriptorMissSlot(RuntimeDescriptorSet descriptors)
         {
-            return descriptors.MissBuffers.Acquire(_scheduler.CurrentTick, CreateRuntimeDescriptorMissBuffer);
+            var tick = _scheduler.CurrentTick;
+            if (descriptors.MissScanTick == tick)
+            {
+                return descriptors.MissSlot;
+            }
+
+            if (_missSlotBytes == 0)
+            {
+                var alignment = Math.Max(_deviceInfo.MinStorageBufferOffsetAlignment, 16);
+                _missSlotBytes = (RuntimeDescriptorTable.MissBufferDwords * sizeof(uint) + alignment - 1) / alignment * alignment;
+            }
+
+            MissArena arena;
+            lock (_missArenaGate)
+            {
+                if (!_missArenas.TryGetValue(tick, out var arenas))
+                {
+                    arenas = [];
+                    _missArenas.Add(tick, arenas);
+                    _scheduler.QueueCompletionAction(() => CompleteMissArenas(tick));
+                }
+
+                if (arenas.Count == 0 || arenas[^1].Used == MissArenaSlots)
+                {
+                    arenas.Add(_spareMissArenas.TryPop(out var spare) ? spare : CreateMissArena());
+                }
+
+                arena = arenas[^1];
+            }
+
+            var slot = arena.Used++;
+            arena.Owners[slot] = descriptors;
+            descriptors.MissScanTick = tick;
+            descriptors.MissSlot = new BufferView(arena.Buffer.Handle, (ulong)slot * _missSlotBytes, _missSlotBytes);
+            return descriptors.MissSlot;
         }
 
-        private GpuBuffer CreateRuntimeDescriptorMissBuffer()
+        private MissArena CreateMissArena()
         {
             var buffer = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download, 0, BufferUsageFlags.StorageBufferBit,
-                RuntimeDescriptorTable.MissBufferDwords * sizeof(uint));
+                _missSlotBytes * MissArenaSlots);
             buffer.Mapped.Clear();
             if (!buffer.IsCoherent)
             {
                 buffer.Flush(0, buffer.Size);
             }
 
-            return buffer;
+            return new MissArena(buffer, MissArenaSlots);
         }
 
-        // Once per tick that binds runtime descriptors: the misses its draws recorded are read
-        // when it completes. Each tick owns separate storage until that read finishes.
-        private void ScanRuntimeDescriptorMissesAfterTick(RuntimeDescriptorSet descriptors)
+        // Reads every slot the tick's draws wrote, clears the counts and keeps the arenas for later ticks.
+        private void CompleteMissArenas(ulong tick)
         {
-            var tick = _scheduler.CurrentTick;
-            if (descriptors.MissScanTick == tick)
+            List<MissArena>? arenas;
+            lock (_missArenaGate)
+            {
+                _missArenas.Remove(tick, out arenas);
+            }
+
+            if (arenas is null)
             {
                 return;
             }
 
-            descriptors.MissScanTick = tick;
-            _scheduler.QueueCompletionAction(() =>
-                descriptors.MissBuffers.Complete(tick, buffer => ReadRuntimeDescriptorMisses(descriptors, buffer)));
+            foreach (var arena in arenas)
+            {
+                if (!arena.Buffer.IsCoherent)
+                {
+                    arena.Buffer.Invalidate(0, arena.Buffer.Size);
+                }
+
+                for (var slot = 0; slot < arena.Used; slot++)
+                {
+                    var words = MemoryMarshal.Cast<byte, uint>(arena.Buffer.Mapped.Slice((int)((ulong)slot * _missSlotBytes), (int)_missSlotBytes));
+                    ReadRuntimeDescriptorMisses(arena.Owners[slot]!, words);
+                    words[(int)RuntimeDescriptorTable.ImageMissCountDword] = 0;
+                    words[(int)RuntimeDescriptorTable.SamplerMissCountDword] = 0;
+                    arena.Owners[slot] = null;
+                }
+
+                if (!arena.Buffer.IsCoherent)
+                {
+                    arena.Buffer.Flush(0, arena.Buffer.Size);
+                }
+
+                arena.Used = 0;
+                lock (_missArenaGate)
+                {
+                    if (_spareMissArenas.Count < MaxSpareMissArenas)
+                    {
+                        _spareMissArenas.Push(arena);
+                        continue;
+                    }
+                }
+
+                arena.Buffer.Dispose();
+            }
         }
 
-        private void ReadRuntimeDescriptorMisses(RuntimeDescriptorSet descriptors, GpuBuffer buffer)
+        private static void ReadRuntimeDescriptorMisses(RuntimeDescriptorSet descriptors, Span<uint> words)
         {
-            if (!buffer.IsCoherent)
-            {
-                buffer.Invalidate(0, buffer.Size);
-            }
-
-            var words = MemoryMarshal.Cast<byte, uint>(buffer.Mapped);
             var imageCount = Math.Min(words[(int)RuntimeDescriptorTable.ImageMissCountDword], RuntimeDescriptorTable.ImageMissCapacity);
             var samplerCount = Math.Min(words[(int)RuntimeDescriptorTable.SamplerMissCountDword], RuntimeDescriptorTable.SamplerMissCapacity);
             for (uint record = 0; record < imageCount; record++)
@@ -358,9 +429,18 @@ internal static unsafe partial class VulkanVideoPresenter
             foreach (var descriptors in _runtimeDescriptorSets.Values)
             {
                 descriptors.Table?.Dispose();
-                descriptors.MissBuffers.Dispose();
             }
             _runtimeDescriptorSets.Clear();
+            lock (_missArenaGate)
+            {
+                foreach (var arena in _missArenas.Values.SelectMany(arenas => arenas).Concat(_spareMissArenas))
+                {
+                    arena.Buffer.Dispose();
+                }
+
+                _missArenas.Clear();
+                _spareMissArenas.Clear();
+            }
         }
     }
 }
