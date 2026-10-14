@@ -84,12 +84,21 @@ public interface ICommandStreamHost
 {
     ICpuMemory Memory { get; }
 
+    bool TryRecordLodStatistics(ulong destination, uint size) => false;
+
     // Reads guest memory the GPU may have written; the host synchronizes GPU-owned pages first.
     bool TryReadGuest(ulong address, Span<byte> destination);
 
     // Writes a few bytes to guest memory and the GPU's copy of them without downloading the
     // GPU's other writes on the page first; false when the host must take the ordinary write.
     bool TryWriteThrough(ulong address, ReadOnlySpan<byte> source) => false;
+    // Reads a packet operand (a label, a predicate, indirect arguments): memory earlier work may
+    // write, unlike the packets themselves. A host that defers work completes it first.
+    bool TryReadGuestOperand(ulong address, Span<byte> destination) => TryReadGuest(address, destination);
+
+    // Reads the label a wait polls. A stale value only suspends the wait until a retry, so a host
+    // that runs work behind the stream need not complete it first.
+    bool TryReadGuestWaitOperand(ulong address, Span<byte> destination) => TryReadGuestOperand(address, destination);
 
     // Runs commands other threads posted to this worker. Called before every packet.
     void RunPendingCommands();
@@ -98,6 +107,10 @@ public interface ICommandStreamHost
     void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots);
 
     void Flush();
+
+    // A frame boundary: submits what the frame recorded. The submitter resumes once it returns, so a
+    // host that runs the stream ahead of its recording returns only after the frame is recorded.
+    void FlushFrame() => Flush();
 
     void FlushAndWait();
 

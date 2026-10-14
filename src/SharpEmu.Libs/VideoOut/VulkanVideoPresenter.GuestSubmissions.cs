@@ -47,13 +47,32 @@ internal static unsafe partial class VulkanVideoPresenter
         private CommandBuffer BeginBatchedGuestCommands()
         {
             var commandBuffer = CurrentRecordingBuffer();
+            OpenGuestBatch();
+            return commandBuffer;
+        }
+
+        private CommandBuffer BeginBatchedGuestStateCommands()
+        {
+            var recording = CurrentRecording();
+            OpenGuestBatch();
+            return new CommandBuffer(recording.StateHandle);
+        }
+
+        private void RequestGuestMemoryBarrier(in MemoryBarrierRequest request)
+        {
+            var recording = CurrentRecording();
+            OpenGuestBatch();
+            _scheduler.MemoryBarrierRecorder ??= RecordRequestedMemoryBarrier;
+            recording.RequestMemoryBarrier(request);
+        }
+
+        private void OpenGuestBatch()
+        {
             if (!_batchOpen)
             {
                 _batchOpen = true;
                 _batchDrawCount = 0;
             }
-
-            return commandBuffer;
         }
 
         // Submits the current recording buffer with everything the batch lists own.
@@ -108,21 +127,24 @@ internal static unsafe partial class VulkanVideoPresenter
                     retireBuffers));
         }
 
-        // Collecting completed work reads the timeline semaphore and runs deferred callbacks;
-        // per draw that was a tenth of the render thread. Below capacity it runs at most this often.
-        private static readonly long CompletionPollInterval = System.Diagnostics.Stopwatch.Frequency / 2000;
-        private long _lastCompletionPoll;
+        // Collecting completed submissions polls the GPU timeline twice and may wait for the priority
+        // worker. Every draw used to pay that; completed work only frees resources and runs deferred
+        // callbacks, so a collection a few hundred microseconds later changes nothing but how long
+        // those resources stay reserved. A full in-flight queue still collects, and waits, at once.
+        private static readonly long CollectIntervalTicks = System.Diagnostics.Stopwatch.Frequency / 4000;
+        private long _lastCollectTicks;
 
-        private void EnsureGuestSubmissionCapacity()
+        private void EnsureGuestSubmissionCapacity(bool collectNow = false)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.SubmissionCapacity);
             var now = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (!SharpEmu.ShaderCompiler.DbgFlags.Disabled("poll") && _pendingGuestSubmissions.Count < MaxInFlightGuestSubmissions && now - _lastCompletionPoll < CompletionPollInterval)
+            if (!collectNow && !SharpEmu.ShaderCompiler.DbgFlags.Disabled("poll") &&
+                _pendingGuestSubmissions.Count < MaxInFlightGuestSubmissions && now - _lastCollectTicks < CollectIntervalTicks)
             {
                 return;
             }
 
-            _lastCompletionPoll = now;
+            _lastCollectTicks = now;
             CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {
@@ -161,6 +183,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _commandStream.NotifyCompletedGpuTick(_scheduler.Timeline.CompletedTick);
+            PublishLodStatistics();
 
             ProcessDeferredTextureDestroys();
         }

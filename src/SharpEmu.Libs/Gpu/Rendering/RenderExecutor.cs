@@ -88,6 +88,9 @@ public sealed partial class RenderExecutor
         public uint ColorCount;
         public DepthAttachmentState Depth;
         public bool PixelActive;
+        // The registers leave the pixel stage inactive, but it runs for its memory stores
+        // (PixelStageWritesMemory): no prefetch, which knows only the registers, resolved this.
+        public bool PixelForcedActive;
         public RenderingState Rendering;
         public GraphicsPrograms Programs;
 
@@ -837,29 +840,23 @@ public sealed partial class RenderExecutor
     private void ResolveShaderPrograms(RegisterBanks banks, ref DrawState state)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawProgramResolution);
-        var context = banks.Context;
-        Span<ColorComponentMapArray> mappingStorage = stackalloc ColorComponentMapArray[1];
-        Span<ColorComponentMap> targetExportMapping = mappingStorage[0];
-        targetExportMapping.Fill(ColorComponentMap.Identity);
+        var inputs = GraphicsProgramInputs.Create();
+        Span<ColorComponentMap> targetExportMapping = inputs.Mapping;
         foreach (ref readonly var color in BoundColors(ref state))
         {
             targetExportMapping[(int)color.Slot] = color.Resolution.ExportMapping;
         }
 
-        state.Programs = _pipelines.GetGraphicsPrograms(
-            banks.Shader.Vertex,
-            banks.Shader.Pixel,
-            context.ShaderInterface,
-            context,
-            targetExportMapping,
-            state.PixelActive,
-            state.Depth.HasTarget);
-    }
+        inputs.PixelActive = state.PixelActive;
+        inputs.DepthBound = state.Depth.HasTarget;
+        // A prefetch resolved the inputs the register banks give (ProgramInputsOf) only.
+        if (!state.PixelForcedActive && Prefetch is { } prefetch && prefetch.TryTakeGraphics(banks, in inputs, out var prefetched))
+        {
+            state.Programs = prefetched;
+            return;
+        }
 
-    [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]
-    private struct ColorComponentMapArray
-    {
-        private ColorComponentMap _element0;
+        state.Programs = ResolveGraphicsPrograms(banks, in inputs);
     }
 
     private static void TraceDrawState(ulong submitId, RegisterBanks banks, in DrawCall draw, in DrawState state)

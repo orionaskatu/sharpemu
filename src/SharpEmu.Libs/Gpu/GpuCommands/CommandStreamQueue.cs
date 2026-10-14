@@ -659,7 +659,7 @@ public sealed class CommandStreamQueue
         if (submission.Kind == CommandSubmissionKind.FrameBoundary)
         {
             SlicesRun++;
-            _host.Flush();
+            _host.FlushFrame();
             return true;
         }
 

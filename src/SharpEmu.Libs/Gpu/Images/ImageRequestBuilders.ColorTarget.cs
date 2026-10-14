@@ -41,14 +41,6 @@ public static partial class ImageRequestBuilders
 {
     private static long _normalizedSliceRanges;
 
-    // Every draw resolves its color targets; the per-level scratch is copied into the
-    // description before returning, so one cleared pair per thread replaces two arrays per call.
-    [ThreadStatic]
-    private static TileLevelSpan[]? _colorTargetMipSpans;
-
-    [ThreadStatic]
-    private static TilePaddedSize[]? _colorTargetMipPadded;
-
     public static uint SampleCount(uint encodedLog2) => encodedLog2 <= 3 ? 1u << (int)encodedLog2 : 0;
 
     private static bool DccAlphaOnMsb(in ColorTargetWords words)
@@ -106,6 +98,26 @@ public static partial class ImageRequestBuilders
 
     public static bool SupportsDccFixedClear(Format format) => PackedClearValue.SupportsDccFixedColor(format);
 
+    // Every draw rebuilds its targets' requests (a whole mip layout) from the same register words,
+    // twice: once for the attachments and once for the pixel outputs. The build reads nothing but
+    // its arguments, so a result is reused while they are equal.
+    private struct ColorTargetMemo
+    {
+        public bool Valid;
+        public ColorTargetWords Words;
+        public uint TargetMask;
+        public uint DrawLayerOffset;
+        public bool IgnoreTargetMask;
+        public ColorTargetResolution? Result;
+    }
+
+    private const int TargetMemoCount = 8;
+
+    [ThreadStatic]
+    private static ColorTargetMemo[]? _colorTargetMemos;
+
+    private static int TargetMemoSlot(ulong address) => (int)((address >> 12) ^ (address >> 20)) & (TargetMemoCount - 1);
+
     // Builds the request for a bound color target. Null when the slot carries no target.
     private static readonly bool DbgAllTargets = Environment.GetEnvironmentVariable("SHARPEMU_DBG_ALL_TARGETS") == "1"; // TEMP
 
@@ -132,6 +144,34 @@ public static partial class ImageRequestBuilders
                 $"bind target=0x{copy.BaseAddress:X} info=0x{copy.Info:X8} dcc={copy.DccEnabled} dccAddr=0x{copy.DccAddress:X} fastClear={copy.FastClear} cmask=0x{copy.CmaskAddress:X} clear0=0x{copy.ClearWord0:X8} dccControl=0x{copy.DccControl:X8} mask=0x{targetMask:X} size={copy.Width + 1}x{copy.Height + 1} tile={copy.TileMode} attrib=0x{copy.Attrib:X8} view=0x{copy.View:X8}");
         }
 
+        if (Rendering.RenderTrace.Enabled)
+        {
+            return ColorTargetCore(in words, targetMask, drawLayerOffset, ignoreTargetMask);
+        }
+
+        var memos = _colorTargetMemos ??= new ColorTargetMemo[TargetMemoCount];
+        ref var memo = ref memos[TargetMemoSlot(words.BaseAddress)];
+        if (memo.Valid && memo.TargetMask == targetMask && memo.DrawLayerOffset == drawLayerOffset &&
+            memo.IgnoreTargetMask == ignoreTargetMask && memo.Words.Equals(words))
+        {
+            return memo.Result;
+        }
+
+        var result = ColorTargetCore(in words, targetMask, drawLayerOffset, ignoreTargetMask);
+        memo = new ColorTargetMemo
+        {
+            Valid = true,
+            Words = words,
+            TargetMask = targetMask,
+            DrawLayerOffset = drawLayerOffset,
+            IgnoreTargetMask = ignoreTargetMask,
+            Result = result,
+        };
+        return result;
+    }
+
+    private static ColorTargetResolution? ColorTargetCore(in ColorTargetWords words, uint targetMask, uint drawLayerOffset, bool ignoreTargetMask)
+    {
         var mask = targetMask & 0xF;
         if (ignoreTargetMask && words.BaseAddress != 0 && mask == 0)
         {
@@ -288,10 +328,7 @@ public static partial class ImageRequestBuilders
             pitch = TileGeometry.TexturePitch(transferFormat, width, GuestTileMode.Linear);
         }
 
-        var mipSpans = _colorTargetMipSpans ??= new TileLevelSpan[TiledSurfaceLayout.MaxLevels];
-        var mipPadded = _colorTargetMipPadded ??= new TilePaddedSize[TiledSurfaceLayout.MaxLevels];
-        Array.Clear(mipSpans);
-        Array.Clear(mipPadded);
+        var (mipSpans, mipPadded) = MipLayoutScratch.Rent();
         TiledSurfaceLayout? volumeLayout = null;
         ulong size;
         ulong backingSize = 0;

@@ -219,7 +219,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         var metadataBaseLayer = request.View.BaseLayer;
         var result = LookUpImage(ref request, exactFormat);
+        CompleteLookup(result, in request, metadataBaseLayer);
+        return result;
+    }
 
+    public void CompleteLookup(ResourceSlotIdentifier result, in ImageRequest request, uint metadataBaseLayer)
+    {
         if (request.Role is ImageRole.Texture or ImageRole.StorageImage)
         {
             ulong metadataAddress;
@@ -257,8 +262,6 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
                     $"A compressed display surface can only be read from clean native GPU contents: address=0x{image.Description.Data.Address:X16} bufferModified={image.IsBufferModified} cpuDirty={image.IsCpuDirty} gpuModified={image.IsGpuModified}.");
             }
         }
-
-        return result;
     }
 
     private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat)

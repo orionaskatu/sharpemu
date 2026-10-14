@@ -12,6 +12,11 @@ public static class ComputeWaveModel
     private static readonly bool NativeWave64Enabled =
         Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_WAVE64") != "0";
 
+    // SHARPEMU_NATIVE_WAVE64=0 or SHARPEMU_REQUIRE_SUBGROUP64=0 keep wave64 compute off 64-lane
+    // host subgroups: it is lowered as on a 32-lane host and the pipeline is not pinned to 64.
+    public static bool NativeWave64Allowed { get; } =
+        NativeWave64Enabled && Environment.GetEnvironmentVariable("SHARPEMU_REQUIRE_SUBGROUP64") != "0";
+
     // A wave64 program whose workgroup is whole waves runs each guest wave as one 64-lane host
     // subgroup when the device can require that size for compute.
     public static bool UsesNativeWave64(ComputeInputInfo info, bool deviceSupportsSubgroup64, uint maxWorkgroupSubgroups)

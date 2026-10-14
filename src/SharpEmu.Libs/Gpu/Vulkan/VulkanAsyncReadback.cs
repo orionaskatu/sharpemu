@@ -188,10 +188,13 @@ internal sealed unsafe class VulkanAsyncReadback : IBufferReadback
                 PSemaphores = &semaphore,
                 PValues = &signalValue,
             };
+            var waitStart = VideoOut.GpuWaitSiteProfile.Begin();
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
                 Require(vk.WaitSemaphores(_device.Device, &waitInfo, ulong.MaxValue), "vkWaitSemaphores(readback)");
             }
+
+            VideoOut.GpuWaitSiteProfile.End(waitStart);
         }
         finally
         {

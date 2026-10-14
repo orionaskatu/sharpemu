@@ -17,6 +17,12 @@ public sealed partial class RenderExecutor
     private bool TryResolveDrawTargets(RegisterBanks banks, in DrawCall draw, ref DrawState state)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawTargetResolution);
+        if (Diagnostics.DccWriterTrace.Enabled)
+        {
+            Diagnostics.DccWriterTrace.CurrentKind = "draw";
+            Diagnostics.DccWriterTrace.CurrentProgram = 0;
+        }
+
         var context = banks.Context;
         if (TryResolveMultisampleColor(context))
         {
@@ -165,12 +171,16 @@ public sealed partial class RenderExecutor
             return false;
         }
 
+        // A pixel stage the registers leave inactive is resolved as active here, which no
+        // prefetch could foresee.
         state.PixelActive = true;
+        state.PixelForcedActive = true;
         ResolveShaderPrograms(banks, ref state);
         var stage = state.Programs.PixelInput.Stage;
         if (!state.Programs.Available || stage.Program is not { } program)
         {
             state.PixelActive = false;
+            state.PixelForcedActive = false;
             return false;
         }
 
@@ -292,9 +302,11 @@ public sealed partial class RenderExecutor
     // left bound by Astro Bot's depth clear kept the clear out of most of a 1080p depth buffer.
     // The pixel outputs drop the same slots (ShaderPipelineCache.ResolveBoundTargets), so host
     // locations stay dense and aligned with the remaining attachments.
+    // The provider also asks for the drop when it leaves a single target for dual-source
+    // alpha blending (ShaderPipelineCache.LeavesSingleDualSourceTarget).
     private static void DropUnwrittenColorTargets(ContextRegisters context, ref DrawState state, ShaderProgramInfo? pixelProgram)
     {
-        if (!state.Depth.HasTarget)
+        if (!state.Depth.HasTarget && !state.Programs.DropUnwrittenColorTargets)
         {
             return;
         }

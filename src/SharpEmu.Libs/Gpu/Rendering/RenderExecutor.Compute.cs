@@ -358,6 +358,7 @@ public sealed partial class RenderExecutor
         if (Diagnostics.DccWriterTrace.Enabled)
         {
             Diagnostics.DccWriterTrace.CurrentProgram = program.Hash;
+            Diagnostics.DccWriterTrace.CurrentKind = "compute";
         }
 
         if (Diagnostics.DbgSequence.Active) // TEMP
@@ -1357,7 +1358,10 @@ public sealed partial class RenderExecutor
         var hash = input.Stage.Program!.Hash;
         if (!_host.TryClearImageFromBuffer(address, clear.Size, clear.PackedClear))
         {
-            // A metadata fill may run before its target is bound; the store keeps it pending and the dispatch runs.
+            // A metadata fill may run before its target is bound; the store keeps it pending. The fill
+            // itself then runs on the host when the range is known DCC metadata: run as a dispatch it
+            // leaves the metadata GPU-written, and every later bind of the surface waits for the GPU to
+            // read it back (Astro Bot fills several surfaces this way each frame).
             var registered = _host.TryAbsorbDccFill(address, clear.Size, clear.PackedClear);
             // A DCC-code fill of metadata that is still pending its target is applied on the CPU: the
             // dispatch would leave the bytes GPU-dirty and the target's discovery would wait for them.
@@ -1367,14 +1371,15 @@ public sealed partial class RenderExecutor
                 return true;
             }
 
-            DbgClear(registered ? "absorbed" : "pending-run", hash, address, clear.Size, clear.PackedClear); // TEMP
+            var filledOnHost = !registered && _host.TryFillDccMetadata(address, clear.Size, clear.PackedClear);
+            DbgClear(registered ? "absorbed" : filledOnHost ? "host-fill" : "pending-run", hash, address, clear.Size, clear.PackedClear); // TEMP
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
             {
                 RenderTrace.Write(
-                    $"{(registered ? "Tracked" : "Deferred")} a metadata clear: shader=0x{hash:X16} address=0x{address:X16} size=0x{clear.Size:X16} value=0x{clear.PackedClear:X8}");
+                    $"{(registered ? "Tracked" : filledOnHost ? "Filled on the host" : "Deferred")} a metadata clear: shader=0x{hash:X16} address=0x{address:X16} size=0x{clear.Size:X16} value=0x{clear.PackedClear:X8}");
             }
 
-            return registered;
+            return registered || filledOnHost;
         }
 
         DbgClear("cleared", hash, address, clear.Size, clear.PackedClear); // TEMP

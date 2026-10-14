@@ -99,8 +99,8 @@ internal static partial class RegisterWriters
         {
             indirect[offset] = static (banks, register, value) =>
             {
-                banks.Context.ShaderInterface.PixelInterpolatorSettings[register - SpiPsInputCntl0] = value;
-                banks.Context.ShaderInterface.PixelInterpolatorWritten |= 1u << (int)(register - SpiPsInputCntl0);
+                banks.ShaderInterfaceForWrite.PixelInterpolatorSettings[register - SpiPsInputCntl0] = value;
+                banks.ShaderInterfaceForWrite.PixelInterpolatorWritten |= 1u << (int)(register - SpiPsInputCntl0);
             };
         }
 
@@ -161,7 +161,7 @@ internal static partial class RegisterWriters
 
         for (var offset = PaScAaSampleLocations0; offset < PaScAaSampleLocations0 + SampleLocationRegisters.LocationCount; offset++)
         {
-            indirect[offset] = static (banks, register, value) => banks.Context.SampleLocations.Locations[register - PaScAaSampleLocations0] = value;
+            indirect[offset] = static (banks, register, value) => banks.SampleLocationsForWrite.Locations[register - PaScAaSampleLocations0] = value;
         }
 
         foreach (var offset in new[]
@@ -181,36 +181,36 @@ internal static partial class RegisterWriters
         indirect[PaScAaMaskX0Y0X1Y0] = static (banks, _, value) => banks.Context.SampleCoverageMaskX0Y0X1Y0 = value;
         indirect[PaScAaMaskX0Y1X1Y1] = static (banks, _, value) => banks.Context.SampleCoverageMaskX0Y1X1Y1 = value;
 
-        indirect[SpiVsOutConfig] = static (banks, _, value) => banks.Context.ShaderInterface.VertexOutputConfiguration = value;
+        indirect[SpiVsOutConfig] = static (banks, _, value) => banks.ShaderInterfaceForWrite.VertexOutputConfiguration = value;
         indirect[DbRenderOverride] = static (banks, _, value) => banks.Context.DepthRenderOverride = DepthRenderOverrideRegisters.Decode(value);
-        indirect[SpiShaderPosFormat] = static (banks, _, value) => banks.Context.ShaderInterface.PositionExportFormat = value;
-        indirect[SpiShaderIdxFormat] = static (banks, _, value) => banks.Context.ShaderInterface.IndexExportFormat = value;
-        indirect[PaClVsOutCntl] = static (banks, _, value) => banks.Context.ShaderInterface.VertexOutputControl = value;
-        indirect[GeNggSubgroupCntl] = static (banks, _, value) => banks.Context.ShaderInterface.PrimitiveShaderSubgroupControl = value;
-        indirect[VgtGsInstanceCnt] = static (banks, _, value) => banks.Context.ShaderInterface.GeometryInstanceCount = value;
-        indirect[VgtGsOnchipCntl] = static (banks, _, value) => banks.Context.ShaderInterface.GeometryOnChipControl = value;
-        indirect[VgtHosMaxTessLevel] = static (banks, _, value) => banks.Context.ShaderInterface.MaxTessellationLevel = value;
-        indirect[VgtHosMinTessLevel] = static (banks, _, value) => banks.Context.ShaderInterface.MinTessellationLevel = value;
-        indirect[GeMaxOutputPerSubgroup] = static (banks, _, value) => banks.Context.ShaderInterface.MaxOutputPerSubgroup = value;
-        indirect[VgtEsgsRingItemSize] = static (banks, _, value) => banks.Context.ShaderInterface.ExportRingItemSize = value;
-        indirect[VgtGsMaxVertOut] = static (banks, _, value) => banks.Context.ShaderInterface.GeometryMaxVerticesOut = value;
-        indirect[VgtPrimitiveIdEn] = static (banks, _, value) => banks.Context.ShaderInterface.PrimitiveIdEnable = value;
-        indirect[VgtReuseOff] = static (banks, _, value) => banks.Context.ShaderInterface.VertexReuseOff = value;
+        indirect[SpiShaderPosFormat] = static (banks, _, value) => banks.ShaderInterfaceForWrite.PositionExportFormat = value;
+        indirect[SpiShaderIdxFormat] = static (banks, _, value) => banks.ShaderInterfaceForWrite.IndexExportFormat = value;
+        indirect[PaClVsOutCntl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.VertexOutputControl = value;
+        indirect[GeNggSubgroupCntl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.PrimitiveShaderSubgroupControl = value;
+        indirect[VgtGsInstanceCnt] = static (banks, _, value) => banks.ShaderInterfaceForWrite.GeometryInstanceCount = value;
+        indirect[VgtGsOnchipCntl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.GeometryOnChipControl = value;
+        indirect[VgtHosMaxTessLevel] = static (banks, _, value) => banks.ShaderInterfaceForWrite.MaxTessellationLevel = value;
+        indirect[VgtHosMinTessLevel] = static (banks, _, value) => banks.ShaderInterfaceForWrite.MinTessellationLevel = value;
+        indirect[GeMaxOutputPerSubgroup] = static (banks, _, value) => banks.ShaderInterfaceForWrite.MaxOutputPerSubgroup = value;
+        indirect[VgtEsgsRingItemSize] = static (banks, _, value) => banks.ShaderInterfaceForWrite.ExportRingItemSize = value;
+        indirect[VgtGsMaxVertOut] = static (banks, _, value) => banks.ShaderInterfaceForWrite.GeometryMaxVerticesOut = value;
+        indirect[VgtPrimitiveIdEn] = static (banks, _, value) => banks.ShaderInterfaceForWrite.PrimitiveIdEnable = value;
+        indirect[VgtReuseOff] = static (banks, _, value) => banks.ShaderInterfaceForWrite.VertexReuseOff = value;
         indirect[VgtMultiPrimIbResetIndex] = static (banks, _, value) => banks.Context.PrimitiveResetIndex = value;
-        indirect[VgtTessDistribution] = static (banks, _, value) => banks.Context.ShaderInterface.TessellationDistribution = value;
+        indirect[VgtTessDistribution] = static (banks, _, value) => banks.ShaderInterfaceForWrite.TessellationDistribution = value;
         indirect[VgtShaderStagesEn] = static (banks, _, value) => banks.Context.ShaderStages = value;
-        indirect[VgtLsHsConfig] = static (banks, _, value) => banks.Context.ShaderInterface.LocalHullConfiguration = value;
-        indirect[VgtGsOutPrimType] = static (banks, _, value) => banks.Context.ShaderInterface.GeometryOutputPrimitiveType = value;
-        indirect[VgtTfParam] = static (banks, _, value) => banks.Context.ShaderInterface.TessellationFactorParameter = value;
-        indirect[SpiShaderZFormat] = static (banks, _, value) => banks.Context.ShaderInterface.DepthExportFormat = value;
+        indirect[VgtLsHsConfig] = static (banks, _, value) => banks.ShaderInterfaceForWrite.LocalHullConfiguration = value;
+        indirect[VgtGsOutPrimType] = static (banks, _, value) => banks.ShaderInterfaceForWrite.GeometryOutputPrimitiveType = value;
+        indirect[VgtTfParam] = static (banks, _, value) => banks.ShaderInterfaceForWrite.TessellationFactorParameter = value;
+        indirect[SpiShaderZFormat] = static (banks, _, value) => banks.ShaderInterfaceForWrite.DepthExportFormat = value;
         indirect[SpiShaderColFormat] = ShaderColorFormatEntry;
-        indirect[SpiPsInputEna] = static (banks, _, value) => banks.Context.ShaderInterface.PixelInputEnable = value;
-        indirect[SpiPsInputAddr] = static (banks, _, value) => banks.Context.ShaderInterface.PixelInputAddress = value;
-        indirect[SpiPsInControl] = static (banks, _, value) => banks.Context.ShaderInterface.PixelInputControl = value;
-        indirect[SpiBarycCntl] = static (banks, _, value) => banks.Context.ShaderInterface.BarycentricControl = value;
-        indirect[DbShaderControl] = static (banks, _, value) => banks.Context.ShaderInterface.DepthShaderControl = DepthShaderControlRegisters.Decode(value);
-        indirect[CbShaderMask] = static (banks, _, value) => banks.Context.ShaderInterface.ColorShaderMask = value;
-        indirect[PaScShaderControl] = static (banks, _, value) => banks.Context.ShaderInterface.ScanShaderControl = value;
+        indirect[SpiPsInputEna] = static (banks, _, value) => banks.ShaderInterfaceForWrite.PixelInputEnable = value;
+        indirect[SpiPsInputAddr] = static (banks, _, value) => banks.ShaderInterfaceForWrite.PixelInputAddress = value;
+        indirect[SpiPsInControl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.PixelInputControl = value;
+        indirect[SpiBarycCntl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.BarycentricControl = value;
+        indirect[DbShaderControl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.DepthShaderControl = DepthShaderControlRegisters.Decode(value);
+        indirect[CbShaderMask] = static (banks, _, value) => banks.ShaderInterfaceForWrite.ColorShaderMask = value;
+        indirect[PaScShaderControl] = static (banks, _, value) => banks.ShaderInterfaceForWrite.ScanShaderControl = value;
         indirect[CbTargetMask] = static (banks, _, value) => banks.Context.RenderTargetMask = value;
         indirect[PaScScreenScissorTl] = ScreenScissorTopLeftEntry;
         indirect[PaScScreenScissorBr] = ScreenScissorBottomRightEntry;
@@ -254,7 +254,7 @@ internal static partial class RegisterWriters
         indirect[DbStencilRefMaskBack] = StencilMaskBackEntry;
         indirect[PaClClipCntl] = static (banks, _, value) => banks.Context.Clip = ClipControlRegisters.Decode(value);
         indirect[PaSuLineCntl] = LineControlEntry;
-        indirect[PaClVteCntl] = static (banks, _, value) => banks.Context.ScreenViewport.TransformControl = value;
+        indirect[PaClVteCntl] = static (banks, _, value) => banks.ScreenViewportForWrite.TransformControl = value;
         indirect[PaScModeCntl0] = static (banks, _, value) => banks.Context.ScanMode = ScanModeRegisters.Decode(value);
         indirect[PaScModeCntl1] = static (banks, _, value) => banks.Context.ScanModeControl1 = value;
         indirect[PaScAaConfig] = static (banks, _, value) => banks.Context.AntialiasingConfig = AntialiasingConfigRegisters.Decode(value);
@@ -376,8 +376,8 @@ internal static partial class RegisterWriters
             throw PacketError(banks, "The pixel interpolator packet has an invalid count", in packet, offset, values.Length);
         }
 
-        values.CopyTo(banks.Context.ShaderInterface.PixelInterpolatorSettings);
-        banks.Context.ShaderInterface.PixelInterpolatorWritten |= (uint)((1ul << values.Length) - 1);
+        values.CopyTo(banks.ShaderInterfaceForWrite.PixelInterpolatorSettings);
+        banks.ShaderInterfaceForWrite.PixelInterpolatorWritten |= (uint)((1ul << values.Length) - 1);
         return (uint)values.Length;
     }
 
@@ -420,7 +420,7 @@ internal static partial class RegisterWriters
     // One location at any slot, or all sixteen from the first slot.
     private static uint SampleLocationsPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
-        var locations = banks.Context.SampleLocations.Locations;
+        var locations = banks.SampleLocationsForWrite.Locations;
         if (values.Length == 1)
         {
             locations[offset - PaScAaSampleLocations0] = values[0];
@@ -516,19 +516,19 @@ internal static partial class RegisterWriters
 
     private static void HardwareScreenOffsetEntry(RegisterBanks banks, uint offset, uint value)
     {
-        banks.Context.ScreenViewport.HardwareOffsetX = RegisterField.Get(value, 0, 0x1FF);
-        banks.Context.ScreenViewport.HardwareOffsetY = RegisterField.Get(value, 16, 0x1FF);
+        banks.ScreenViewportForWrite.HardwareOffsetX = RegisterField.Get(value, 0, 0x1FF);
+        banks.ScreenViewportForWrite.HardwareOffsetY = RegisterField.Get(value, 16, 0x1FF);
     }
 
     private static void WindowOffsetEntry(RegisterBanks banks, uint offset, uint value)
     {
-        banks.Context.ScreenViewport.WindowOffsetX = RegisterField.Coordinate16(value);
-        banks.Context.ScreenViewport.WindowOffsetY = RegisterField.Coordinate16(value >> 16);
+        banks.ScreenViewportForWrite.WindowOffsetX = RegisterField.Coordinate16(value);
+        banks.ScreenViewportForWrite.WindowOffsetY = RegisterField.Coordinate16(value >> 16);
     }
 
     private static void ClipRectangleEntry(RegisterBanks banks, uint offset, uint value)
     {
-        var viewport = banks.Context.ScreenViewport;
+        var viewport = banks.ScreenViewportForWrite;
         if (offset == PaScClipRectRule)
         {
             viewport.ClipRectangleRule = (ushort)(value & 0xFFFFu);
@@ -608,7 +608,7 @@ internal static partial class RegisterWriters
 
     private static void CentroidPriorityEntry(RegisterBanks banks, uint offset, uint value)
     {
-        var locations = banks.Context.SampleLocations;
+        var locations = banks.SampleLocationsForWrite;
         switch (offset)
         {
             case PaScCentroidPriority0:
@@ -622,7 +622,7 @@ internal static partial class RegisterWriters
 
     private static void ShaderColorFormatEntry(RegisterBanks banks, uint offset, uint value)
     {
-        var modes = banks.Context.ShaderInterface.TargetOutputModes;
+        var modes = banks.ShaderInterfaceForWrite.TargetOutputModes;
         for (var index = 0; index < modes.Length; index++)
         {
             modes[index] = (byte)((value >> (index * 4)) & 0xFu);
@@ -631,19 +631,19 @@ internal static partial class RegisterWriters
 
     private static void ScreenScissorTopLeftEntry(RegisterBanks banks, uint offset, uint value)
     {
-        banks.Context.ScreenViewport.ScreenScissorLeft = RegisterField.Coordinate16(value);
-        banks.Context.ScreenViewport.ScreenScissorTop = RegisterField.Coordinate16(value >> 16);
+        banks.ScreenViewportForWrite.ScreenScissorLeft = RegisterField.Coordinate16(value);
+        banks.ScreenViewportForWrite.ScreenScissorTop = RegisterField.Coordinate16(value >> 16);
     }
 
     private static void ScreenScissorBottomRightEntry(RegisterBanks banks, uint offset, uint value)
     {
-        banks.Context.ScreenViewport.ScreenScissorRight = RegisterField.Coordinate16(value);
-        banks.Context.ScreenViewport.ScreenScissorBottom = RegisterField.Coordinate16(value >> 16);
+        banks.ScreenViewportForWrite.ScreenScissorRight = RegisterField.Coordinate16(value);
+        banks.ScreenViewportForWrite.ScreenScissorBottom = RegisterField.Coordinate16(value >> 16);
     }
 
     private static void GenericScissorTopLeftEntry(RegisterBanks banks, uint offset, uint value)
     {
-        var viewport = banks.Context.ScreenViewport;
+        var viewport = banks.ScreenViewportForWrite;
         viewport.GenericScissorLeft = RegisterField.Coordinate15(value);
         viewport.GenericScissorTop = RegisterField.Coordinate15(value >> 16);
         viewport.GenericScissorWindowOffsetEnable = !RegisterField.Bit(value, 31);
@@ -651,13 +651,13 @@ internal static partial class RegisterWriters
 
     private static void GenericScissorBottomRightEntry(RegisterBanks banks, uint offset, uint value)
     {
-        banks.Context.ScreenViewport.GenericScissorRight = RegisterField.Coordinate15(value);
-        banks.Context.ScreenViewport.GenericScissorBottom = RegisterField.Coordinate15(value >> 16);
+        banks.ScreenViewportForWrite.GenericScissorRight = RegisterField.Coordinate15(value);
+        banks.ScreenViewportForWrite.GenericScissorBottom = RegisterField.Coordinate15(value >> 16);
     }
 
     private static void WindowScissorTopLeftEntry(RegisterBanks banks, uint offset, uint value)
     {
-        var viewport = banks.Context.ScreenViewport;
+        var viewport = banks.ScreenViewportForWrite;
         viewport.WindowScissorLeft = RegisterField.Coordinate15(value);
         viewport.WindowScissorTop = RegisterField.Coordinate15(value >> 16);
         viewport.WindowScissorWindowOffsetEnable = !RegisterField.Bit(value, 31);
@@ -665,13 +665,13 @@ internal static partial class RegisterWriters
 
     private static void WindowScissorBottomRightEntry(RegisterBanks banks, uint offset, uint value)
     {
-        banks.Context.ScreenViewport.WindowScissorRight = RegisterField.Coordinate15(value);
-        banks.Context.ScreenViewport.WindowScissorBottom = RegisterField.Coordinate15(value >> 16);
+        banks.ScreenViewportForWrite.WindowScissorRight = RegisterField.Coordinate15(value);
+        banks.ScreenViewportForWrite.WindowScissorBottom = RegisterField.Coordinate15(value >> 16);
     }
 
     private static void ViewportScissorTopLeftEntry(RegisterBanks banks, uint offset, uint value)
     {
-        ref var viewport = ref banks.Context.ScreenViewport.Viewports[(offset - PaScViewportScissor0Tl) / 2];
+        ref var viewport = ref banks.ViewportsForWrite[(offset - PaScViewportScissor0Tl) / 2];
         viewport.ScissorLeft = RegisterField.Coordinate15(value);
         viewport.ScissorTop = RegisterField.Coordinate15(value >> 16);
         viewport.ScissorWindowOffsetEnable = !RegisterField.Bit(value, 31);
@@ -679,21 +679,21 @@ internal static partial class RegisterWriters
 
     private static void ViewportScissorBottomRightEntry(RegisterBanks banks, uint offset, uint value)
     {
-        ref var viewport = ref banks.Context.ScreenViewport.Viewports[(offset - PaScViewportScissor0Br) / 2];
+        ref var viewport = ref banks.ViewportsForWrite[(offset - PaScViewportScissor0Br) / 2];
         viewport.ScissorRight = RegisterField.Coordinate15(value);
         viewport.ScissorBottom = RegisterField.Coordinate15(value >> 16);
     }
 
     private static void ViewportZMinEntry(RegisterBanks banks, uint offset, uint value) =>
-        banks.Context.ScreenViewport.Viewports[(offset - PaScViewportZMin0) / 2].MinDepth = RegisterField.AsFloat(value);
+        banks.ViewportsForWrite[(offset - PaScViewportZMin0) / 2].MinDepth = RegisterField.AsFloat(value);
 
     private static void ViewportZMaxEntry(RegisterBanks banks, uint offset, uint value) =>
-        banks.Context.ScreenViewport.Viewports[(offset - PaScViewportZMax0) / 2].MaxDepth = RegisterField.AsFloat(value);
+        banks.ViewportsForWrite[(offset - PaScViewportZMax0) / 2].MaxDepth = RegisterField.AsFloat(value);
 
     private static void ViewportScaleOffsetEntry(RegisterBanks banks, uint offset, uint value)
     {
         var relative = offset - PaClViewportXScale;
-        ref var viewport = ref banks.Context.ScreenViewport.Viewports[relative / ViewportFieldCount];
+        ref var viewport = ref banks.ViewportsForWrite[relative / ViewportFieldCount];
         var number = RegisterField.AsFloat(value);
         switch (relative % ViewportFieldCount)
         {
@@ -728,7 +728,7 @@ internal static partial class RegisterWriters
 
     private static void GuardBandEntry(RegisterBanks banks, uint offset, uint value)
     {
-        var viewport = banks.Context.ScreenViewport;
+        var viewport = banks.ScreenViewportForWrite;
         var number = RegisterField.AsFloat(value);
         switch (offset)
         {
@@ -773,7 +773,7 @@ internal static partial class RegisterWriters
     {
         if (SharpEmu.Libs.Diagnostics.DbgSequence.Active) // TEMP
             SharpEmu.Libs.Diagnostics.DbgSequence.Note($"blend{offset - CbBlend0Control}=0x{value:X8}");
-        banks.Context.BlendControls[offset - CbBlend0Control] = BlendRegisters.Decode(value);
+        banks.BlendControlsForWrite[offset - CbBlend0Control] = BlendRegisters.Decode(value);
     }
 
     private static void DepthZInfoEntry(RegisterBanks banks, uint offset, uint value)
@@ -818,7 +818,7 @@ internal static partial class RegisterWriters
     }
 
     private static ref ColorTargetWords ColorTarget(RegisterBanks banks, uint offset, uint first, uint stride) =>
-        ref banks.Context.ColorTargets[(offset - first) / stride];
+        ref banks.ColorTargetsForWrite[(offset - first) / stride];
 
     private static void ColorBaseLowEntry(RegisterBanks banks, uint offset, uint value)
     {
@@ -905,7 +905,7 @@ internal static partial class RegisterWriters
     }
 
     private static void ColorClearWord1Entry(RegisterBanks banks, uint offset, uint value) =>
-        banks.Context.ColorClearWord1[(offset - CbColor0ClearWord1) / ColorSlotStride] = value;
+        banks.ColorClearWord1ForWrite[(offset - CbColor0ClearWord1) / ColorSlotStride] = value;
 
     private static void ColorDccBaseLowEntry(RegisterBanks banks, uint offset, uint value)
     {

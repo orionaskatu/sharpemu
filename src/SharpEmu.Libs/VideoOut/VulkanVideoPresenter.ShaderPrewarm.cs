@@ -180,8 +180,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 setLayout = CreateDescriptorSetLayout(bindings, out _, out _);
                 pipelineLayout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit, layout!.UsesBindlessImages);
                 module = CreateShaderModule(payload);
-                var pipeline = CompileComputePipeline(_vk, _device, _pipelineCache, module, pipelineLayout,
-                    RequiredComputeSubgroupSize(record.Info));
+                var pipeline = CompileComputePipeline(_vk, _device, _pipelineCache, module, pipelineLayout, ComputeRequiredSubgroupSize(record.Info));
                 _vk.DestroyPipeline(_device, pipeline, null);
                 Interlocked.Increment(ref _shaderPrewarmCompiled);
             }

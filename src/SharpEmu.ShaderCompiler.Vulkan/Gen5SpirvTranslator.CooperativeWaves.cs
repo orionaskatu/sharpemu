@@ -23,7 +23,7 @@ public static partial class Gen5SpirvTranslator
         }
 
         private uint CooperativeCounterPointer(uint index) => _module.AddInstruction(
-            SpirvOp.AccessChain, _wave64ExchangeElementPointer, _cooperativeProgramCounters, index);
+            SpirvOp.AccessChain, _module.TypePointer(SpirvStorageClass.Workgroup, _uintType), _cooperativeProgramCounters, index);
 
         private uint SelectCooperativeBlock(IReadOnlyList<ShaderBlock> blocks)
         {

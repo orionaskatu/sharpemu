@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -175,6 +176,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	[ThreadStatic]
 	private static List<(IVirtualMemory Memory, ulong Base)>? _nestedGuestCallbackStacks;
 
+	// Nested-callback stacks are cached per host thread;
+	// when an executor thread ends they return here instead of pinning a stack slot forever.
+	private static readonly ConcurrentQueue<(IVirtualMemory Memory, ulong Base)> _reusableNestedCallbackStacks = new();
+
+	private static void ReleaseNestedGuestCallbackStacks()
+	{
+		if (_nestedGuestCallbackStacks is not { } stacks)
+			return;
+
+		foreach (var stack in stacks)
+			_reusableNestedCallbackStacks.Enqueue(stack);
+
+		stacks.Clear();
+	}
+
+	private static bool TryTakeReusableNestedCallbackStack(IVirtualMemory memory, out ulong stackBase)
+	{
+		var count = _reusableNestedCallbackStacks.Count;
+		for (var i = 0; i < count && _reusableNestedCallbackStacks.TryDequeue(out var stack); i++)
+		{
+			if (ReferenceEquals(stack.Memory, memory))
+			{
+				stackBase = stack.Base;
+				return true;
+			}
+
+			_reusableNestedCallbackStacks.Enqueue(stack);
+		}
+
+		stackBase = 0;
+		return false;
+	}
+
 	[ThreadStatic]
 	private static int _nestedGuestCallbackDepth;
 
@@ -208,10 +242,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private nint _tlsGetValueAddress;
 
 	private nint _queryPerformanceCounterAddress;
-
-	private nint _switchToThreadAddress;
-
-	private nint _sleepAddress;
 
 	private int _tlsPatchStubOffset;
 
@@ -414,6 +444,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Blocked,
 		Exited,
 		Faulted,
+		Parked,
 	}
 
 	private enum GuestNativeCallExitReason
@@ -428,9 +459,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		public ulong ThreadHandle { get; init; }
 
-		public ulong EntryPoint { get; init; }
+		public ulong EntryPoint { get; set; }
 
-		public ulong Argument { get; init; }
+		public ulong Argument { get; set; }
+
+		public IGuestThreadRecycler? Recycler { get; init; }
 
 		public string Name { get; init; } = string.Empty;
 
@@ -673,6 +706,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			finally
 			{
+				ReleaseNestedGuestCallbackStacks();
 				GuestThreadExecution.RestoreGuestThread(previousGuestThreadHandle);
 				_workAvailable.Dispose();
 			}
@@ -1114,12 +1148,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			{
 				throw new InvalidOperationException("Failed to resolve kernel32!QueryPerformanceCounter");
 			}
-			_switchToThreadAddress = kernel32 != 0 ? GetProcAddress(kernel32, "SwitchToThread") : 0;
-			_sleepAddress = kernel32 != 0 ? GetProcAddress(kernel32, "Sleep") : 0;
-			if (_switchToThreadAddress == 0 || _sleepAddress == 0)
-			{
-				throw new InvalidOperationException("Failed to resolve kernel32 thread timing functions");
-			}
 			_setEventAddress = kernel32 != 0 ? GetProcAddress(kernel32, "SetEvent") : 0;
 		}
 		else
@@ -1128,8 +1156,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			// not need to change per platform.
 			_tlsGetValueAddress = PosixHostStubs.TlsGetValueStubAddress;
 			_queryPerformanceCounterAddress = PosixHostStubs.QueryPerformanceCounterStubAddress;
-			_switchToThreadAddress = PosixHostStubs.SwitchToThreadStubAddress;
-			_sleepAddress = PosixHostStubs.SleepStubAddress;
 		}
 		_tlsBaseAddress = (nint)VirtualAlloc(null, 4096u, 12288u, 4u);
 		if (_tlsBaseAddress == 0)
@@ -1482,8 +1508,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return false;
 		}
 
-		if (nid == "1jfXLRVzisc" &&
-			string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal))
+		// sceKernelUsleep stays on the HLE export: a native stub can only round to Win32 Sleep milliseconds,
+		// which overshoots every wait by most of a scheduler tick and starves loops paced by usleep.
+		if (nid == "1jfXLRVzisc")
 		{
 			address = 0;
 			return false;
@@ -1506,31 +1533,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0xFF, 0xD0,
 				0x48, 0x8B, 0x44, 0x24, 0x20,
 				0x48, 0x83, 0xC4, 0x28,
-				0xC3,
-			],
-			"1jfXLRVzisc" =>
-			[
-				0x48, 0x85, 0xFF,
-				0x74, 0x1D,
-				0x48, 0x81, 0xFF, 0xE8, 0x03, 0x00, 0x00,
-				0x73, 0x17,
-				0x48, 0x83, 0xEC, 0x28,
-				0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0xFF, 0xD0,
-				0x48, 0x83, 0xC4, 0x28,
-				0x31, 0xC0,
-				0xC3,
-				0x48, 0x89, 0xF8,
-				0x48, 0x05, 0xE7, 0x03, 0x00, 0x00,
-				0x31, 0xD2,
-				0xB9, 0xE8, 0x03, 0x00, 0x00,
-				0x48, 0xF7, 0xF1,
-				0x89, 0xC1,
-				0x48, 0x83, 0xEC, 0x28,
-				0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0xFF, 0xD0,
-				0x48, 0x83, 0xC4, 0x28,
-				0x31, 0xC0,
 				0xC3,
 			],
 			"j4ViWNHEgww" =>
@@ -1755,11 +1757,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		if (nid == "fgxnMeTNUtY")
 		{
 			*(nint*)((byte*)memory + 11) = _queryPerformanceCounterAddress;
-		}
-		else if (nid == "1jfXLRVzisc")
-		{
-			*(nint*)((byte*)memory + 20) = _switchToThreadAddress;
-			*(nint*)((byte*)memory + 64) = _sleepAddress;
 		}
 		uint oldProtect = 0;
 		if (!VirtualProtect(memory, intrinsicAllocationSize, 32u, &oldProtect))
@@ -3980,6 +3977,55 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return true;
 	}
 
+	public bool TryRestartParkedThread(ulong threadHandle, ulong entryPoint, ulong argument, out string? error)
+	{
+		if (entryPoint < 65536)
+		{
+			error = $"invalid restart entry=0x{entryPoint:X16}";
+			return false;
+		}
+
+		using (LockGate("TryRestartParkedThread"))
+		{
+			if (!_guestThreads.TryGetValue(threadHandle, out var thread) ||
+				thread.State != GuestThreadRunState.Parked ||
+				thread.ExecutorActive)
+			{
+				error = $"guest thread 0x{threadHandle:X16} is not parked";
+				return false;
+			}
+
+			// The previous entry's frames are dead:
+			// start over at the stack top and keep the thread's TLS, like a fresh entry on the same thread.
+			var previous = thread.Context;
+			var context = new CpuContext(previous.Memory, previous.TargetGeneration)
+			{
+				Rip = entryPoint,
+				Rflags = 0x202,
+				FsBase = previous.FsBase,
+				GsBase = previous.GsBase,
+			};
+			context[CpuRegister.Rsp] = thread.StackBase + thread.StackSize - sizeof(ulong);
+			context[CpuRegister.Rdi] = argument;
+			if (!InitializeGuestThreadFrame(context))
+			{
+				error = "failed to reinitialize guest thread stack";
+				return false;
+			}
+
+			thread.Context = context;
+			thread.EntryPoint = entryPoint;
+			thread.Argument = argument;
+			thread.ExitValue = 0;
+			thread.State = GuestThreadRunState.Ready;
+			EnqueueReadyGuestThreadLocked(thread);
+		}
+
+		DispatchReadyGuestThreads();
+		error = null;
+		return true;
+	}
+
 	public bool SupportsGuestContextTransfer => true;
 
 	// The handle and context this host thread registered last; a repeat registration (every
@@ -4514,7 +4560,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			else
 			{
-				if (!TryMapGuestThreadRegion(
+				if (!TryTakeReusableNestedCallbackStack(virtualMemory, out callbackStackBase) &&
+					!TryMapGuestThreadRegion(
 						virtualMemory,
 						GuestThreadStackBaseAddress,
 						GuestThreadStackSize,
@@ -4979,7 +5026,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return true;
 			}
 
-			if (target.State is GuestThreadRunState.Exited or GuestThreadRunState.Faulted)
+			if (target.State is GuestThreadRunState.Exited or GuestThreadRunState.Faulted or GuestThreadRunState.Parked)
 			{
 				error = $"guest exception target 0x{threadHandle:X16} is no longer running";
 				return false;
@@ -5597,6 +5644,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			StackBase = stackBase,
 			StackSize = stackSize,
 			State = GuestThreadRunState.Ready,
+			Recycler = request.Recycler,
 		};
 		error = null;
 		return true;
@@ -5619,8 +5667,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return false;
 	}
 
-	// Finding a free slot and mapping it must be one step: Map reuses a region that
-	// already exists, so two threads claiming at once would both get the same stack.
+	// Map does not reject a range that is already mapped: it reuses and zero-fills it. Two threads
+	// creating guest threads at once could both find the same slot free and share one stack, so
+	// choosing and mapping a slot happen under one lock.
 	private static readonly object GuestThreadRegionGate = new();
 
 	internal static bool TryMapGuestThreadRegion(
@@ -5633,11 +5682,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		lock (GuestThreadRegionGate)
 		{
-			return TryMapFreeGuestThreadRegion(virtualMemory, baseAddress, size, protection, out mappedBase, out error);
+			return TryMapGuestThreadRegionLocked(virtualMemory, baseAddress, size, protection, out mappedBase, out error);
 		}
 	}
 
-	private static bool TryMapFreeGuestThreadRegion(
+	private static bool TryMapGuestThreadRegionLocked(
 		IVirtualMemory virtualMemory,
 		ulong baseAddress,
 		ulong size,
@@ -5681,11 +5730,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		lock (GuestThreadRegionGate)
 		{
-			return TryMapFreeGuestThreadTlsRegion(virtualMemory, out tlsBase, out error);
+			return TryMapGuestThreadTlsRegionLocked(virtualMemory, out tlsBase, out error);
 		}
 	}
 
-	private static bool TryMapFreeGuestThreadTlsRegion(
+	private static bool TryMapGuestThreadTlsRegionLocked(
 		IVirtualMemory virtualMemory,
 		out ulong tlsBase,
 		out string? error)
@@ -5771,18 +5820,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return true;
 	}
 
+	private static readonly bool LegacyGuestPriorities =
+		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_PRIORITY"), "legacy", StringComparison.OrdinalIgnoreCase);
+
 	private static ThreadPriority MapGuestThreadPriority(int priority)
 	{
 		if (priority <= 478)
 		{
-			return ThreadPriority.Highest;
+			return LegacyGuestPriorities ? ThreadPriority.Highest : ThreadPriority.Normal;
 		}
 		if (priority >= 733)
 		{
 			return ThreadPriority.Lowest;
 		}
 
-		return ThreadPriority.Normal;
+		return LegacyGuestPriorities ? ThreadPriority.Normal : ThreadPriority.BelowNormal;
 	}
 
 	private void ApplyGuestThreadAffinity(ulong guestAffinityMask)
@@ -5962,6 +6014,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 			thread.HostThread = Thread.CurrentThread;
 		}
+		IGuestThreadRecycler? parkedRecycler = null;
 		var previousLastError = LastError;
 		var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(thread.ThreadHandle);
 		var previousGuestThreadState = _activeGuestThreadState;
@@ -6011,6 +6064,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					case GuestNativeCallExitReason.Returned:
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
+						if (thread.Recycler is not null)
+						{
+							thread.State = GuestThreadRunState.Parked;
+							parkedRecycler = thread.Recycler;
+							break;
+						}
 						thread.State = GuestThreadRunState.Exited;
 						if (_logGuestThreads)
 						Console.Error.WriteLine(
@@ -6088,6 +6147,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"error={pendingError ?? "unknown"}");
 			}
 		}
+
+		// Reported once the executor is released, so the owner can restart the parked thread straight from this callback.
+		parkedRecycler?.OnEntryReturned(thread.ThreadHandle, thread.ExitValue);
 	}
 
 	private bool TryReleaseGuestThreadExecutorLocked(
@@ -7190,7 +7252,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			var sawBlockedThread = false;
 			foreach (var thread in _guestThreads.Values)
 			{
-				if (thread.State is GuestThreadRunState.Exited or GuestThreadRunState.Faulted)
+				if (thread.State is GuestThreadRunState.Exited or GuestThreadRunState.Faulted or GuestThreadRunState.Parked)
 				{
 					continue;
 				}

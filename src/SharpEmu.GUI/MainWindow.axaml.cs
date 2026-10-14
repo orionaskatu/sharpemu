@@ -18,6 +18,7 @@ using Avalonia.Threading;
 using Avalonia.VisualTree;
 using SharpEmu.Core.Cpu;
 using SharpEmu.Core.Runtime;
+using SharpEmu.HLE.FileSystem;
 using SharpEmu.HLE.Host;
 using SharpEmu.Libs.Pad;
 using SharpEmu.Libs.VideoOut;
@@ -142,6 +143,7 @@ public partial class MainWindow : Window
     private readonly ConcurrentQueue<(string Line, bool IsError)> _pendingLines = new();
     private readonly DispatcherTimer _consoleFlushTimer;
     private readonly DispatcherTimer _libraryLayoutTimer;
+    private readonly DispatcherTimer _titleMusicVolumeTimer;
 
     private GuiSettings _settings = new();
     private IReadOnlyList<HostDisplayOption> _hostDisplays = [];
@@ -153,6 +155,7 @@ public partial class MainWindow : Window
     private readonly SndPreviewPlayer _sndPreview = new();
     private string? _emulatorExePath;
     private PendingLaunch? _pendingLaunch;
+    private string? _runningEbootPath;
     private bool _isRunning;
     private bool _isStopping;
     private int _autoScrollTicks;
@@ -259,6 +262,15 @@ public partial class MainWindow : Window
             _libraryLayoutTimer.Stop();
             UpdateLibraryLayoutMetrics();
         };
+        _titleMusicVolumeTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(180),
+        };
+        _titleMusicVolumeTimer.Tick += (_, _) =>
+        {
+            _titleMusicVolumeTimer.Stop();
+            _settings.Save();
+        };
         CarouselAddFolderButton.Click += (_, _) => StartAddFolderFromTile();
         GameList.AddHandler(PointerPressedEvent, OnCarouselPointerPressed, RoutingStrategies.Tunnel, handledEventsToo: true);
         GameList.AddHandler(PointerMovedEvent, OnCarouselPointerMoved, RoutingStrategies.Tunnel, handledEventsToo: true);
@@ -321,7 +333,17 @@ public partial class MainWindow : Window
         CloseConsoleButton.Click += (_, _) => ConsoleToggle.IsChecked = false;
         LibraryTabButton.Click += (_, _) => SetActivePage(0);
         OptionsTabButton.Click += (_, _) => SetActivePage(1);
+        TrophiesTabButton.Click += (_, _) => OpenTrophyHub();
         LibraryLayoutButton.Click += (_, _) => ToggleLibraryLayout();
+        TitleMusicMuteButton.Click += (_, _) => TitleMusicToggle.IsChecked = !_settings.PlayTitleMusic;
+        TitleMusicVolumeSlider.ValueChanged += (_, _) =>
+        {
+            _settings.TitleMusicVolume = TitleMusicVolumeSlider.Value / 100.0;
+            _sndPreview.Volume = _settings.TitleMusicVolume;
+            UpdateTitleMusicMuteButton();
+            _titleMusicVolumeTimer.Stop();
+            _titleMusicVolumeTimer.Start();
+        };
         LibraryPage.SizeChanged += (_, _) => ScheduleLibraryLayoutMetricsUpdate();
         LibrarySelectedDetails.SizeChanged += (_, _) => UpdateLibraryMinimumHeight();
         MainContent.SizeChanged += (_, _) => ClampEmbeddedConsoleHeight();
@@ -341,6 +363,7 @@ public partial class MainWindow : Window
         {
             _settings.PlayTitleMusic = TitleMusicToggle.IsChecked == true;
             OnTitleMusicSettingChanged();
+            _settings.Save();
         };
         DiscordToggle.IsCheckedChanged += (_, _) =>
         {
@@ -407,7 +430,10 @@ public partial class MainWindow : Window
         CtxCopyTitleId.Click += async (_, _) =>
             await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.TitleId);
         CtxGameSettings.Click += (_, _) => OpenSelectedGameSettings();
+        CtxTrophies.Click += (_, _) => OpenSelectedGameTrophies();
+        InitializeTrophies();
         CtxRemove.Click += (_, _) => RemoveSelectedFromLibrary();
+        CtxPackZar.Click += async (_, _) => await PackSelectedAsZarAsync();
 
         Opened += async (_, _) => await OnOpenedAsync();
         Closing += (_, _) => BeginWindowClosing();
@@ -493,6 +519,8 @@ public partial class MainWindow : Window
         _activePageIndex = index;
         SetActiveClass(LibraryTabButton, index == 0);
         SetActiveClass(OptionsTabButton, index == 1);
+        SetActiveClass(TrophiesTabButton, index == 2);
+        TrophyPageHost.IsVisible = index == 2;
         LibraryPage.IsVisible = index == 0;
         LibraryToolbar.IsVisible = index == 0;
         OptionsPageSurface.IsVisible = index == 1;
@@ -866,14 +894,16 @@ public partial class MainWindow : Window
         }
 
         var shoulderPressed = pad.Buttons & ~_previousPadButtons;
+        var shownOrder = new[] { 0, 2, 1 };
+        var shown = Array.IndexOf(shownOrder, _activePageIndex);
         if ((shoulderPressed & HostGamepadButtons.L1) != 0)
         {
-            SetActivePage(0);
+            SetActivePage(shownOrder[Math.Max(0, shown - 1)]);
         }
 
         if ((shoulderPressed & HostGamepadButtons.R1) != 0)
         {
-            SetActivePage(1);
+            SetActivePage(shownOrder[Math.Min(shownOrder.Length - 1, shown + 1)]);
         }
 
         if (_activePageIndex != 0 || _isGameSettingsOpen)
@@ -1134,6 +1164,8 @@ public partial class MainWindow : Window
         RefreshUpdateText();
         UpdateEmptyStateTexts();
         UpdateLibraryLayoutButton();
+        UpdateTitleMusicMuteButton();
+        AutomationProperties.SetName(TitleMusicVolumeSlider, Localization.Instance.Get("Library.Music.Volume"));
         UpdateRunButtons();
     }
 
@@ -1260,6 +1292,7 @@ public partial class MainWindow : Window
         Interlocked.Increment(ref _detailLoadGeneration);
         _consoleFlushTimer.Stop();
         _libraryLayoutTimer.Stop();
+        _titleMusicVolumeTimer.Stop();
         _gamepadTimer.Stop();
     }
 
@@ -1429,6 +1462,12 @@ public partial class MainWindow : Window
         CrashDumpToggle.IsChecked = _settings.EnvironmentToggles.Contains("SHARPEMU_CRASH_CAPTURE");
         OverrideLogFileToggle.IsChecked = _settings.OverrideLogFile;
         TitleMusicToggle.IsChecked = _settings.PlayTitleMusic;
+        TitleMusicVolumeSlider.Value = _settings.TitleMusicVolume * 100.0;
+        _titleMusicVolumeTimer.Stop();
+        _sndPreview.Volume = _settings.TitleMusicVolume;
+        UpdateTitleMusicMuteButton();
+        TrophySoundToggle.IsChecked = _settings.TrophySound;
+        TrophySound.Enabled = _settings.TrophySound;
         SetLibraryLayout(string.Equals(_settings.LibraryLayout, "Grid", StringComparison.OrdinalIgnoreCase));
         DiscordToggle.IsChecked = _settings.DiscordRichPresence;
         AutoUpdateToggle.IsChecked = _settings.CheckForUpdatesOnStartup;
@@ -1959,6 +1998,19 @@ public partial class MainWindow : Window
     /// </summary>
     private static long ComputeInstallSize(string ebootPath)
     {
+        // An archive is the whole game; the folder it sits in may hold other games.
+        if (ZArchive.IsArchivePath(ebootPath))
+        {
+            try
+            {
+                return new FileInfo(ebootPath).Length;
+            }
+            catch (IOException)
+            {
+                return 0;
+            }
+        }
+
         var directory = Path.GetDirectoryName(ebootPath);
         if (directory is null)
         {
@@ -2007,7 +2059,9 @@ public partial class MainWindow : Window
 
             try
             {
-                foreach (var file in Directory.EnumerateFiles(folder, "eboot.bin", enumeration))
+                // A game is a folder with eboot.bin or a .zar archive of one.
+                foreach (var file in Directory.EnumerateFiles(folder, "eboot.bin", enumeration)
+                    .Concat(Directory.EnumerateFiles(folder, "*.zar", enumeration)))
                 {
                     var fullPath = Path.GetFullPath(file);
                     if (!seen.Add(fullPath) || excludedPaths.Contains(fullPath))
@@ -2055,10 +2109,28 @@ public partial class MainWindow : Window
                 $"[GUI][WARN] Could not inspect executable '{fullPath}': {exception.Message}");
         }
 
-        var (title, titleId, version) = TryReadParamJson(fullPath);
+        // An archive's metadata is read from its cache folder, which stands in for the game folder.
+        var metadataPath = fullPath;
+        if (ZArchive.IsArchivePath(fullPath))
+        {
+            try
+            {
+                if (ZArchiveCache.ExtractMetadata(fullPath) is { } cacheRoot)
+                {
+                    metadataPath = Path.Combine(cacheRoot, "eboot.bin");
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+            {
+                Console.Error.WriteLine(
+                    $"[GUI][WARN] Could not read archive '{fullPath}': {exception.Message}");
+            }
+        }
+
+        var (title, titleId, version) = TryReadParamJson(metadataPath);
         return new GameEntry(
-            title ?? GameNameFor(fullPath), titleId, version, fullPath, size,
-            FindCoverFor(fullPath), FindBackgroundFor(fullPath));
+            title ?? GameNameFor(metadataPath), titleId, version, fullPath, size,
+            FindCoverFor(metadataPath), FindBackgroundFor(metadataPath));
     }
 
     /// <summary>
@@ -2475,6 +2547,109 @@ public partial class MainWindow : Window
         CtxLaunch.IsEnabled = !_isRunning;
         CtxCopyTitleId.IsEnabled = game.TitleId is not null;
         CtxGameSettings.IsEnabled = !string.IsNullOrWhiteSpace(game.TitleId);
+        CtxPackZar.IsEnabled = !ZArchive.IsArchivePath(game.Path);
+        CtxTrophies.IsEnabled = !string.IsNullOrWhiteSpace(game.TitleId);
+    }
+
+    // Packs the selected game's folder into a .zar chosen by the user, beside the folder by default.
+    private async Task PackSelectedAsZarAsync()
+    {
+        if (GameList.SelectedItem is not GameEntry game || ZArchive.IsArchivePath(game.Path) ||
+            Path.GetDirectoryName(game.Path) is not { } gameFolder)
+        {
+            return;
+        }
+
+        var loc = Localization.Instance;
+        var options = new FilePickerSaveOptions
+        {
+            Title = loc.Get("Dialog.SaveZar"),
+            SuggestedFileName = SuggestedArchiveName(Path.GetFileName(gameFolder), game.TitleId, game.Version) + ".zar",
+            DefaultExtension = "zar",
+            FileTypeChoices = [new FilePickerFileType(loc.Get("Dialog.ZarFiles")) { Patterns = ["*.zar"] }],
+        };
+        if (Path.GetDirectoryName(gameFolder) is { } parent &&
+            await StorageProvider.TryGetFolderFromPathAsync(parent) is { } startFolder)
+        {
+            options.SuggestedStartLocation = startFolder;
+        }
+
+        var file = await StorageProvider.SaveFilePickerAsync(options);
+        var picked = file?.TryGetLocalPath();
+        if (string.IsNullOrEmpty(picked))
+        {
+            return;
+        }
+
+        var destination = ArchiveDestination(picked);
+
+        // A running game may hold files in the folder open, so it is never deleted then.
+        var dialog = new ZarPackDialog(game.Name, gameFolder, destination, canDeleteSource: !_isRunning);
+        dialog.MuteMusicChanged += SetTitleMusicMuted;
+        try
+        {
+            if (await dialog.ShowDialog<bool>(this))
+            {
+                AppendConsoleLine(loc.Format("Status.PackedZar", destination), SuccessLineBrush);
+            }
+        }
+        finally
+        {
+            SetTitleMusicMuted(false);
+        }
+    }
+
+    // A version-suffixed name such as PPSA01234-1.001 already ends in what the save dialog takes for
+    // an extension, so the dialog keeps it and does not add .zar; the archive then looks like a
+    // split-archive part. The extension is added here when it is missing.
+    internal static string ArchiveDestination(string path) =>
+        path.EndsWith(".zar", StringComparison.OrdinalIgnoreCase) ? path : path + ".zar";
+
+    // TITLEID-version (PPSA01234-1.004): the title id differs between regions of the same game and
+    // the version between updates, so each archive gets its own name and cache folder. Without a
+    // title id the game folder's name stands in.
+    internal static string SuggestedArchiveName(string folderName, string? titleId, string? version)
+    {
+        var name = string.IsNullOrWhiteSpace(titleId) ? folderName : titleId.Trim();
+        var shortVersion = ShortVersion(version);
+        if (shortVersion.Length > 0)
+        {
+            name = $"{name}-{shortVersion}";
+        }
+
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+        {
+            name = name.Replace(invalid, '_');
+        }
+
+        return name;
+    }
+
+    // "01.004.000" reads as "1.004": the leading zeros of the major number go, and the last part
+    // stays only when it is not zero. A version in another form is kept as it is.
+    private static string ShortVersion(string? version)
+    {
+        var text = version?.Trim() ?? string.Empty;
+        var parts = text.Split('.');
+        if (parts.Length < 2 || !parts.All(part => part.Length > 0 && part.All(char.IsAsciiDigit)))
+        {
+            return text;
+        }
+
+        var major = parts[0].TrimStart('0');
+        var shortened = $"{(major.Length == 0 ? "0" : major)}.{parts[1]}";
+        return parts.Length > 2 && parts[2].Any(digit => digit != '0')
+            ? $"{shortened}.{string.Join('.', parts[2..])}"
+            : shortened;
+    }
+
+    private void SetTitleMusicMuted(bool muted)
+    {
+        _sndPreview.Muted = muted;
+        if (!muted && WindowState != WindowState.Minimized)
+        {
+            _sndPreview.Resume();
+        }
     }
 
     private void OpenSelectedGameFolder()
@@ -2650,7 +2825,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        var directory = Path.GetDirectoryName(game.Path);
+        var directory = ZArchive.IsArchivePath(game.Path)
+            ? ZArchiveCache.GetCacheRoot(game.Path)
+            : Path.GetDirectoryName(game.Path);
         var sndPath = directory is null ? null : Path.Combine(directory, "sce_sys", "snd0.at9");
         if (sndPath is not null && File.Exists(sndPath))
         {
@@ -2664,6 +2841,7 @@ public partial class MainWindow : Window
 
     private void OnTitleMusicSettingChanged()
     {
+        UpdateTitleMusicMuteButton();
         if (!_settings.PlayTitleMusic)
         {
             _sndPreview.Stop();
@@ -2672,6 +2850,17 @@ public partial class MainWindow : Window
         {
             PlaySelectedGamePreview(game);
         }
+    }
+
+    private void UpdateTitleMusicMuteButton()
+    {
+        TitleMusicMuteGlyph.Text = !_settings.PlayTitleMusic || _settings.TitleMusicVolume == 0
+            ? "volume_off"
+            : _settings.TitleMusicVolume < 0.5 ? "volume_down" : "volume_up";
+        var label = Localization.Instance.Get(
+            _settings.PlayTitleMusic ? "Library.Music.Mute" : "Library.Music.Unmute");
+        ToolTip.SetTip(TitleMusicMuteButton, label);
+        AutomationProperties.SetName(TitleMusicMuteButton, label);
     }
 
     /// <summary>Pauses the preview music while the window is minimized.</summary>
@@ -2758,7 +2947,7 @@ public partial class MainWindow : Window
             FileTypeFilter = new[]
             {
                 new FilePickerFileType(Localization.Instance.Get("Dialog.PsExecutables"))
-                    { Patterns = new[] { "eboot.bin", "*.bin", "*.self", "*.elf" } },
+                    { Patterns = new[] { "eboot.bin", "*.bin", "*.self", "*.elf", "*.zar" } },
                 FilePickerFileTypes.All,
             },
         });
@@ -3076,6 +3265,7 @@ public partial class MainWindow : Window
             var arguments = BuildEmulatorArguments(launch);
             _emulator = process;
             _pendingLaunch = null;
+            _runningEbootPath = launch.EbootPath;
             process.Start(
                 _emulatorExePath,
                 arguments,
@@ -3134,6 +3324,11 @@ public partial class MainWindow : Window
     private void OnEmulatorOutput(string line, bool isError)
     {
         _pendingLines.Enqueue((line, isError));
+        if (SharpEmu.Libs.Np.TrophyCatalog.TryParseUnlockLine(line, out var notice))
+        {
+            var ebootPath = _runningEbootPath;
+            Dispatcher.UIThread.Post(() => ShowTrophyToast(notice, ebootPath));
+        }
     }
 
     private void OpenFileLog(string? titleId)
