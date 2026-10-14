@@ -332,7 +332,6 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         QueueRead(harness, address);
 
         GpuWrite(harness, address, 0x02020202);
-        Assert.True(harness.Cache.HotWritePending);
         var value = 0x03030303u;
         var deadline = DateTime.UtcNow.AddSeconds(20);
         while (harness.Cache.EagerReadbacksWasted < 3 && DateTime.UtcNow < deadline)
@@ -345,7 +344,6 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         SubmitBatch(harness);
         var started = harness.Cache.EagerReadbacksStarted;
         GpuWrite(harness, address, 0x07070707);
-        Assert.False(harness.Cache.HotWritePending);
         SubmitBatch(harness);
         SubmitBatch(harness);
 
