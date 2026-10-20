@@ -190,6 +190,7 @@ public enum SpirvOp : ushort
 public enum SpirvCapability : uint
 {
     Shader = 1,
+    Tessellation = 3,
     ShaderLayer = 69,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
@@ -227,8 +228,17 @@ public enum SpirvCapability : uint
     SampledImageArrayNonUniformIndexing = 5307,
     StorageImageArrayNonUniformIndexing = 5309,
     PhysicalStorageBufferAddresses = 5347,
-    SignedZeroInfNanPreserve = 4466,
     MeshShadingExt = 5283,
+}
+
+[Flags]
+public enum SpirvFunctionControl : uint
+{
+    None = 0,
+    Inline = 0x1,
+    DontInline = 0x2,
+    Pure = 0x4,
+    Const = 0x8,
 }
 
 public enum SpirvStorageClass : uint
@@ -275,7 +285,7 @@ public enum SpirvExecutionMode : uint
     LocalSize = 17,
     DenormPreserve = 4459,
     SignedZeroInfNanPreserve = 4461,
-    OutputVertices = 26,
+    RoundingModeRTE = 4462,
     OutputPrimitivesExt = 5270,
     OutputTrianglesExt = 5298,
 }

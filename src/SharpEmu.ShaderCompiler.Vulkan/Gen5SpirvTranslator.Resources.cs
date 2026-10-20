@@ -138,6 +138,7 @@ public static partial class Gen5SpirvTranslator
         private uint _samplerPointer;
         private uint _storageUlongPointer;
         private uint _physicalUintPointer;
+        private uint _deviceEntryScratch;
         private uint _deviceWordScratch;
         private uint _deviceBufferWordScratch;
 
@@ -379,7 +380,6 @@ public static partial class Gen5SpirvTranslator
                 _interfaces.Add(_pendingWriteBits);
                 if (DeviceAddressCache)
                 {
-                    var privateUlongPointer = _module.TypePointer(SpirvStorageClass.Private, _ulongType);
                     _translatedPage = _module.AddGlobalVariable(privateUlongPointer, SpirvStorageClass.Private, ULong(ulong.MaxValue));
                     _translatedEntry = _module.AddGlobalVariable(privateUlongPointer, SpirvStorageClass.Private, ULong(0));
                     _module.AddName(_translatedPage, "translatedPage");

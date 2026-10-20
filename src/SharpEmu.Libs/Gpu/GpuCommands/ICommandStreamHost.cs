@@ -134,6 +134,17 @@ public interface ICommandStreamHost
     // Prints recorded writers of a range for the image-clear trace.
     void TraceWritersOf(string subject, ulong address, ulong size) { }
 
+    // A satisfied wait packet or a command-processor memory write: CPU writes released by the
+    // waited-on value, or the written bytes, must become visible to the commands that follow,
+    // the same as at the start of a submission slice.
+    void NoteMemoryVisibilityPoint()
+    {
+    }
+
+    // A command-processor write of these bytes: only they changed, so a host may keep what it
+    // already synchronized for the rest of memory.
+    void NoteCommandProcessorWrite(ulong address, ulong size) => NoteMemoryVisibilityPoint();
+
     void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount);
 
     // Return completed samples for counter zero. False keeps the legacy fallback.

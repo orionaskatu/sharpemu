@@ -65,7 +65,7 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         };
         Require(vk.CreateDescriptorSetLayout(device, &layoutInfo, null, out _setLayout), "vkCreateDescriptorSetLayout");
         var push = new PushConstantRange(StageFlags, 0, PushData.ByteSize);
-        fixed (DescriptorSetLayout* layout = &_setLayout)
+        if (_globalSetLayout.Handle != 0)
         {
             var layouts = stackalloc DescriptorSetLayout[] { _globalSetLayout, _setLayout };
             var pipelineLayoutInfo = new PipelineLayoutCreateInfo
@@ -231,7 +231,10 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         IReadOnlyDictionary<DescriptorBindingKind, DescriptorImageInfo[]>? boundImages = null,
         ulong shaderBase = 0,
         uint[]? dispatchThreadLimits = null,
-        uint[]? meshDrawParameters = null)
+        uint[]? meshDrawParameters = null,
+        uint[]? bufferStrides = null,
+        uint[]? tessellationData = null,
+        DescriptorSet globalSet = default)
     {
         var vk = _harness.Vk;
         var device = _harness.Device.Device;
@@ -368,7 +371,20 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         VulkanSynchronization.PipelineBarrier(vk, command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStages, 0, 1, &barrier, 0, null, 0, null);
         var bindPoint = IsMesh ? PipelineBindPoint.Graphics : PipelineBindPoint.Compute;
         vk.CmdBindPipeline(command, bindPoint, _pipeline);
-        vk.CmdBindDescriptorSets(command, bindPoint, _pipelineLayout, 0, 1, &set, 0, null);
+        if (_globalSetLayout.Handle != 0)
+        {
+            if (globalSet.Handle == 0)
+            {
+                throw new InvalidOperationException("This pipeline needs the bindless descriptor set.");
+            }
+
+            vk.CmdBindDescriptorSets(command, bindPoint, _pipelineLayout, 0, 1, &globalSet, 0, null);
+            vk.CmdBindDescriptorSets(command, bindPoint, _pipelineLayout, 1, 1, &set, 0, null);
+        }
+        else
+        {
+            vk.CmdBindDescriptorSets(command, bindPoint, _pipelineLayout, 0, 1, &set, 0, null);
+        }
         if (layout.UsesPushData)
         {
             fixed (uint* pointer = pushData)

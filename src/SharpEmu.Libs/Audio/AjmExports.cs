@@ -1115,7 +1115,7 @@ public static class AjmExports
         else
         {
             config = instance.Atrac9?.Config;
-            result = DecodeScattered(ctx, instance, inputs, inputLength, outputs, outputLength, multipleFrames);
+            result = DecodeAtrac9Scattered(ctx, instance, inputs, inputLength, outputs, outputLength, multipleFrames);
             config ??= instance.Atrac9?.Config;
         }
 
@@ -1228,7 +1228,7 @@ public static class AjmExports
         return true;
     }
 
-    private static Atrac9DecodeResult DecodeScattered(
+    private static Atrac9DecodeResult DecodeAtrac9Scattered(
         CpuContext ctx,
         AjmInstanceState instance,
         List<AjmGuestBuffer> inputs,

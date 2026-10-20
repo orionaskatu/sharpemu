@@ -539,8 +539,164 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         return CreateBuffer(guestAddress, size);
     }
 
+    public void PrepareBufferAllocations(ReadOnlySpan<GuestSpan> ranges)
+    {
+        // Draws have few ranges; keep that common case off the managed heap.
+        Span<GuestSpan> pages = ranges.Length <= 64 ? stackalloc GuestSpan[ranges.Length] : new GuestSpan[ranges.Length];
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            if (!IsValidRange(range.Address, range.Size) ||
+                !PageOwnerTable.TryGetPageRange(range.Address, range.Size, out var first, out var end))
+                throw SubmissionScheduler.Fatal($"The prepared buffer allocation range is invalid: address=0x{range.Address:X16} size=0x{range.Size:X16}.");
+            pages[index] = new GuestSpan(first * CachingPageSize, (end - first) * CachingPageSize);
+        }
+        pages.Sort(static (left, right) => left.Address.CompareTo(right.Address));
+
+        for (var index = 0; index < pages.Length;)
+        {
+            var range = pages[index];
+            var next = index + 1;
+            // AcquireVertexBuffers also coalesces touching byte ranges. Reserve their
+            // whole union now, so its later acquisition cannot replace a shader binding.
+            while (next < pages.Length && pages[next].Address <= range.End)
+            {
+                range = new GuestSpan(range.Address, Math.Max(range.End, pages[next].End) - range.Address);
+                next++;
+            }
+
+            // Disjoint read-only geometry can still use the stream ring, without another cache allocation.
+            if (next > index + 1 || _registry.HasOverlap(range.Address, range.Size))
+                _ = FindBuffer(range.Address, range.Size);
+            index = next;
+        }
+    }
+
+    // SHARPEMU_TRACE_COHERENCE=1 (diagnostic): after a presented frame, with nothing recorded and
+    // the last submitted GPU work complete, a page the tracker calls clean (no CPU-dirty, GPU-dirty
+    // or GPU-modified bytes, no cached image over it) must hold the same bytes in guest memory and
+    // in the mapped buffer. Each check compares the next slice of mapped buffers and reports any
+    // page that differs, rechecking afterwards that a concurrent guest store did not dirty it.
+    private static readonly bool TraceCoherence = Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COHERENCE") == "1";
+    private static readonly ulong CoherenceBytesPerCheck =
+        (ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COHERENCE_MB"), out var coherenceMb) && coherenceMb != 0 ? coherenceMb : 8) * 1024 * 1024;
+    private long _coherenceFrames;
+    private int _coherenceBufferCursor;
+    private ulong _coherencePageCursor;
+    private long _coherencePagesChecked;
+    private long _coherenceDivergences;
+    private long _coherenceChecks;
+
+    public void CheckCoherence()
+    {
+        if (!TraceCoherence || (++_coherenceFrames & 3) != 0)
+        {
+            return;
+        }
+
+        // Drain everything recorded and run the completion work, so mapped memory holds the GPU's last word.
+        if (_scheduler.Active)
+        {
+            _scheduler.FinishMemoryAccess();
+        }
+        else if (_scheduler.HasUnsubmittedCommands)
+        {
+            return;
+        }
+
+        var lastSubmitted = _scheduler.CurrentTick - 1;
+        if (lastSubmitted == 0)
+        {
+            return;
+        }
+
+        _scheduler.WaitForSubmittedTick(lastSubmitted);
+        var identifiers = _registry.SnapshotRegisteredIdentifiers();
+        if (identifiers.Length == 0)
+        {
+            return;
+        }
+
+        var images = ImageCache;
+        Span<byte> guest = stackalloc byte[(int)TrackerLayout.PageBytes];
+        var budget = CoherenceBytesPerCheck;
+        for (var visited = 0; visited < identifiers.Length && budget != 0; visited++)
+        {
+            _coherenceBufferCursor %= identifiers.Length;
+            var buffer = _registry.TryGetRegisteredBuffer(identifiers[_coherenceBufferCursor]);
+            if (buffer is null || buffer.MappedPointer == null || buffer.Size < TrackerLayout.PageBytes)
+            {
+                _coherenceBufferCursor++;
+                _coherencePageCursor = 0;
+                continue;
+            }
+
+            var firstPage = (buffer.CpuAddress + TrackerLayout.PageBytes - 1) & ~(TrackerLayout.PageBytes - 1);
+            var endPage = (buffer.CpuAddress + buffer.Size) & ~(TrackerLayout.PageBytes - 1);
+            var page = Math.Max(firstPage, _coherencePageCursor);
+            for (; page < endPage && budget != 0; page += TrackerLayout.PageBytes, budget -= TrackerLayout.PageBytes)
+            {
+                if (!IsCoherenceCandidate(page, images) || !_backing.TryReadBacking(page, guest))
+                {
+                    continue;
+                }
+
+                _coherencePagesChecked++;
+                var gpu = new ReadOnlySpan<byte>(buffer.MappedPointer + buffer.Offset(page), (int)TrackerLayout.PageBytes);
+                var diff = guest.CommonPrefixLength(gpu);
+                if (diff == guest.Length || !IsCoherenceCandidate(page, images))
+                {
+                    continue;
+                }
+
+                var differing = 0;
+                for (var index = diff; index < guest.Length; index++)
+                {
+                    differing += guest[index] != gpu[index] ? 1 : 0;
+                }
+
+                var divergences = ++_coherenceDivergences;
+                GuestGpuMemoryHook.SelectDivergenceTracePage(page);
+                if (divergences <= 40 || divergences % 100 == 0)
+                {
+                    var from = diff & ~15;
+                    var length = Math.Min(32, guest.Length - from);
+                    var hot = _tracker.IsCpuWriteHotRange(page, TrackerLayout.PageBytes);
+                    var guestHex = Convert.ToHexString(guest.Slice(from, length));
+                    var gpuHex = Convert.ToHexString(gpu.Slice(from, length));
+                    Console.Error.WriteLine(FormattableString.Invariant(
+                        $"[GPU][COHERENCE] time={DateTime.Now:HH:mm:ss} page=0x{page:X} buffer=0x{buffer.CpuAddress:X}+0x{buffer.Size:X} first_diff=+0x{diff:X} differing_bytes={differing} hot={hot} last_gpu_write={buffer.LastGpuWriteTick} completed={_scheduler.Timeline.CompletedTick} guest={guestHex} gpu={gpuHex} n={divergences}"));
+                }
+            }
+
+            if (page >= endPage)
+            {
+                _coherenceBufferCursor++;
+                _coherencePageCursor = 0;
+            }
+            else
+            {
+                _coherencePageCursor = page;
+            }
+        }
+
+        if ((++_coherenceChecks % 64) == 0)
+        {
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"[GPU][COHERENCE] time={DateTime.Now:HH:mm:ss} summary pages_checked={_coherencePagesChecked} divergences={_coherenceDivergences} buffers={identifiers.Length}"));
+        }
+    }
+
+    private bool IsCoherenceCandidate(ulong page, IGuestImageCache? images) =>
+        images is not null &&
+        _tracker.HasRegion(page, TrackerLayout.PageBytes) &&
+        !_tracker.HasCpuDirtyPages(page, TrackerLayout.PageBytes) &&
+        !_tracker.HasGpuDirtyPages(page, TrackerLayout.PageBytes) &&
+        !_gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes) &&
+        !images.QueryRegion(page, TrackerLayout.PageBytes).ImageBytes;
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false,
-        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0)
+        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool requiresDeviceAddress = false)
     {
         CompleteGuestPublications?.Invoke(guestAddress, size, isWritten ? PublicationAccess.Write : PublicationAccess.OverlaidRead);
         if (isWritten && ImageClearTrace.Enabled) ImageCache?.TraceGuestWrite("shader-buffer-write", guestAddress, size, shaderHash: traceShaderHash);
@@ -3319,7 +3475,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
             }
 
-            if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-upload", guestAddress, size, $"bytes={totalSize} copies={copies.Count}");
+            if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-upload", guestAddress, size, $"bytes={sink.TotalSize} copies={copies.Count}");
             var command = _scheduler.Current;
             if (!_uploadBatchActive)
             {

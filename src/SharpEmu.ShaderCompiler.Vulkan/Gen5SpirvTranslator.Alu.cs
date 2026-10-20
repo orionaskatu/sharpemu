@@ -4320,8 +4320,16 @@ public static partial class Gen5SpirvTranslator
             }
 
             var targetLane = IAdd(BitwiseAnd(lane, UInt(0xFFFF_FFF8)), selector);
-            targetLane = BitwiseAnd(targetLane, UInt(NativeLaneMask));
-            var shuffled = ShuffleLane(value, targetLane);
+            // Ensure target lane is properly constrained to wave size (32 or 64)
+            if (_waveLaneCount == 64)
+            {
+                targetLane = BitwiseAnd(targetLane, UInt(63));
+            }
+            else
+            {
+                targetLane = BitwiseAnd(targetLane, UInt(31));
+            }
+            var shuffled = ShuffleGuestLaneOrSelf(value, targetLane, out var sourcePresent);
             if (control.FetchInactive)
             {
                 return shuffled;
@@ -4378,31 +4386,11 @@ public static partial class Gen5SpirvTranslator
                 inRange,
                 targetLane,
                 lane);
-            if (!_pairedMeshLanes)
+            // Mask to guest wave size (32 or 64 lanes); a DPP16 row never crosses 16 lanes.
+            safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 ? 63u : 31u));
+            if (control.FetchInactive)
             {
-                safeTarget = BitwiseAnd(safeTarget, UInt(NativeLaneMask));
-            }
-            var shuffled = _pairedMeshLanes
-                ? ShufflePairedValue(_pairedDppSources[0], _pairedDppSources[1], safeTarget)
-                : ShuffleLane(value, safeTarget);
-
-            var sourceAvailable = inRange;
-            if (!control.FetchInactive)
-            {
-                var activeWord = _module.AddInstruction(
-                    SpirvOp.Select,
-                    _uintType,
-                    Load(_boolType, _exec),
-                    UInt(1),
-                    UInt(0));
-                var shuffledActive = _pairedMeshLanes
-                    ? ShufflePairedValue(_pairedActiveWords[0], _pairedActiveWords[1], safeTarget)
-                    : ShuffleLane(activeWord, safeTarget);
-                sourceAvailable = _module.AddInstruction(
-                    SpirvOp.LogicalAnd,
-                    _boolType,
-                    sourceAvailable,
-                    IsNotZero(shuffledActive));
+                return inRange;
             }
 
             var activeWord = _module.AddInstruction(
@@ -5621,7 +5609,6 @@ public static partial class Gen5SpirvTranslator
             targetLane = BitwiseAnd(targetLane, UInt(NativeLaneMask));
             var shuffled = ShuffleLane(value, targetLane);
             var fetchInactive = (control.OperandSelect & 1) != 0;
-            var boundControl = (control.OperandSelect & 2) != 0;
             if (fetchInactive)
             {
                 return shuffled;
@@ -5634,21 +5621,13 @@ public static partial class Gen5SpirvTranslator
                 UInt(1),
                 UInt(0));
             var sourceActive = IsNotZero(
-                ShuffleGuestLaneOrSelf(activeWord, targetLane, out _));
-            // An inactive source reads zero with BOUND_CTRL; without it the lane keeps its
-            // old destination value (the intrinsic's `old` operand).
+                ShuffleLane(activeWord, targetLane));
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
-                _module.AddInstruction(
-                    SpirvOp.LogicalOr,
-                    _boolType,
-                    LogicalNot(sourcePresent),
-                    sourceActive),
+                sourceActive,
                 shuffled,
-                boundControl || instruction.Destinations.Count == 0
-                    ? UInt(0)
-                    : LoadV(instruction.Destinations[0].Value));
+                UInt(0));
         }
 
         private uint GetInt16Source(Gen5ShaderInstruction instruction, int sourceIndex, bool signed)

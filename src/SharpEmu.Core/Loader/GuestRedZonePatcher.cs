@@ -1608,6 +1608,8 @@ internal static class GuestRedZonePatcher
 
     private static ulong AlignUp(ulong value, ulong alignment) => checked((value + alignment - 1) & ~(alignment - 1));
 
+    private delegate bool JumpTableReader(ulong address, byte[] entries);
+
     private readonly record struct DecodedInstruction(Instruction Instruction);
 
     /// <summary>

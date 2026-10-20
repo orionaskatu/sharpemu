@@ -43,6 +43,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly HashSet<ResourceSlotIdentifier> _scheduledReadbacks = new();
     private readonly SortedList<ulong, SurfaceMetadata> _surfaceMetadata = new();
     private ulong _totalUsedMemory;
+    private long _retiredImageMemoryBytes;
     private ulong _collectionStartBytes = 1536 * MiB;
     private ulong _memoryPressureBytes = 1536 * MiB;
     private ulong _criticalMemoryBytes = 3072 * MiB;
@@ -302,12 +303,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
         foreach (var imageIdentifier in candidates)
         {
-            foreach (var imageIdentifier in starting)
+            if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
             {
-                if (HasSameBacking(_slots[imageIdentifier].Description, request.Description, exactFormat))
-                {
-                    result = imageIdentifier;
-                }
+                result = imageIdentifier;
             }
         }
 
@@ -317,7 +315,6 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         var exactMatch = result.IsValid;
         if (!result.IsValid)
         {
-            var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
             foreach (var candidate in candidates)
             {
                 viewMip = -1;
@@ -372,6 +369,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
+        // A compute shader indexes a storage image in guest pixels and its dispatch grid does
+        // not shrink with the host resolution, so a scaled image would be written with holes
+        // (upscale) or redundantly (downscale). Such memory drops back to guest resolution.
+        if (result.IsValid && request.ShaderWrite && _slots[result].IsScaled)
+        {
+            result = ReplaceScaled(result);
+        }
+
         if (RenderPhaseProfile.Enabled && result.IsValid)
         {
             if (exactMatch) _exactImageMatches++;
@@ -409,8 +414,6 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             {
                 inserted.MarkBufferModified();
             }
-
-            SyncResizedSibling(result);
         }
 
         var image = _slots[result];
@@ -434,6 +437,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TraceVolumeState("lookup", image, request);
         return result;
     }
+
+    // Uploads guest changes of an image that was found earlier.
 
     // Uploads guest changes of an image that was found earlier.
     public void RefreshImage(ResourceSlotIdentifier imageIdentifier)
@@ -860,11 +865,82 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return imageIdentifier;
     }
 
+    // Drops one image back to guest resolution for good; later images over the same guest
+    // memory are created unscaled too, so the decision cannot oscillate.
+    public void DemoteRenderScale(ResourceSlotIdentifier imageIdentifier)
+    {
+        using var held = _lock.Hold();
+        if (_slots[imageIdentifier].IsScaled)
+        {
+            ReplaceScaled(imageIdentifier);
+        }
+    }
+
+    private ResourceSlotIdentifier ReplaceScaled(ResourceSlotIdentifier cachedImageIdentifier)
+    {
+        var cached = _slots[cachedImageIdentifier];
+        _unscaledRanges.Add(cached.Description.Data);
+        var replacementImageIdentifier = InsertImage(cached.Description);
+        var replacement = _slots[replacementImageIdentifier];
+        replacement.Uses = cached.Uses;
+        if (cached.Binding.IsBound || cached.Binding.IsTarget)
+        {
+            cached.Binding.NeedsRebind = true;
+        }
+
+        CopyWholeImage(replacementImageIdentifier, cachedImageIdentifier);
+        ReleaseImage(cachedImageIdentifier);
+        return replacementImageIdentifier;
+    }
+
+    private readonly List<GuestSpan> _unscaledRanges = new();
+
+    private bool IsUnscaledRange(in GuestSpan data)
+    {
+        if (data.Address == 0)
+        {
+            return true;
+        }
+        foreach (var range in _unscaledRanges)
+        {
+            if (range.Address <= data.Address && data.Address + data.Size <= range.Address + range.Size)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private ResourceSlotIdentifier InsertImage(in ImageDescription description,
         [System.Runtime.CompilerServices.CallerMemberName] string creationPath = "")
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool, _reportAllocationFailure));
+        var requiredBytes = (description.Data.Size + 1023) & ~1023UL;
+        CollectForAllocation(requiredBytes);
+        var allowScaling = !IsUnscaledRange(description.Data);
+        CachedImage image;
+        try
+        {
+            image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _reportAllocationFailure,
+                _imageMemoryPool, DescribeImageMemory, allowScaling);
+        }
+        catch (CachedImage.ImageOutOfMemoryException)
+        {
+            // The budget is an estimate: the device can still run out. Free everything that can
+            // go, wait for retired images to be destroyed, and try once more.
+            ReclaimAfterFailedAllocation();
+            try
+            {
+                image = new CachedImage(_device, _scheduler, _backing, description, _backingPool, _reportAllocationFailure,
+                    _imageMemoryPool, DescribeImageMemory, allowScaling);
+            }
+            catch (CachedImage.ImageOutOfMemoryException again)
+            {
+                throw SubmissionScheduler.Fatal(again.Message);
+            }
+        }
+
+        var imageIdentifier = _slots.Insert(image);
         _createdImageCount++;
         ReportLargeImageCreation(_slots[imageIdentifier], creationPath);
         ReportImageLifetime(_slots[imageIdentifier], "recreate");

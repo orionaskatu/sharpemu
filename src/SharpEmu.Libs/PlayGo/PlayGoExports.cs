@@ -787,11 +787,11 @@ public static class PlayGoExports
         // Derive the installed chunk set from pak files when no usable chunk map
         // was available. A locally dumped title has all of its data installed, and
         // chunk 0 is always retained as the final single-chunk fallback.
-        var installedChunkIds = DiscoverInstalledChunkIds(app0Root);
-        TracePlayGo($"metadata_fallback; fully-installed chunks=[{string.Join(',', installedChunkIds)}]");
+        var finalChunkIds = DiscoverInstalledChunkIds(app0Root);
+        TracePlayGo($"metadata_fallback; fully-installed chunks=[{string.Join(',', finalChunkIds)}]");
         return new PlayGoMetadata(
             true,
-            installedChunkIds,
+            finalChunkIds,
             PlayGoChunkIdKnowledge.Authoritative);
     }
 

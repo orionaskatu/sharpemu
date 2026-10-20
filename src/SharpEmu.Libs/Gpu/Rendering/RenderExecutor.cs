@@ -320,12 +320,6 @@ public sealed partial class RenderExecutor
             TraceDisposition("unsupported-geometry-stage");
             return;
         }
-        if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
-        {
-            DbgDrawStats.Record(banks.Context.ShaderStages, !HasValidVertexShader(shader) ? "no-vs" : "unsupported"); // TEMP
-            return;
-        }
-        DbgDrawStats.Record(banks.Context.ShaderStages, "ok"); // TEMP
 
         if (RenderTrace.Enabled)
         {
@@ -429,6 +423,12 @@ public sealed partial class RenderExecutor
 
     public void DrawAuto(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
     {
+        if (arguments.IndirectArgumentsAddress != 0 && !CanDrawAutoIndirectOnGpu(banks))
+        {
+            DrawAutoWithCpuArguments(submitId, banks, in arguments);
+            return;
+        }
+
         using var meshTrace = MeshDrawTrace.Begin(submitId, banks.Shader.Vertex.ExportAddress, banks.Context.ShaderStages);
         try
         {
@@ -441,6 +441,38 @@ public sealed partial class RenderExecutor
             throw;
         }
     }
+
+    // Fans, polygons and legacy rectangle/quad lists are drawn from their vertex counts, so
+    // those read the indirect arguments on the CPU, as merged tessellation does: it counts its
+    // patches from the vertex count. Rectangle lists draw through the host's general
+    // rectangle-list variant, as indexed indirect draws do.
+    private static bool CanDrawAutoIndirectOnGpu(RegisterBanks banks) =>
+        !Pipelines.ShaderPipelineCache.IsMergedTessellationMask(banks.Context.ShaderStages) &&
+        (GuestPrimitiveType)banks.UserConfig.PrimitiveType is
+            GuestPrimitiveType.PointList or GuestPrimitiveType.LineList or GuestPrimitiveType.LineStrip or
+            GuestPrimitiveType.TriangleList or GuestPrimitiveType.TriangleStrip or GuestPrimitiveType.RectangleList;
+
+    private void DrawAutoWithCpuArguments(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
+    {
+        Span<byte> bytes = stackalloc byte[(int)AutoIndirectArgumentsSize];
+        if (!_host.TryReadGuest(arguments.IndirectArgumentsAddress, bytes))
+        {
+            throw _host.Fatal($"The indirect draw arguments are unreadable: address=0x{arguments.IndirectArgumentsAddress:X16}.");
+        }
+
+        var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(bytes);
+        var resolved = arguments with
+        {
+            VertexCount = words[0],
+            InstanceCount = words[1],
+            FirstVertex = words[2],
+            FirstInstance = words[3],
+            IndirectArgumentsAddress = 0,
+        };
+        DrawAutoCore(submitId, banks, in resolved);
+    }
+
+    private const ulong AutoIndirectArgumentsSize = 16;
 
     private void DrawAutoCore(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)
     {
@@ -486,12 +518,6 @@ public sealed partial class RenderExecutor
             TraceDrawTargets(banks, "unsupported-geometry-stage");
             return;
         }
-        if (!HasValidVertexShader(shader) || IsUnsupportedGeometryStage(banks))
-        {
-            DbgDrawStats.Record(banks.Context.ShaderStages, !HasValidVertexShader(shader) ? "no-vs" : "unsupported"); // TEMP
-            return;
-        }
-        DbgDrawStats.Record(banks.Context.ShaderStages, "ok"); // TEMP
 
         if (RenderTrace.Enabled)
         {
@@ -507,14 +533,6 @@ public sealed partial class RenderExecutor
         {
             TraceDrawTargets(banks, "no-targets");
             _host.ResetBindings();
-            return;
-        }
-
-        if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
-        {
-            // A targetless draw may be retained and replayed later; it needs its counts.
-            _host.ResetBindings();
-            DrawAutoWithCpuArguments(submitId, banks, in arguments);
             return;
         }
 

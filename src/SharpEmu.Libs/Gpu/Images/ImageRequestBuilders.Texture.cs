@@ -120,7 +120,7 @@ public static partial class ImageRequestBuilders
     // The view follows the compiled module: a volume, a layer window to the last layer, or one layer.
     private static ImageViewDescription TextureView(
         in TextureDescriptorWords descriptor, in ShaderImageShape shape, Format format, bool shaderConversion, uint viewLevels, uint imageLayers,
-        ulong shaderHash, int imageIndex)
+        ulong shaderHash = 0, int imageIndex = 0, uint firstLevel = 0)
     {
         var baseLevel = descriptor.BaseLevel - firstLevel;
         var mapping = shape.Storage || shaderConversion ? default : ViewFormatRules.ComponentMapping(DestinationSwizzle(descriptor));
@@ -245,8 +245,7 @@ public static partial class ImageRequestBuilders
         return resolution;
     }
 
-    private static TextureRequestResolution BuildTexture(ReadOnlySpan<uint> words, in ShaderImageShape shape,
-        ulong shaderHash, int imageIndex)
+    public static bool TryTexture(ReadOnlySpan<uint> words, in ShaderImageShape shape, out TextureRequestResolution resolution)
     {
         Span<uint> key = stackalloc uint[8];
         words[..Math.Min(words.Length, 8)].CopyTo(key);
@@ -270,6 +269,167 @@ public static partial class ImageRequestBuilders
 
         cache[cacheKey] = resolution;
         return true;
+    }
+
+    private static TextureRequestResolution BuildTexture(ReadOnlySpan<uint> words, in ShaderImageShape shape,
+        ulong shaderHash, int imageIndex)
+    {
+        Span<uint> padded = stackalloc uint[8];
+        words[..Math.Min(words.Length, 8)].CopyTo(padded);
+        var descriptor = new TextureDescriptorWords(padded);
+        if (ImageClearTrace.Enabled && descriptor.Type == GuestImageType.Color3D)
+            ImageClearTrace.Write($"volume-descriptor address=0x{descriptor.BaseAddress:X16} words={Convert.ToHexString(System.Runtime.InteropServices.MemoryMarshal.AsBytes(padded))}");
+        var storage = shape.Storage;
+        if (descriptor.BaseAddress == 0)
+        {
+            return NullTextureResolution(shape);
+        }
+
+        var address = descriptor.BaseAddress;
+        var width = descriptor.Width + 1;
+        var height = descriptor.Height + 1;
+        var baseLevel = descriptor.BaseLevel;
+        var lastLevel = descriptor.LastLevel;
+        var type = TextureType(descriptor.Type);
+        var multisampled = IsMultisampledTexture(type);
+        var maxMip = shape.R128 ? lastLevel : descriptor.MaxMip;
+        var levels = multisampled ? 1 : maxMip + 1;
+        var dynamicStorage = storage && shape.DynamicMip;
+        var viewLastLevel = !multisampled && !dynamicStorage ? Math.Min(lastLevel, maxMip) : lastLevel;
+        var tile = descriptor.TileMode;
+        var depthTile = tile == GuestTileMode.Depth;
+        var msaaTile = depthTile || tile == GuestTileMode.RenderTarget;
+        var msaaArray = type == GuestImageType.Color2DMsaaArray;
+     
+        if (!multisampled && baseLevel >= levels)
+        {
+            return NullTextureResolution(shape);
+        }
+
+        if ((!multisampled && (baseLevel > viewLastLevel || viewLastLevel >= levels)) ||
+            (multisampled &&
+             (baseLevel != 0 || lastLevel == 0 || lastLevel > 3 || maxMip != lastLevel || !msaaTile || (descriptor.MsaaDepth && !depthTile) ||
+              (!msaaArray && (descriptor.Depth != 0 || descriptor.BaseArray != 0)))))
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The texture mip view is not supported: address=0x{address:X16} type={(uint)type} baseLevel={baseLevel} lastLevel={lastLevel} maxMip={maxMip} " +
+                $"levels={levels} tile={(uint)tile} depth={descriptor.Depth} baseArray={descriptor.BaseArray} msaaDepth={descriptor.MsaaDepth} storage={storage}.");
+        }
+
+        var samples = multisampled ? 1u << (int)lastLevel : 1u;
+        var viewLevels = multisampled ? 1 : viewLastLevel - baseLevel + 1;
+        var depth = descriptor.Depth + 1;
+        var format = descriptor.Format;
+        var surfaceFormat = TextureTransferLayout.SurfaceFormat(format);
+        var shaderConversion = surfaceFormat.ConversionFormat != GuestPixelFormat.Invalid;
+        var volume = type == GuestImageType.Color3D;
+        var layered = type is GuestImageType.Color1DArray or GuestImageType.Color2DArray or GuestImageType.Color2DMsaaArray;
+        var imageLayers = layered ? depth : 1;
+        if (shape.Cube &&
+            (volume || multisampled || width != height || descriptor.BaseArray > descriptor.Depth ||
+             (descriptor.Depth - descriptor.BaseArray + 1) % 6 != 0))
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The cubemap view is invalid: address=0x{address:X16} extent={width}x{height} layers={imageLayers} baseArray={descriptor.BaseArray} samples={samples}.");
+        }
+        uint pitch;
+        TileSizeAndAlignment size;
+        if (multisampled)
+        {
+            var bytes = GuestPixelFormats.BytesPerElement(format);
+            pitch = depthTile ? TileGeometry.DepthPitch(width, bytes, lastLevel) : TileGeometry.RenderTargetPitch(width, bytes, lastLevel);
+            if (pitch == 0 || !TileGeometry.TryGetRenderTargetSize(width, height, pitch, bytes, out size, lastLevel) || size.Size > uint.MaxValue / imageLayers)
+            {
+                throw SubmissionScheduler.Fatal(
+                    $"The multisample texture layout is not supported: address=0x{address:X16} extent={width}x{height} bytes={bytes} pitch={pitch} samplesLog2={lastLevel} layers={imageLayers}.");
+            }
+
+            size = new TileSizeAndAlignment(size.Size * imageLayers, size.Align);
+        }
+        else
+        {
+            pitch = TileGeometry.TexturePitch(format, width, tile);
+            size = TileGeometry.TextureTotalSize(format, width, height, volume ? depth : imageLayers, levels, tile, volume);
+        }
+
+        if (size.Size == 0 || size.Align == 0 || (address & (size.Align - 1UL)) != 0)
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The texture footprint or alignment is invalid: address=0x{address:X16} size=0x{size.Size:X} align=0x{size.Align:X} format={(uint)format} tile={(uint)tile}.");
+        }
+
+        var pixelFormat = surfaceFormat.HostFormat;
+        // Comparison sampling needs a depth image, even when no depth target created it.
+        if (shape.DepthCompare && DepthFormatRule.FindByGuestFormat(format) is { } depthFormat)
+        {
+            pixelFormat = depthFormat.DepthAttachmentFormat;
+        }
+        // Atomic storage images are declared as UINT in SPIR-V, including float atomics.
+        var storageViewFormat = storage && (shape.Atomic || format == GuestPixelFormat.Bits32SInt) ? Format.R32Uint : ViewFormatRules.SrgbStorageFormat(pixelFormat);
+        var viewFormat = storage && storageViewFormat != Format.Undefined ? storageViewFormat : pixelFormat;
+        var blockBytes = GuestPixelFormats.BlockCompressedBytes(format);
+        var description = ImageDescription.Create();
+        description.Data = new GuestSpan(address, size.Size);
+        description.PixelFormat = pixelFormat;
+        description.GuestFormat = format;
+        description.Type = TextureBaseType(type);
+        description.Extent = new Extent3D(width, height, volume ? depth : 1);
+        description.Resources = new SubresourceCount(levels, imageLayers);
+        description.Pitch = pitch;
+        description.BytesPerBlock = blockBytes != 0 ? blockBytes : GuestPixelFormats.BytesPerElement(format);
+        description.Samples = samples;
+        description.TileMode = tile;
+        if (!shape.R128 && words.Length >= 8 && descriptor.MetadataCompress &&
+            tile != GuestTileMode.Depth && !description.IsDepth)
+        {
+            _ = TileGeometry.TryGetDccSize(
+                width, height, volume ? depth : imageLayers, description.BytesPerBlock, levels, tile,
+                out var metadataSize, (uint)System.Numerics.BitOperations.TrailingZeroCount(samples));
+            description.Metadata.Kind = MetadataKind.Dcc;
+            description.Metadata.Range = new GuestSpan(descriptor.MetadataAddress << 8, metadataSize.Size);
+            description.Metadata.DccAlphaMsb = descriptor.DccAlphaMsb;
+        }
+
+        if (samples > 1)
+        {
+            description.MipLayout[0] = new MipLevelLayout { Offset = 0, Size = size.Size, Pitch = pitch, Height = height };
+        }
+        else
+        {
+            PopulateTextureMipLayout(ref description);
+        }
+
+        // A nonzero first level maps the whole chain on the device and views the range the descriptor covers.
+        var firstLevel = !storage && !volume && samples == 1 && baseLevel > 0 && baseLevel < levels ? baseLevel : 0u;
+        var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers,
+            shaderHash, imageIndex, firstLevel);
+        if (!shape.R128 && descriptor.MetadataCompress && !description.IsDepth && !shaderConversion &&
+            tile == GuestTileMode.RenderTarget && levels == 1 && samples == 1 &&
+            type is GuestImageType.Color2D or GuestImageType.Color2DArray or GuestImageType.Color3D &&
+            NativeColorClear.TryDecode(0x40, viewFormat, !descriptor.DccAlphaOnMostSignificantBits, out _))
+        {
+            var clearMetadataAddress = descriptor.MetadataAddress << 8;
+            var sliceSize = NativeColorClear.SliceSize(width, height, description.BytesPerBlock);
+            var metadataSize = sliceSize * description.TransferLayers;
+            if (clearMetadataAddress != 0 && (clearMetadataAddress & 4095) == 0 && sliceSize != 0 &&
+                metadataSize <= ulong.MaxValue - clearMetadataAddress)
+            {
+                description.Metadata.Kind = MetadataKind.Dcc;
+                description.Metadata.Range = new GuestSpan(clearMetadataAddress, metadataSize);
+                description.Metadata.NativeColorClear = true;
+                description.Metadata.ColorAlphaOnLeastSignificantBits = !descriptor.DccAlphaOnMostSignificantBits;
+                description.Metadata.ColorMetadataBaseLayer = volume ? 0 : view.BaseLayer;
+            }
+        }
+        var request = new ImageRequest(description, view, storage ? ImageRole.StorageImage : ImageRole.Texture);
+        if (ImageClearTrace.Enabled && volume)
+        {
+            request.TraceTextureMetadataAddress = descriptor.MetadataAddress << 8;
+            request.TraceMetadataCompress = descriptor.MetadataCompress;
+            request.TraceWriteCompress = descriptor.WriteCompress;
+            request.TraceTextureDescriptor = string.Join(",", ((ReadOnlySpan<uint>)descriptor.Fields).ToArray().Select(word => word.ToString("X8")));
+        }
+        return new TextureRequestResolution(request, shaderConversion, pixelFormat, DestinationSwizzle(descriptor));
     }
 
     private static TextureRequestResolution Reject(string message, bool tolerateInvalid, out string? invalid)
@@ -432,8 +592,25 @@ public static partial class ImageRequestBuilders
             PopulateTextureMipLayout(ref description);
         }
 
+        // A sampled texture whose descriptor starts past mip 0 may be a streamed texture whose
+        // larger mips are not mapped: the request then holds only the levels from there. The
+        // image cache returns it to the whole chain when those mips are mapped after all
+        // (WithWholeMipChain), as a view of a lower mip of a rendered image is.
+        var firstLevel = !storage && !volume && samples == 1 && baseLevel > 0 && baseLevel < levels ? baseLevel : 0u;
+        if (firstLevel != 0)
+        {
+            description.FirstLevel = firstLevel;
+            description.Resources = new SubresourceCount(levels - firstLevel, imageLayers);
+        }
+
+        if (!shape.Volume && descriptor.BaseArray >= description.Resources.Layers)
+        {
+            return Reject($"The texture base layer is outside the image: baseLayer={descriptor.BaseArray} layers={description.Resources.Layers} address=0x{address:X16}.",
+                tolerateInvalid, out invalid);
+        }
+
         var view = TextureView(descriptor, shape, viewFormat, shaderConversion, viewLevels, description.Resources.Layers,
-            shaderHash, imageIndex);
+            firstLevel);
         if (!shape.R128 && descriptor.MetadataCompress && !description.IsDepth && !shaderConversion &&
             tile == GuestTileMode.RenderTarget && levels == 1 && samples == 1 &&
             type is GuestImageType.Color2D or GuestImageType.Color2DArray or GuestImageType.Color3D &&

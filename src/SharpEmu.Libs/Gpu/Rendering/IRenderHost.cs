@@ -65,7 +65,9 @@ public readonly record struct DynamicDrawState(
     StencilMasks BackStencil,
     uint ColorWriteCount,
     byte ColorWriteEnableMask,
-    uint DepthCountControl = 0);
+    uint DepthCountControl = 0,
+    float DepthMinBounds = 0f,
+    float DepthMaxBounds = 1f);
 
 // The host-side descriptors of one shader stage, prepared before the draw or dispatch records.
 public interface IPreparedBindings
@@ -213,6 +215,10 @@ public interface IRenderHost
     void DebugSetDrawHash(ulong vertexHash) { } // TEMP
 
     void DrawIndexedIndirect(BufferBinding arguments) =>
+        throw new NotSupportedException("The render host does not draw from indirect arguments.");
+
+    // One draw whose counts the GPU reads from the buffer (VkDrawIndirectCommand layout).
+    void DrawIndirect(BufferBinding arguments) =>
         throw new NotSupportedException("The render host does not draw from indirect arguments.");
 
     void InsertDrawTraceMarker(string label) { }

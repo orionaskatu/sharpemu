@@ -369,6 +369,9 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly long[] ImageVersions = new long[CleanReadPageSlots];
         }
 
+        // Resident reads that had to check GPU ownership instead of trusting a verified page.
+        internal long CleanReadVerifications { get; private set; }
+
         private bool TryReadAliasBytes(ulong address, Span<byte> destination)
         {
             if (_guestBacking?.TryEnterBackingAliasAccess() != true) return false;
@@ -851,7 +854,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 Layout = CreatePipelineLayout(setLayout,
                     (description.VertexStage.Stage == ShaderStageKind.Mesh
                         ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
-                    ShaderStageFlags.FragmentBit),
+                    ShaderStageFlags.FragmentBit,
+                    usesBindlessImages),
                 UsesPushDescriptors = usesPushDescriptors,
                 UsesBindlessImages = usesBindlessImages,
                 Description = description,

@@ -1272,9 +1272,6 @@ public static partial class Gen5MslTranslator
                     StoreScalar(destination, result);
                     return true;
                 }
-                case "SFlbitI32B32":
-                    StoreScalar(destination, $"{left} == 0u ? 0xFFFFFFFFu : (uint)clz({left})");
-                    return true;
                 case "SBitset0B32":
                     StoreScalar(
                         destination,

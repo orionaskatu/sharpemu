@@ -13,6 +13,7 @@ public enum ShaderStage : byte
     Pixel,
     Compute,
     Mesh,
+    TessellationEvaluation,
 }
 
 public enum ImageNumericClass : byte
@@ -168,6 +169,9 @@ public sealed class BufferCandidateTableInfo
 public sealed class ShaderResourceInfo
 {
     public const int MaxBuffers = 32;
+    // Bindless material tables select among many descriptors; the host binds each
+    // candidate, and the device's per-stage limits are checked when the layout is made.
+    public const int MaxImages = 65536;
     public const int MaxIndirectImageCandidates = 64;
     public const int NoScalarRegister = -1;
 

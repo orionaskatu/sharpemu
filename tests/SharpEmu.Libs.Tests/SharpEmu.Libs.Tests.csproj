@@ -17,6 +17,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <ProjectReference Include="..\..\src\SharpEmu.GUI\SharpEmu.GUI.csproj" />
     <!-- The resource-plan program builders drive the device tests of the new compile path. -->
     <ProjectReference Include="..\SharpEmu.ShaderCompiler.Tests\SharpEmu.ShaderCompiler.Tests.csproj" />
+    <Compile Include="../../src/SharpEmu.CLI/RosettaGcBudget.cs" Link="Cli/RosettaGcBudget.cs" />
   </ItemGroup>
 
   <ItemGroup>

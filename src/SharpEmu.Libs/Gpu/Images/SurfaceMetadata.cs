@@ -88,6 +88,12 @@ public sealed class SurfaceMetadata
     }
     public ulong Size;
     public ulong RangeSize;
+    // HTile slices of the depth target, so a rewrite can be read back slice by slice.
+    public uint Layers = 1;
+
+    // A dispatch rewrote these HTile words in place; their clear state is read from the
+    // words before the depth target is next bound.
+    public bool RewrittenByGpu;
     public bool NativeColorClear;
     public bool Invalidated;
 }

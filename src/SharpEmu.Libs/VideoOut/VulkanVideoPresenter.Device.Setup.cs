@@ -892,6 +892,11 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string ImageViewMinLodExtensionName = "VK_EXT_image_view_min_lod";
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
         private bool _supportsImageViewMinLod;
+        private bool _samplerFilterMinmaxEnabled;
+        private bool _fragmentShaderInterlockEnabled;
+        private bool _conservativeRasterizationEnabled;
+        private bool _supportsNativeTwoSampleMixed;
+        private bool _supportsVariableSampleLocations;
         private const string MeshShaderExtensionName = "VK_EXT_mesh_shader";
 
         private void CreateDevice()
@@ -1209,15 +1214,15 @@ internal static unsafe partial class VulkanVideoPresenter
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
             var supportsExactFloat16 = VulkanFloat16Support.SupportsExactConversions(_vk, _physicalDevice);
             SetExactFloat16ConversionsCapability(supportsExactFloat16);
-            var supportsNonUniformImageIndexing = descriptorIndexingQuery.ShaderSampledImageArrayNonUniformIndexing &&
-                descriptorIndexingQuery.ShaderStorageImageArrayNonUniformIndexing;
+            var supportsNonUniformImageIndexing = vulkan12Features.ShaderSampledImageArrayNonUniformIndexing &&
+                vulkan12Features.ShaderStorageImageArrayNonUniformIndexing;
             SetNonUniformImageIndexingCapability(supportsNonUniformImageIndexing);
             var supportsBindlessImageHeap = supportsNonUniformImageIndexing &&
-                descriptorIndexingQuery.RuntimeDescriptorArray &&
-                descriptorIndexingQuery.DescriptorBindingPartiallyBound &&
-                descriptorIndexingQuery.DescriptorBindingSampledImageUpdateAfterBind &&
-                descriptorIndexingQuery.DescriptorBindingStorageImageUpdateAfterBind &&
-                descriptorIndexingQuery.DescriptorBindingUpdateUnusedWhilePending &&
+                vulkan12Features.RuntimeDescriptorArray &&
+                vulkan12Features.DescriptorBindingPartiallyBound &&
+                vulkan12Features.DescriptorBindingSampledImageUpdateAfterBind &&
+                vulkan12Features.DescriptorBindingStorageImageUpdateAfterBind &&
+                vulkan12Features.DescriptorBindingUpdateUnusedWhilePending &&
                 supportsNullDescriptor;
             SetBindlessImageHeapCapability(supportsBindlessImageHeap);
             var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
@@ -1283,6 +1288,36 @@ internal static unsafe partial class VulkanVideoPresenter
             var imageViewMinLodExtension = (byte*)SilkMarshal.StringToPtr(ImageViewMinLodExtensionName);
             var fillRectangleExtension = (byte*)SilkMarshal.StringToPtr(FillRectangleExtensionName);
             var meshExtension = (byte*)SilkMarshal.StringToPtr(MeshShaderExtensionName);
+            var nativeMixedExtension = (byte*)SilkMarshal.StringToPtr("VK_NV_framebuffer_mixed_samples");
+            var coverageReductionExtension = (byte*)SilkMarshal.StringToPtr("VK_NV_coverage_reduction_mode");
+            var sampleLocationsExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sample_locations");
+            var postDepthCoverageExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_post_depth_coverage");
+            var samplerFilterMinmaxExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_sampler_filter_minmax");
+            var interlockExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_fragment_shader_interlock");
+            var conservativeExtension = (byte*)SilkMarshal.StringToPtr("VK_EXT_conservative_rasterization");
+            var interlockFeatures = new PhysicalDeviceFragmentShaderInterlockFeaturesEXT
+            {
+                SType = StructureType.PhysicalDeviceFragmentShaderInterlockFeaturesExt,
+            };
+            if (IsDeviceExtensionAvailable("VK_EXT_fragment_shader_interlock") &&
+                Environment.GetEnvironmentVariable("SHARPEMU_POPS_INTERLOCK") != "0")
+            {
+                var interlockQuery = new PhysicalDeviceFeatures2
+                {
+                    SType = StructureType.PhysicalDeviceFeatures2,
+                    PNext = &interlockFeatures,
+                };
+                _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &interlockQuery);
+                _fragmentShaderInterlockEnabled = interlockFeatures.FragmentShaderPixelInterlock;
+            }
+            // Opt-in (SHARPEMU_SAMPLER_MINMAX=1): applying FILTER_MODE min/max made Yotei render large
+            // dark dithered triangles and doubled GPU time; kept for investigation.
+            // Enabling the extension enables samplerFilterMinmax: the guest sampler's FILTER_MODE
+            // (min/max reduction, used by depth-pyramid downsamples) maps to a reduction mode.
+            _samplerFilterMinmaxEnabled = IsDeviceExtensionAvailable("VK_EXT_sampler_filter_minmax") &&
+                Environment.GetEnvironmentVariable("SHARPEMU_SAMPLER_MINMAX") == "1";
+            _conservativeRasterizationEnabled = IsDeviceExtensionAvailable("VK_EXT_conservative_rasterization") &&
+                Environment.GetEnvironmentVariable("SHARPEMU_CONSERVATIVE_RASTER") != "0";
             try
             {
                 var extensions = stackalloc byte*[24];
@@ -1350,6 +1385,34 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_memoryBudgetEnabled)
                 {
                     extensions[extensionCount++] = memoryBudgetExtension;
+                }
+
+                _postDepthCoverageEnabled = IsDeviceExtensionAvailable("VK_EXT_post_depth_coverage");
+                if (_postDepthCoverageEnabled)
+                {
+                    extensions[extensionCount++] = postDepthCoverageExtension;
+                }
+
+                if (_samplerFilterMinmaxEnabled)
+                {
+                    extensions[extensionCount++] = samplerFilterMinmaxExtension;
+                }
+
+                if (_fragmentShaderInterlockEnabled)
+                {
+                    extensions[extensionCount++] = interlockExtension;
+                }
+
+                if (_conservativeRasterizationEnabled)
+                {
+                    extensions[extensionCount++] = conservativeExtension;
+                }
+
+                if (_supportsNativeTwoSampleMixed)
+                {
+                    extensions[extensionCount++] = nativeMixedExtension;
+                    extensions[extensionCount++] = coverageReductionExtension;
+                    extensions[extensionCount++] = sampleLocationsExtension;
                 }
 
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
@@ -1598,19 +1661,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     RemoveSingleFilePipelineCache(singleFilePath);
                 }
             }
-            byte* initialData = null;
-            ulong initialLength = 0;
+            byte[] initialData = [];
             try
             {
                 if (_pipelineCachePath is not null && File.Exists(_pipelineCachePath))
                 {
-                    using var file = File.OpenRead(_pipelineCachePath);
-                    if (!PipelineCacheSignature.TryReadFrom(file, DriverCacheSignature(), out initialData, out initialLength))
+                    if (!PipelineCacheSignature.TryUnwrap(DriverCacheSignature(), File.ReadAllBytes(_pipelineCachePath), out initialData))
                     {
                         Console.Error.WriteLine(
                             $"[LOADER][INFO] Vulkan pipeline cache invalidated: path={_pipelineCachePath} reason=signature-or-hash-mismatch");
-                        initialData = null;
-                        initialLength = 0;
+                        initialData = [];
                     }
                 }
             }
@@ -1620,8 +1680,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"[LOADER][WARN] Vulkan pipeline cache read failed: {exception.Message}");
             }
 
-            Result result;
-            try
+            var result = TryCreatePipelineCache(initialData, out _pipelineCache);
+            if (result != Result.Success && initialData.Length != 0)
             {
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] Vulkan pipeline cache rejected ({result}); rebuilding it.");
@@ -1664,7 +1724,7 @@ internal static unsafe partial class VulkanVideoPresenter
             else
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][INFO] Vulkan pipeline cache ready: path={_pipelineCachePath} initial={initialLength} bytes");
+                    $"[LOADER][INFO] Vulkan pipeline cache ready: path={_pipelineCachePath} initial={initialData.Length} bytes");
             }
         }
 
@@ -1841,34 +1901,39 @@ internal static unsafe partial class VulkanVideoPresenter
             try
             {
                 nuint size = 0;
-                var result = _vk.GetPipelineCacheData(_device, cache, &size, null);
-                if (result != Result.Success || size == 0) return false;
+                var result = _vk.GetPipelineCacheData(
+                    _device,
+                    cache,
+                    &size,
+                    null);
+                if (result != Result.Success || size == 0)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan pipeline cache query failed: result={result} size={size}");
+                    return false;
+                }
+
                 if (size > byteLimit)
                 {
                     if ((_resetPipelineCachePaths ??= new HashSet<string>(StringComparer.Ordinal)).Add(path))
                     {
                         WritePipelineCacheFile(path, []);
-                        Console.Error.WriteLine($"[LOADER][INFO] Vulkan pipeline cache shard outgrew its limit: path={path} bytes={size} limit={byteLimit}");
+                        Console.Error.WriteLine(
+                            $"[LOADER][INFO] Vulkan pipeline cache outgrew its limit; the next launch starts a fresh cache: path={path} bytes={size} limit={byteLimit}");
                     }
+
                     savedBytes = size;
                     return true;
                 }
-                var data = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc(size);
-                try
+
+                var data = new byte[checked((int)size)];
+                fixed (byte* dataPointer = data)
                 {
-                    result = _vk.GetPipelineCacheData(_device, cache, &size, data);
-                    if (result != Result.Success)
-                    {
-                        Console.Error.WriteLine($"[LOADER][WARN] Vulkan pipeline cache export failed: {result}");
-                        return false;
-                    }
-                    var temporaryPath = path + $".{Environment.ProcessId}.tmp";
-                    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-                    using (var file = File.Create(temporaryPath))
-                        PipelineCacheSignature.WriteTo(file, DriverCacheSignature(), data, size);
-                    File.Move(temporaryPath, path, overwrite: true);
-                    savedBytes = size;
-                    return true;
+                    result = _vk.GetPipelineCacheData(
+                        _device,
+                        cache,
+                        &size,
+                        dataPointer);
                 }
 
                 if (result != Result.Success)
@@ -1894,10 +1959,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine($"[LOADER][WARN] Vulkan pipeline cache write failed: {exception.Message}");
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] Vulkan pipeline cache save failed: {exception.Message}");
                 return false;
             }
         }
+
         private void WritePipelineCacheFile(string path, ReadOnlySpan<byte> data)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);

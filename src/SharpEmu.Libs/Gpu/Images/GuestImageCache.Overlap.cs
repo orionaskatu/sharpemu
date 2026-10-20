@@ -852,6 +852,8 @@ public sealed partial class GuestImageCache
         {
             UnwatchImage(association);
         }
+        // A lookup resolved earlier only changes when the association itself does.
+        var associationChanged = record.DepthOwner != depthImageIdentifier;
         record.AssociateDepth(depthImageIdentifier);
         if (associationChanged)
         {

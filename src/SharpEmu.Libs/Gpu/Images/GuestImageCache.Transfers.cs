@@ -751,6 +751,60 @@ public sealed unsafe partial class GuestImageCache
         _tiler.Tile(guestLinear.Buffer, guestLinear.Offset, info.Data.Size, destination.Handle, destinationOffset, info.Data.Size, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tiles));
     }
 
+    private static uint ExpandedColorChannels(CachedImage image) =>
+        image.Backing.Format is Format.R8G8B8A8Srgb or Format.R8G8B8A8Unorm
+            ? image.Description.GuestFormat switch
+            {
+                GuestPixelFormat.Bits8Srgb => 1u,
+                GuestPixelFormat.Bits8_8Srgb => 2u,
+                _ => 0u,
+            }
+            : 0u;
+
+    private static List<BufferImageCopy> ExpandedColorRegions(List<BufferImageCopy> guestRegions, out ulong size)
+    {
+        var result = new List<BufferImageCopy>(guestRegions.Count);
+        size = 0;
+        foreach (var guest in guestRegions)
+        {
+            var wide = guest;
+            wide.BufferOffset = size;
+            var pitch = guest.BufferRowLength == 0 ? guest.ImageExtent.Width : guest.BufferRowLength;
+            var height = guest.BufferImageHeight == 0 ? guest.ImageExtent.Height : guest.BufferImageHeight;
+            size = checked(size + (ulong)pitch * height * 4);
+            result.Add(wide);
+        }
+        return result;
+    }
+
+    private void ConvertExpandedColor(TilerBufferSpan guest, TilerBufferSpan wide,
+        List<BufferImageCopy> guestRegions, List<BufferImageCopy> wideRegions, uint channels, bool widen)
+    {
+        for (var index = 0; index < guestRegions.Count; index++)
+        {
+            var region = guestRegions[index];
+            if (region.ImageExtent.Depth != 1 || region.ImageSubresource.LayerCount != 1)
+                throw SubmissionScheduler.Fatal("Expanded color transfers require one slice per copy region.");
+            var pitch = region.BufferRowLength == 0 ? region.ImageExtent.Width : region.BufferRowLength;
+            var height = region.BufferImageHeight == 0 ? region.ImageExtent.Height : region.BufferImageHeight;
+            var narrowRow = checked((ulong)pitch * channels);
+            var wideRow = checked((ulong)pitch * 4);
+            if (region.BufferOffset > guest.Size || wideRegions[index].BufferOffset > wide.Size)
+                throw SubmissionScheduler.Fatal("Expanded color transfer offset exceeds its buffer span.");
+            var narrow = new TilerBufferSpan(guest.Buffer, checked(guest.Offset + region.BufferOffset), guest.Size - region.BufferOffset);
+            var expanded = new TilerBufferSpan(wide.Buffer, checked(wide.Offset + wideRegions[index].BufferOffset), wide.Size - wideRegions[index].BufferOffset);
+            _tiler.ConvertNarrowColor(widen ? narrow : expanded, widen ? expanded : narrow, channels, widen,
+                new DepthConversionLayout
+                {
+                    Width = region.ImageExtent.Width, Height = region.ImageExtent.Height, Layers = 1,
+                    SourceRowStride = widen ? narrowRow : wideRow,
+                    TargetRowStride = widen ? wideRow : narrowRow,
+                    SourceSliceStride = checked((widen ? narrowRow : wideRow) * height),
+                    TargetSliceStride = checked((widen ? wideRow : narrowRow) * height),
+                });
+        }
+    }
+
     private void DownloadToBuffer(CachedImage image, GpuBuffer destination, ulong destinationOffset, ulong destinationSize, ImageDownloadPlan plan)
     {
         if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-to-buffer", image.Description.Data.Address, image.Description.Data.Size, $"destinationOffset=0x{destinationOffset:X} destinationSize=0x{destinationSize:X}");
@@ -1084,9 +1138,11 @@ public sealed unsafe partial class GuestImageCache
         lock (_publishingDownloads) _publishingDownloads.Add(publishing);
         _scheduler.QueuePriorityCompletionAction(() =>
         {
-            download.Invalidate(offset, range.Size);
-            GpuWritebackEpoch.Advance();
-            var published = download.Mapped.Slice((int)offset, (int)range.Size);
+            try
+            {
+                download.Invalidate(offset, range.Size);
+                GpuWritebackEpoch.Advance();
+                var published = download.Mapped.Slice((int)offset, (int)range.Size);
             if (!backing.TryWriteBacking(range.Address, published) &&
                 !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
             {
@@ -1096,6 +1152,7 @@ public sealed unsafe partial class GuestImageCache
                 {
                     throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
                 }
+            }
             }
             finally
             {

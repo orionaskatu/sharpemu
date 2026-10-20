@@ -16,6 +16,7 @@ public enum ShaderStageKind
     Pixel,
     Compute,
     Mesh,
+    TessellationEvaluation,
 }
 
 public enum ImageResourceClass : byte

@@ -127,9 +127,9 @@ if (args.Length == 4 && args[0] == "--replay-compute")
         ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
         BindingLayout.ReadsShaderBase(program),
         state.GetProperty("PushDataStartDword").GetUInt32(),
-        state.GetProperty("UsesDispatchThreadLimits").GetBoolean(),
-        state.GetProperty("UsesBindlessImages").GetBoolean(),
-        state.TryGetProperty("UsesRuntimeBufferStrides", out var runtimeStrides) && runtimeStrides.GetBoolean());
+        usesDispatchThreadLimits: state.GetProperty("UsesDispatchThreadLimits").GetBoolean(),
+        usesBindlessImages: state.GetProperty("UsesBindlessImages").GetBoolean(),
+        usesRuntimeBufferStrides: state.TryGetProperty("UsesRuntimeBufferStrides", out var runtimeStrides) && runtimeStrides.GetBoolean());
     var request = new ShaderCompileRequest(plan, resources, layout)
     {
         WaveSize = wave,

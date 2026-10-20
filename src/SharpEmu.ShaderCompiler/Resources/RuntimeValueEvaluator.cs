@@ -247,6 +247,40 @@ public sealed class RuntimeValueEvaluator
     internal void RecordPrefetchedConsumer(ScalarValue node, ulong address) =>
         ResourceMaterializationCache.RecordReadConsumer(_plan, node, address);
 
+    // A buffer load past its V# range reads zero without touching memory.
+    private const ulong OutOfRangeRead = ulong.MaxValue;
+
+    // The aligned dword a raw read loads, without loading it; OutOfRangeRead for a buffer
+    // load past its records.
+    internal bool TryResolveRawRead(ScalarValue value, out ulong address, out ulong baseAddress)
+    {
+        address = 0;
+        baseAddress = 0;
+        if (value.Kind is not (ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord) ||
+            value.MemoryIndex >= _plan.Memory.Count)
+        {
+            return false;
+        }
+
+        var memory = _plan.Memory[value.MemoryIndex];
+        if (!TryEvaluateRawBase(value.Operands[0], value.Kind, out baseAddress, out var high, out var records) ||
+            !Operand(value, 1, out var offset))
+        {
+            return false;
+        }
+
+        switch (ResolveRawAddress(value.Kind, baseAddress, high, records, (int)memory.Offset, (uint)offset, out address))
+        {
+            case RawAddress.Failed:
+                return false;
+            case RawAddress.Zero:
+                address = OutOfRangeRead;
+                return true;
+        }
+
+        return true;
+    }
+
     internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate,
         out ulong result, ScalarValue node)
     {

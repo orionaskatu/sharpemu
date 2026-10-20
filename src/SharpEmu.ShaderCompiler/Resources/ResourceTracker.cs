@@ -427,6 +427,93 @@ public sealed partial class ResourceTracker
             (_plan.ValidateRuntimeValue(dword) || DependsOnScalarMemoryWord(dword))) &&
         handle.Operands.Any(DependsOnScalarMemoryWord);
 
+    // Every buffer V# loaded by the shader from memory is read on the GPU at run time (the
+    // descriptors of GPU-driven indirect draws come from memory the GPU itself produces, so a
+    // host-side evaluation at record time reads stale words). The emulator switches it on at start-up
+    // (SHARPEMU_DEVICE_DESCRIPTORS=0 keeps the host evaluation); library users default to off.
+    public static bool ForceDeviceDescriptors { get; set; }
+
+    private static bool DependsOnScalarAddressWord(ScalarValue value)
+    {
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.ScalarAddressWord)
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
+    // TEMP: SHARPEMU_DEVICE_DESCRIPTORS_TABLE=1 also reads V#s assembled from flattened table words on the GPU.
+    private static readonly bool ForceTableDeviceDescriptors = Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DESCRIPTORS_TABLE") == "1";
+
+    private static bool DependsOnResourceTableWord(ScalarValue value)
+    {
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.ResourceTableWord)
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
+    private static bool DependsOnScalarBufferWord(ScalarValue value)
+    {
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.ScalarBufferWord)
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
     private bool HasDeviceRecordCount(ScalarValue? handle) =>
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
         !_plan.ValidateRuntimeValue(handle.Operands[2]) &&

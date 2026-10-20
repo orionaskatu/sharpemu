@@ -242,6 +242,9 @@ public sealed partial class RenderExecutor
         }
     }
 
+    private static int _dbgGrassLogs; // TEMP
+    private static int _dbgHogLogs; // TEMP
+
     // Binds everything the draw needs inside one preparation scope, then records it.
     private string RecordDraw(
         ulong submitId,
@@ -262,7 +265,7 @@ public sealed partial class RenderExecutor
         var vertexInput = state.Programs.VertexInput;
         if (DbgSkipVertexHashes.Count != 0 && DbgSkipVertexHashes.Contains(vertexInput.Stage.Program?.Hash ?? 0)) // TEMP
         {
-            return;
+            return "dbg-skip";
         }
 
         Diagnostics.DbgSequence.Tally("DR", vertexInput.Stage.Program?.Hash ?? 0); // TEMP
@@ -298,12 +301,12 @@ public sealed partial class RenderExecutor
         }
         if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
         {
-            return;
+            return "dbg-skip";
         }
 
         if (DbgBisectSkip(vertexInput.Stage.Program?.Hash ?? 0, state.PixelActive)) // TEMP
         {
-            return;
+            return "dbg-skip";
         }
         var pixelInput = state.Programs.PixelInput;
         var meshInput = state.Programs.MeshInput;

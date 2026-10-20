@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.VideoOut;
+using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
@@ -316,6 +317,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        var dbgT0 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
         var dbgT1 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         if (computeProgram.Consumed)

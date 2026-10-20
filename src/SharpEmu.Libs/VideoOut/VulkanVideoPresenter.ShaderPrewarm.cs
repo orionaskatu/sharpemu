@@ -117,7 +117,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     while (!_shaderPrewarmStopping && work.TryDequeue(out var item))
                     {
-                        if (PrewarmComputePipeline(item.Record, item.Code, compiler, sharedInt64Atomics, execGuardElision))
+                        if (PrewarmComputePipeline(item.Record, item.Code, compiler, host))
                         {
                             _shaderPrewarmCompleted.Enqueue(ShaderPrewarmList.Identity(item.Record));
                         }

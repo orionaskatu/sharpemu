@@ -359,6 +359,23 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint MemoryOffsetCount { get; init; }
     public bool UsesDispatchThreadLimits { get; init; }
     public bool UsesMeshDrawParameters { get; init; }
+    public bool UsesTessellationData { get; init; }
+
+    // The host writes each buffer's descriptor stride into shader data (two 16-bit halves
+    // per dword) and the shader indexes with it, so the stride is not compiled in: one
+    // program serves every stride a title binds instead of one compile per stride.
+    public bool UsesRuntimeBufferStrides { get; init; }
+    // Vulkan can put image arrays in one persistent descriptor set. The per-draw
+    // flattened table then starts with the local-image -> heap-slot mapping.
+    public bool UsesBindlessImages { get; init; }
+
+    // The module reads the internal-resolution dwords: the factor that maps a guest pixel
+    // onto host texels, its reciprocal, the mask of scaled image resources and the factor
+    // the pixel position is divided by.
+    public bool UsesRenderScale { get; init; }
+
+    // The pixel module writes an object/primitive ID target and reads the draw's object ID.
+    public bool UsesObjectId { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
 
@@ -374,10 +391,6 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     public uint TessellationDataDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
     public uint RenderScaleDword => TessellationDataDword + (UsesTessellationData ? Gen5TessellationData.DwordCount : 0u);
-
-    public uint ObjectIdDword => MipStatisticsDword + MipStatisticsCount;
-
-    public uint ShaderDataDwordCount => ObjectIdDword + (UsesObjectId ? 1u : 0u);
 
     public static uint ImageSlotTableDwordCount(ShaderResourceInfo info)
     {
@@ -395,11 +408,13 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     // One dword per image resource: the LOD statistics counter the pixel program reports into.
     public uint MipStatisticsCount { get; init; }
 
-    public uint MipStatisticsDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+    public uint MipStatisticsDword => RenderScaleDword + (UsesRenderScale ? RenderScaleDwordCount : 0u);
 
     public uint MeshDrawParametersDword => MipStatisticsDword + MipStatisticsCount;
 
-    public uint ShaderDataDwordCount => MeshDrawParametersDword + (UsesMeshDrawParameters ? 6u : 0u);
+    public uint ObjectIdDword => MeshDrawParametersDword + (UsesMeshDrawParameters ? 6u : 0u);
+
+    public uint ShaderDataDwordCount => ObjectIdDword + (UsesObjectId ? 1u : 0u);
 
     public bool UsesPushData => PushDataStartDword != PushData.NoStart;
 
@@ -634,7 +649,12 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesShaderBase,
         uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false,
-        bool usesMeshDrawParameters = false)
+        bool usesMeshDrawParameters = false,
+        bool usesRenderScale = false,
+        bool usesBindlessImages = false,
+        bool usesRuntimeBufferStrides = false,
+        bool usesTessellationData = false,
+        bool usesObjectId = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
@@ -642,8 +662,10 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         usesRuntimeBufferStrides &= memoryOffsetCount != 0;
         var mipStatisticsCount = info.Images.Any(static image => image.MipStatistics) ? (uint)info.Images.Count : 0u;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 +
-            (usesDispatchThreadLimits ? 3u : 0u) + mipStatisticsCount + (usesMeshDrawParameters ? 6u : 0u);
-        var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
+            (usesRuntimeBufferStrides ? (memoryOffsetCount + 1) / 2 : 0u) + (usesDispatchThreadLimits ? 3u : 0u) +
+            (usesTessellationData ? Gen5TessellationData.DwordCount : 0u) + (usesRenderScale ? RenderScaleDwordCount : 0u) +
+            mipStatisticsCount + (usesMeshDrawParameters ? 6u : 0u) + (usesObjectId ? 1u : 0u);
+        var pushStart = usesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataStartDword, shaderDataDwords);
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
         {
@@ -746,6 +768,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             // the persistent image heap.
             UsesBindlessImages = usesBindlessImages,
             UsesRenderScale = usesRenderScale,
+            UsesObjectId = usesObjectId,
             MipStatisticsCount = mipStatisticsCount,
             UsesMeshDrawParameters = usesMeshDrawParameters,
             UserDataRegisters = userDataRegisters,
@@ -765,6 +788,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         UsesRuntimeBufferStrides == other.UsesRuntimeBufferStrides &&
         UsesBindlessImages == other.UsesBindlessImages &&
         UsesRenderScale == other.UsesRenderScale &&
+        UsesObjectId == other.UsesObjectId &&
         MipStatisticsCount == other.MipStatisticsCount &&
         UsesMeshDrawParameters == other.UsesMeshDrawParameters &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
@@ -801,9 +825,11 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a mesh shader can use mesh draw parameters.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare,
-            usesFlattenedTable, usesShaderBase, layout.AllocationCursor,
-            layout.UsesDispatchThreadLimits, layout.UsesMeshDrawParameters);
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable,
+            usesShaderBase, layout.AllocationCursor, usesDispatchThreadLimits: layout.UsesDispatchThreadLimits,
+            usesMeshDrawParameters: layout.UsesMeshDrawParameters, usesRenderScale: layout.UsesRenderScale,
+            usesBindlessImages: layout.UsesBindlessImages, usesRuntimeBufferStrides: layout.UsesRuntimeBufferStrides,
+            usesTessellationData: layout.UsesTessellationData, usesObjectId: layout.UsesObjectId);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

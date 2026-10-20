@@ -46,6 +46,8 @@ public sealed class StageCompileOptions
     public ComputeInputInfo? ComputeInfo { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
     public MeshDrawConfiguration? MeshInfo { get; init; }
+    public Gen5TessellationInfo? Tessellation { get; init; }
+    public Gen5TessellationHullInfo? TessellationHull { get; init; }
 }
 
 // The key of a program entry: what the emitter reads besides the resource specialization.
@@ -198,6 +200,22 @@ internal sealed class ShaderProgramCache
     public int ProgramCount => _programs.Count;
 
     public IEnumerable<ProgramSourceEntry> Entries => _programs.Values.Concat(_linkedPrograms.Values);
+
+    private readonly Dictionary<(BindingLayout Layout, Gen5TessellationDomain Domain), (ShaderProgram Vertex, ShaderProgram Control)> _tessellationBridges = [];
+
+    public (ShaderProgram Vertex, ShaderProgram Control) GetTessellationBridge(BindingLayout layout, Gen5TessellationDomain domain)
+    {
+        if (_tessellationBridges.TryGetValue((layout, domain), out var bridge)) return bridge;
+        var shaders = _compiler.CompileTessellationBridge(layout, domain);
+        ShaderProgram Create(IGuestCompiledShader shader, ShaderStage stage)
+        {
+            var id = ++_nextProgramId;
+            return new(id, _host.CreateShaderModule(shader, stage, 0, id));
+        }
+        bridge = (Create(shaders.Vertex, ShaderStage.Vertex), Create(shaders.Control, ShaderStage.TessellationEvaluation));
+        _tessellationBridges.Add((layout, domain), bridge);
+        return bridge;
+    }
 
     // The decoded instructions of a program, shared by every static variant of the same code.
     public Gen5ShaderProgram Decode(ShaderSource source)
@@ -992,7 +1010,8 @@ internal sealed class ShaderProgramCache
             _host, usesTessellationData, usesObjectId);
 
     private static BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
-        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, bool usesMeshDrawParameters = false) =>
+        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, ShaderStage stage = ShaderStage.Vertex,
+        IShaderPipelineHost? host = null, bool usesTessellationData = false, bool usesObjectId = false, bool usesMeshDrawParameters = false) =>
         BindingLayout.Allocate(
             resources.Info,
             BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount, plan.Graph.ExcludedUserDataRegisters),
@@ -1001,10 +1020,50 @@ internal sealed class ShaderProgramCache
             BindingLayout.ReadsShaderBase(program),
             pushDataCursor,
             usesDispatchThreadLimits: usesDispatchThreadLimits,
-            usesMeshDrawParameters: usesMeshDrawParameters);
+            usesMeshDrawParameters: usesMeshDrawParameters,
+            usesBindlessImages: host?.UsesBindlessImages ?? false,
+            usesRuntimeBufferStrides: host?.RuntimeBufferStridesEnabled ?? false,
+            usesTessellationData: usesTessellationData,
+            usesObjectId: usesObjectId,
+            // A pixel program reads its position in guest pixels; any program that samples or
+            // fetches an image needs to know which of them the host holds at another size.
+            usesRenderScale: Images.RenderScalePolicy.Enabled &&
+                             (stage == ShaderStage.Pixel || resources.Info.Images.Count != 0));
+
+    // TEMP: SHARPEMU_DBG_GENERIC_FORMATS=1 decodes formatted buffer accesses from the live descriptor at run time.
+    private static readonly bool DbgGenericFormats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_GENERIC_FORMATS") == "1";
+
+    // TEMP: SHARPEMU_DBG_COOP_WAVE64=hash,... compiles those wave64 compute programs with the cooperative half-wave
+    // model (shared-memory exchange) instead of native 64-lane subgroups, to compare the two.
+    private static readonly HashSet<ulong> DbgCooperativeHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_COOP_WAVE64") ?? "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(text => Convert.ToUInt64(text.Replace("0x", ""), 16)).ToHashSet();
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, IShaderPipelineHost host) =>
+        new(plan, resources, layout)
+        {
+            WaveSize = info.WaveSize, ForceGenericBufferFormats = DbgGenericFormats,
+            HostWave64Supported = info.WaveSize == 64 && host.ComputeWave64SubgroupNative,
+            HostComputeSubgroup32 = info.WaveSize == 64 && !host.ComputeWave64SubgroupNative && host.ComputeRunsOn32LaneSubgroups(info),
+            EnableExecGuardElision = info.WaveSize != 64 || host.ExecGuardElisionEnabled,
+            IeeeMode = info.IeeeMode,
+            TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
+            ScratchDwords = info.ScratchDwords,
+            SupportsSharedInt64Atomics = host.SharedInt64AtomicsEnabled,
+            SupportsExactFloat16Conversions = host.ExactFloat16ConversionsEnabled,
+            FastFloat16Arithmetic = host.ExactFloat16ConversionsEnabled && !ExactFloat16Arithmetic,
+            SupportsNonUniformImageIndexing = host.NonUniformImageIndexingEnabled,
+            ShaderSignedZeroInfNanPreserveFloat32Supported = host.ShaderSignedZeroInfNanPreserveFloat32Supported,
+            ComputeSystemRegisters = systemRegisters,
+            LocalDataShareDwords = info.LocalDataShareDwords,
+            LocalSizeX = Math.Max(info.ThreadsX, 1),
+            LocalSizeY = Math.Max(info.ThreadsY, 1),
+            LocalSizeZ = Math.Max(info.ThreadsZ, 1),
+        };
+
+    private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
+        ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool execGuardElision,
+        bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false) =>
         new(plan, resources, layout)
         {
             WaveSize = info.WaveSize,
@@ -1014,11 +1073,8 @@ internal sealed class ShaderProgramCache
             IeeeMode = info.IeeeMode,
             TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
             ScratchDwords = info.ScratchDwords,
-            SupportsSharedInt64Atomics = host.SharedInt64AtomicsEnabled,
-            SupportsExactFloat16Conversions = host.ExactFloat16ConversionsEnabled,
-            FastFloat16Arithmetic = host.ExactFloat16ConversionsEnabled && !ExactFloat16Arithmetic,
-            SupportsNonUniformImageIndexing = host.NonUniformImageIndexingEnabled,
-            ShaderSignedZeroInfNanPreserveFloat32Supported = host.ShaderSignedZeroInfNanPreserveFloat32Supported,
+            SupportsSharedInt64Atomics = sharedInt64Atomics,
+            ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
             ComputeSystemRegisters = systemRegisters,
             LocalDataShareDwords = info.LocalDataShareDwords,
             LocalSizeX = Math.Max(info.ThreadsX, 1),
@@ -1045,6 +1101,35 @@ internal sealed class ShaderProgramCache
                 record.Info.DispatchThreadDimensions, ShaderStage.Compute, host);
             var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
                 host);
+            return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
+        bool sharedInt64Atomics, bool execGuardElision, bool signedZeroInfNanPreserve, out IGuestCompiledShader? compiled,
+        out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false)
+    {
+        compiled = null;
+        layout = null;
+        try
+        {
+            if (!Gen5ShaderTranslator.TryDecodeProgram(code.CreateContext(), code.Address, out var program, out error))
+            {
+                return false;
+            }
+
+            var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, record.Hash, record.UserDataBase, record.UserDataCount,
+                waveSize: record.Info.WaveSize);
+            var resources = ResourceMaterializer.ApplyTo(plan, record.Specialization);
+            layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
+                record.Info.DispatchThreadDimensions);
+            var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
+                sharedInt64Atomics, execGuardElision, signedZeroInfNanPreserve, hostWave64Supported, hostComputeSubgroup32);
             return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
         }
         catch (Exception exception)

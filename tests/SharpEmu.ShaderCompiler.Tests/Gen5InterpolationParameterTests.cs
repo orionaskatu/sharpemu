@@ -515,7 +515,8 @@ public sealed class Gen5InterpolationParameterTests
 
     private static ShaderCompileRequest Request(
         uint selector, bool custom, uint inputs = 2, string opcode = "VInterpMovF32",
-        uint inputCntl = 0x401, bool supportsPerVertex = true, uint? enabledInputs = null)
+        uint inputCntl = 0x401, bool supportsPerVertex = true, uint? enabledInputs = null,
+        uint? fixedSample = null, bool earlyTests = false)
     {
         var interpolation = new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vintrp, opcode,
             [selector], [Gen5Operand.Vector(selector)], [Gen5Operand.Vector(4)], new Gen5InterpolationControl(1, 2));
@@ -525,6 +526,8 @@ public sealed class Gen5InterpolationParameterTests
         {
             PixelInputAddress = inputs,
             PixelInputEnable = enabledInputs ?? inputs,
+            PixelInterpolationSample = fixedSample,
+            EarlyFragmentTests = earlyTests,
             PixelInputCntl = [0, inputCntl],
             PixelCustomInterpolationMask = custom ? 2u : 0u,
             SupportsPerVertexPixelInputs = supportsPerVertex,

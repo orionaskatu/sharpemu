@@ -286,7 +286,6 @@ public sealed class ShaderCompileRequest
     public bool PrimitiveOrderedInterlock { get; init; }
     // Samples excluded from triggering guest fragment execution after early depth/stencil tests.
     public uint PixelShaderSampleExclusionMask { get; init; }
-    public bool PixelDepthExportEnable { get; init; }
     public bool PixelSampleMaskExportEnable { get; init; }
     public uint PixelMaskExportSamples { get; init; } = 1;
     public uint PixelRasterizationSamples { get; init; } = 1;

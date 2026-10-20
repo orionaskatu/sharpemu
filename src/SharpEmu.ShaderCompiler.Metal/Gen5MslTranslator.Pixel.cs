@@ -562,14 +562,13 @@ public static partial class Gen5MslTranslator
                 if (export.Compressed)
                 {
                     var packed = $"v[{instruction.Sources[component >> 1].Value}]";
-                    var bits = $"(({packed} >> {(component & 1) * 16}) & 0xffffu)";
-                    var decoded = binding.Value.ExportFormat switch
+                    var half = $"(float)as_type<half2>({packed})[{component & 1}]";
+                    values[component] = binding.Value.Kind switch
                     {
                         Gen5PixelOutputKind.Uint => $"uint(as_type<ushort2>({packed})[{component & 1}])",
                         Gen5PixelOutputKind.Sint => $"int(as_type<short2>({packed})[{component & 1}])",
                         _ => half,
                     };
-                    values[component] = $"{componentType}({decoded})";
                     continue;
                 }
 

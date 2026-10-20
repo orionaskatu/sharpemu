@@ -693,7 +693,6 @@ internal static unsafe partial class VulkanVideoPresenter
                 for (var layer = view.BaseLayer; layer < view.BaseLayer + view.LayerCount; layer++)
                 {
                     if (ImageClearTrace.Enabled) _imageCache.TraceVolumeClear("before-sampled-decision", binding.Request, image, $"layer={layer}");
-                    var tracked = _imageCache.IsMetadataCleared(metadataAddress, layer, out var metadataValue) && (byte)metadataValue == DccClearToZero;
                     var clearValue = default(ClearColorValue);
                     var tracked = _imageCache.IsMetadataCleared(metadataAddress, layer, out var metadataValue) &&
                         TryDecodeDccClear((byte)metadataValue, false, (byte)metadataValue == DccClearToZero || fixedClearSupported, default, out clearValue);
@@ -1266,6 +1265,32 @@ internal static unsafe partial class VulkanVideoPresenter
             CountDraw();
         }
 
+        void IRenderHost.DrawIndirect(BufferBinding arguments)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var command = BeginBatchedGuestCommands();
+            if (_boundGraphicsPipeline is { RectangleList: true } entry)
+            {
+                // The count is unknown here, so neither the single-rectangle strip nor a
+                // count check for native rectangles applies.
+                if (CanDrawNativeRectangles)
+                {
+                    BindNativeRectangleList(entry, command);
+                }
+                else
+                {
+                    BindRectangleListVariant(entry, strip: false, command);
+                }
+            }
+
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
+            _occlusionQueries?.TraceDraw();
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
+                _boundGraphicsPipeline?.Id ?? 0, 0, 0);
+            CountDraw();
+        }
+
         void IRenderHost.DrawMeshTasks(uint groupCountX, uint groupCountY, uint groupCountZ)
         {
             if (_cmdDrawMeshTasks is null)
@@ -1282,31 +1307,6 @@ internal static unsafe partial class VulkanVideoPresenter
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.MeshDraw,
                 _boundGraphicsPipeline?.Id ?? 0, groupCountX, groupCountY, groupCountZ,
                 _profileMeshDrawState with { Width = _renderingState.Width, Height = _renderingState.Height });
-            CountDraw();
-        }
-
-        public void Dispatch(uint groupsX, uint groupsY, uint groupsZ)
-        {
-            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
-            var command = BeginBatchedGuestCommands();
-            if (_boundGraphicsPipeline is { RectangleList: true } entry)
-            {
-                // The count is unknown here, so neither the single-rectangle strip nor a
-                // count check for native rectangles applies.
-                if (_supportsFillRectangle)
-                {
-                    BindNativeRectangleList(entry, command);
-                }
-                else
-                {
-                    BindRectangleListVariant(entry, strip: false, command);
-                }
-            }
-
-            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
-            _vk.CmdDrawIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 16);
-            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
-                _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
         }
 

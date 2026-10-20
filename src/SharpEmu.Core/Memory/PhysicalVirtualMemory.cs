@@ -143,7 +143,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private GuestSpaceOwner? _backedSpace;
 
     public PhysicalVirtualMemory(IHostMemory? hostMemory = null, IHostViewMemory? viewHost = null,
-        ulong backingBytes = GuestMemoryLayout.BackingBytes, bool preReserveGuestAddressSpace = false,
+        ulong backingBytes = 0, bool preReserveGuestAddressSpace = false,
         bool adoptStartupAddressReservations = false)
     {
         _hostMemory = hostMemory ?? CrossPlatformHostMemory.Instance;
@@ -160,7 +160,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             HostAddressRange? startupReservation = adoptStartupAddressReservations
                 ? new HostAddressRange(WindowsGuestAddressReservation.DataStart, WindowsGuestAddressReservation.DataSize)
                 : null;
-            _backedSpace = new GuestSpaceOwner(viewHost, backingBytes, preReserveGuestAddressSpace, startupReservation);
+            _backedSpace = new GuestSpaceOwner(viewHost, backingBytes == 0 ? GuestMemoryLayout.BackingBytes : backingBytes, preReserveGuestAddressSpace, startupReservation);
             RunBackingSelfTest();
         }
     }

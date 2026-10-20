@@ -78,6 +78,10 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public ImageDescription Description;
     internal SurfaceMetadata? MetadataRegistration;
+    // The host resolution multiplier of this image. Guest geometry in Description never
+    // changes; only the backing is larger or smaller, and guest bytes move through a
+    // guest-resolution twin (CachedImage.Transfers).
+    public readonly float RenderScale = 1.0f;
     public readonly ImageBacking Backing = new();
     public readonly List<CachedImageView> Views = new();
     private readonly Dictionary<(uint Width, uint Height), CachedImage> _stencilStorageImages = new();
@@ -92,7 +96,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     public int RecencyEntryIndex;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
-        ImageBackingPool? pool = null, Action? reportAllocationFailure = null)
+        ImageBackingPool? pool = null, Action? reportAllocationFailure = null,
+        OptimalImageMemoryPool? memoryPool = null, Func<string>? memoryDiagnostics = null, bool allowScaling = true)
     {
         _device = device;
         _scheduler = scheduler;
@@ -221,6 +226,13 @@ public sealed unsafe partial class CachedImage : IDisposable
         Backing.AllocationSize = requirements.Size;
     }
 
+    private void ReleaseMemory()
+    {
+        if (_memoryPlacement is { } placement) _memoryPool!.Free(placement);
+        else _device.FreeMemory(Backing.Memory);
+        _memoryPlacement = null;
+    }
+
     private static Exception CreateFailure(in ImageCreateInfo create, string operation, Result result,
         ulong allocationSize = 0, uint memoryTypeBits = 0) =>
         SubmissionScheduler.Fatal(
@@ -228,6 +240,9 @@ public sealed unsafe partial class CachedImage : IDisposable
             $"extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={create.Format}({(int)create.Format}) " +
             $"layers={create.ArrayLayers} levels={create.MipLevels} usage=0x{(uint)create.Usage:X} flags=0x{(uint)create.Flags:X} " +
             $"samples={create.Samples} allocation_bytes={allocationSize} memory_type_bits=0x{memoryTypeBits:X}.");
+
+    // The device ran out of memory for the image's backing. Nothing was left allocated.
+    internal sealed class ImageOutOfMemoryException(string message) : Exception(message);
 
     internal static bool TrySelectSupportedImageConfiguration(IImageFormatSupport device, ref ImageCreateInfo configuration, bool allowCompressedImageFallback)
     {
