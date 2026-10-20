@@ -649,12 +649,12 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesShaderBase,
         uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false,
-        bool usesMeshDrawParameters = false,
         bool usesRenderScale = false,
         bool usesBindlessImages = false,
         bool usesRuntimeBufferStrides = false,
         bool usesTessellationData = false,
-        bool usesObjectId = false)
+        bool usesObjectId = false,
+        bool usesMeshDrawParameters = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
