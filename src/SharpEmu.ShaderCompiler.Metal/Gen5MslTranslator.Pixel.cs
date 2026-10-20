@@ -565,11 +565,9 @@ public static partial class Gen5MslTranslator
                     var bits = $"(({packed} >> {(component & 1) * 16}) & 0xffffu)";
                     var decoded = binding.Value.ExportFormat switch
                     {
-                        Gen5PixelExportFormat.Unorm16 => $"(float({bits}) / 65535.0f)",
-                        Gen5PixelExportFormat.Snorm16 => $"max(float(as_type<short>(ushort({bits}))) / 32767.0f, -1.0f)",
-                        Gen5PixelExportFormat.Uint16 => bits,
-                        Gen5PixelExportFormat.Sint16 => $"int(as_type<short>(ushort({bits})))",
-                        _ => $"(float)as_type<half2>({packed})[{component & 1}]",
+                        Gen5PixelOutputKind.Uint => $"uint(as_type<ushort2>({packed})[{component & 1}])",
+                        Gen5PixelOutputKind.Sint => $"int(as_type<short2>({packed})[{component & 1}])",
+                        _ => half,
                     };
                     values[component] = $"{componentType}({decoded})";
                     continue;

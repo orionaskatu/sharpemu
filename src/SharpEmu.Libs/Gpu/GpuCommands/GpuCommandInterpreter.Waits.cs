@@ -29,7 +29,13 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
-        var value = ReadWaitOperand(address, is64Bit);
+        // A deferred label is visible here at once; guest CPU threads see it after the dump before it.
+        if (!_host.TryReadDeferredLabel(QueueId, address, is64Bit ? 8UL : 4UL, out var deferred, out var value))
+        {
+            Suspend();
+            return;
+        }
+        if (!deferred) value = ReadWaitOperand(address, is64Bit);
         if (!WaitOperation.TryCompare(value, reference, mask, compareFunction, out var satisfied))
         {
             throw _host.Fatal($"The wait compare function is unknown: function={compareFunction} address=0x{address:X16}.");
@@ -85,11 +91,49 @@ public sealed partial class GpuCommandInterpreter
                     1 => value == 0,
                     _ => throw _host.Fatal($"The predication condition is unknown: condition=0x{condition:X8} address=0x{address:X16}."),
                 };
+                TracePredication(condition, waitOperation, address, value);
+                VisibilityResultTrace.Predicate(QueueId, SubmitId, address, value, condition, waitOperation, PredicateSkip);
                 break;
             }
 
             default:
                 throw _host.Fatal($"The predication operation is unknown: operation=0x{operation:X8} address=0x{address:X16}.");
+        }
+    }
+
+    private static long _predicationTraceCount;
+    private readonly Queue<(ulong Address, ulong Value, long Evaluation, long Timestamp)> _skippedPredicates = new();
+
+    // Each evaluation decides which later predicated packets run; see docs/image-clear-tracing.md.
+    private void TracePredication(uint condition, uint waitOperation, ulong address, ulong value)
+    {
+        if (!Images.ImageClearTrace.Enabled) return;
+        var evaluation = Interlocked.Increment(ref _predicationTraceCount);
+        RecheckSkippedPredicates(evaluation);
+        if (evaluation > 256) return;
+        Console.Error.WriteLine($"[GPU][TRACE] Predication address=0x{address:X16} value=0x{value:X16} condition={condition} " +
+            $"wait={waitOperation} skip={PredicateSkip} evaluation={evaluation}");
+        if (evaluation <= 32) _host.TraceWritersOf($"predicate=0x{address:X16}", address, sizeof(ulong));
+        if (PredicateSkip && _skippedPredicates.Count < 64)
+            _skippedPredicates.Enqueue((address, value, evaluation, System.Diagnostics.Stopwatch.GetTimestamp()));
+    }
+
+    // A value that changes after its evaluation shows a writer that ran too late for the skip decision.
+    private void RecheckSkippedPredicates(long evaluation)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        for (var remaining = _skippedPredicates.Count; remaining > 0; remaining--)
+        {
+            var entry = _skippedPredicates.Dequeue();
+            var current = _host.TryReadGuest(entry.Address, bytes) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes) : entry.Value;
+            if (current != entry.Value)
+            {
+                var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(entry.Timestamp).TotalMilliseconds;
+                Console.Error.WriteLine($"[GPU][TRACE] PredicationChanged address=0x{entry.Address:X16} evaluated=0x{entry.Value:X16} " +
+                    $"now=0x{current:X16} evaluation={entry.Evaluation} laterEvaluations={evaluation - entry.Evaluation} elapsedMs={elapsed:F3}");
+                continue;
+            }
+            if (evaluation - entry.Evaluation < 64) _skippedPredicates.Enqueue(entry);
         }
     }
 
@@ -173,49 +217,9 @@ public sealed partial class GpuCommandInterpreter
                 $"address=0x{address:X16} count={executeCount} remaining={packet.Remaining}.");
         }
 
-        // The host queue runs every packet in order, so a block of markers and memory waits only
-        // orders work against CPU-written labels. Its GPU-written predicate is not worth draining
-        // the queue for; the value the CPU last saw decides.
-        var predicate = !DbgCondSync && OnlyOrdersWork(packet.PacketAddress + 4u * (1 + payloadDwords), executeCount)
-            ? ReadUnsynchronizedDword(address)
-            : ReadDword(address);
-        if (SharpEmu.Libs.Diagnostics.DbgSequence.Active) // TEMP
-            SharpEmu.Libs.Diagnostics.DbgSequence.Note($"COND_EXEC addr=0x{address:X} value=0x{predicate:X} skipDwords={(predicate == 0 ? executeCount : 0)} blockDwords={executeCount}");
-        return predicate == 0 ? payloadDwords + executeCount : payloadDwords;
-    }
-
-    private static readonly bool DbgCondSync = Environment.GetEnvironmentVariable("SHARPEMU_DBG_COND_SYNC") == "1"; // TEMP
-
-    private uint ReadUnsynchronizedDword(ulong address)
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(uint)];
-        return _host.Memory.TryRead(address, bytes)
-            ? BinaryPrimitives.ReadUInt32LittleEndian(bytes)
-            : ReadDword(address);
-    }
-
-    private bool OnlyOrdersWork(ulong blockAddress, uint dwords)
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(uint)];
-        for (var offset = 0u; offset < dwords;)
-        {
-            if (!_host.Memory.TryRead(blockAddress + 4u * offset, bytes))
-            {
-                return false;
-            }
-
-            var header = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
-            if (PacketHeader.PacketType(header) != 3 || PacketHeader.Opcode(header) != PacketOpcode.Nop ||
-                PacketHeader.CustomCode(header) is not (PacketCustomCode.PushMarker or PacketCustomCode.PopMarker or
-                    PacketCustomCode.WaitMemory32 or PacketCustomCode.WaitMemory64))
-            {
-                return false;
-            }
-
-            offset += PacketHeader.Length(header);
-        }
-
-        return true;
+        if (ReadDword(address) != 0) return payloadDwords;
+        TraceSkippedPackets("conditional-execute", packet.PacketAddress + (payloadDwords + 1) * sizeof(uint), executeCount, (uint)address);
+        return payloadDwords + executeCount;
     }
 
     internal uint SetPredicationPacket(in PacketContext packet, ReadOnlySpan<uint> payload)

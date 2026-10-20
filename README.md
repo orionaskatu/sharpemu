@@ -82,19 +82,25 @@ This project is developed purely for research and educational purposes. There ar
 SharpEmu focuses exclusively on the PlayStation 5.  
 Our goal is **not** to emulate PS4 games, as there is already an excellent emulator dedicated to that platform: **ShadPS4**.
 
-## Games Tested
+## Selected Games
+
+A selection of games tested with SharpEmu. This is not an exhaustive list of supported titles.
 
 |               Demon's Souls Remake                   |                     ASTRO BOT                        |
 | :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
 | ![DeS screenshot](./.github/images/demons-souls.jpg) | ![Astro Bot](./.github/images/astro-bot.jpg) |
 
-|                  ASTRO's PLAYROOM                    |                 Dead Cells                    |
+|                  ASTRO's PLAYROOM                    |                 Gran Turismo 7                    |
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Astro's Playroom](./.github/images/astros-playroom.jpg) | ![Dead Cells](./.github/images/dead-cells.jpg) |
+| ![Astro's Playroom](./.github/images/astros-playroom.jpg) | ![GT7](./.github/images/gt7.jpg) |
 
 |                  God of War: Sons of Sparta                    |                 Tomb Raider V Remastered                    |
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
 | ![GoW SOS](./.github/images/gow-sos.jpg) | ![Tomb Raider V](./.github/images/tomb-raider-v-remastered.jpg) |
+
+<p align="center">
+  <a href="https://sharpemu.app/compatibility/" target="_blank"><strong><i>And more..</i></strong></a>
+</p>
 
 ## Status
 
@@ -131,6 +137,8 @@ You can set them per game or globally in the GUI, or pass them directly through 
 
 A Vulkan-capable GPU and current graphics driver are required. The macOS
 release includes the MoltenVK Vulkan implementation.
+
+See [Game patches](docs/patches.md) for downloading, enabling and writing game patches.
 
 > [!IMPORTANT]  
 > This project does **not** support or condone piracy.  

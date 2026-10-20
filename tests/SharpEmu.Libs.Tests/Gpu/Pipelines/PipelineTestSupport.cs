@@ -32,6 +32,8 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
 
     public List<(ShaderStage Stage, ulong Hash, ulong ProgramId)> Modules { get; } = new();
 
+    public List<IGuestCompiledShader> CompiledShaders { get; } = new();
+
     public List<GraphicsPipelineDescription> GraphicsPipelines { get; } = new();
 
     public List<ComputePipelineDescription> ComputePipelines { get; } = new();
@@ -45,12 +47,10 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
     public bool GraphicsSubgroupOperationsEnabled => true;
 
     public bool SharedInt64AtomicsEnabled => false;
-    public bool PostDepthCoverageSupported { get; set; }
+    public bool MeshShadersSupported { get; set; }
 
-    public bool ExactFloat16ConversionsEnabled { get; set; }
-    public bool NonUniformImageIndexingEnabled { get; set; }
-    public bool RuntimeBufferStridesEnabled { get; set; }
-    public bool UsesBindlessImages { get; set; }
+    public MeshShaderLimits MeshLimits { get; set; }
+    public uint MeshSubgroupSize { get; set; } = 32;
 
     public ShaderPrewarmList? ShaderPrewarm { get; set; }
 
@@ -81,6 +81,7 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
     public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
     {
         Modules.Add((stage, hash, programId));
+        CompiledShaders.Add(shader);
         return _nextHandle++;
     }
 
@@ -130,6 +131,8 @@ internal sealed class FakeShaderCompiler(Func<ShaderCompileRequest, byte[]>? com
     public int Compilations { get; private set; }
 
     public string BackendName => "Fake";
+
+    public bool LinkedShaderCallsSupported { get; set; } = true;
 
 
     public bool TryCompileProgram(ShaderCompileRequest request, out IGuestCompiledShader? shader, out string error)

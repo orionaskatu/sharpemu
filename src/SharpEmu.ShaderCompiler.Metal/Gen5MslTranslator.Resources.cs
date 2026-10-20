@@ -19,9 +19,15 @@ public static partial class Gen5MslTranslator
     public static bool TryCompileProgram(ShaderCompileRequest request, out Gen5MslShader shader, out string error)
     {
         shader = default!;
-        if (request.Stage == ShaderStage.TessellationEvaluation || request.CooperativeWave64Workgroup)
+        if (request.Stage == ShaderStage.Mesh)
         {
-            error = "The Metal backend does not yet support native tessellation evaluation or cooperative wave64 workgroups.";
+            error = "Metal does not support mesh shaders.";
+            return false;
+        }
+        if (request.Program.Instructions.Any(instruction => instruction.Opcode == "SSwappcB64" ||
+            instruction.Control is ShaderCallMatchControl or ShaderCallEntryControl or ShaderCallFaultControl))
+        {
+            error = "Metal does not support linked shader calls.";
             return false;
         }
         try
@@ -29,7 +35,8 @@ public static partial class Gen5MslTranslator
             BindingLayoutValidator.Validate(
                 request.Bindings,
                 request.Resources.Info,
-                BindingLayout.CollectUserDataRegisters(request.Program, request.UserDataBase, request.UserDataCount),
+                BindingLayout.CollectUserDataRegisters(request.Program, request.UserDataBase, request.UserDataCount,
+                    request.ExcludedUserDataRegisters),
                 request.UsesGlobalDataShare,
                 request.UsesFlattenedTable,
                 request.ReadsShaderBase,
@@ -666,7 +673,7 @@ public static partial class Gen5MslTranslator
             }
 
             var classElements = imageClass.Resources.ToList();
-            var element = classElements.IndexOf((uint)resourceIndex);
+            var element = classElements.IndexOf(info.GetCanonicalImageBinding((uint)resourceIndex));
             if (element < 0)
             {
                 return false;
@@ -774,7 +781,7 @@ public static partial class Gen5MslTranslator
                 return false;
             }
 
-            var element = imageClass.Resources.ToList().IndexOf((uint)resourceIndex);
+            var element = imageClass.Resources.ToList().IndexOf(info.GetCanonicalImageBinding((uint)resourceIndex));
             if (element < 0)
             {
                 error = $"image {resourceIndex} is not an element of {bindingKind.Value}";
@@ -819,7 +826,9 @@ public static partial class Gen5MslTranslator
                     return false;
                 }
 
-                samplerName = Temp("sampler", $"{ResourcesName}.samplers[{samplerIndex}]");
+                var samplerElement = request.Bindings.Find(DescriptorBindingKind.Samplers)!.Resources.ToList()
+                    .IndexOf(info.SamplerBinding(samplerIndex));
+                samplerName = Temp("sampler", $"{ResourcesName}.samplers[{samplerElement}]");
             }
 
             dstSelect = imageInfo.ShaderSwizzle;

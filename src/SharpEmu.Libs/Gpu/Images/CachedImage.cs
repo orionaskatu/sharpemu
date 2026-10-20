@@ -77,11 +77,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     private bool _bufferHoldsGpuContents;
 
     public ImageDescription Description;
-
-    // The host resolution multiplier of this image. Guest geometry in Description never
-    // changes; only the backing is larger or smaller, and guest bytes move through a
-    // guest-resolution twin (CachedImage.Transfers).
-    public readonly float RenderScale = 1.0f;
+    internal SurfaceMetadata? MetadataRegistration;
     public readonly ImageBacking Backing = new();
     public readonly List<CachedImageView> Views = new();
     private readonly Dictionary<(uint Width, uint Height), CachedImage> _stencilStorageImages = new();
@@ -96,8 +92,7 @@ public sealed unsafe partial class CachedImage : IDisposable
     public int RecencyEntryIndex;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
-        ImageBackingPool? pool = null, OptimalImageMemoryPool? memoryPool = null, Func<string>? memoryDiagnostics = null,
-        bool allowScaling = true)
+        ImageBackingPool? pool = null, Action? reportAllocationFailure = null)
     {
         _device = device;
         _scheduler = scheduler;
@@ -161,10 +156,11 @@ public sealed unsafe partial class CachedImage : IDisposable
         }
 
         var vk = device.Vk;
-        var createResult = vk.CreateImage(device.Device, &create, null, out Backing.Handle);
-        if (createResult != Result.Success)
+        var creationResult = vk.CreateImage(device.Device, &create, null, out Backing.Handle);
+        if (creationResult != Result.Success)
         {
-            throw CreateFailure(create, "vkCreateImage", createResult, 0);
+            reportAllocationFailure?.Invoke();
+            throw CreateFailure(create, "vkCreateImage", creationResult);
         }
 
         var dedicated = new MemoryDedicatedRequirements { SType = StructureType.MemoryDedicatedRequirements };
@@ -189,6 +185,7 @@ public sealed unsafe partial class CachedImage : IDisposable
             PNext = dedicated.RequiresDedicatedAllocation ? &dedicatedInfo : null,
         };
         var allocated = Result.ErrorOutOfDeviceMemory;
+        var allocationAttempted = false;
         for (uint index = 0; index < device.MemoryTypeCount; index++)
         {
             if ((requirements.MemoryTypeBits & (1u << (int)index)) == 0 ||
@@ -198,68 +195,39 @@ public sealed unsafe partial class CachedImage : IDisposable
             }
 
             allocateInfo.MemoryTypeIndex = index;
-            if (_memoryPool is not null && !dedicated.RequiresDedicatedAllocation)
-            {
-                allocated = _memoryPool.Allocate(requirements, index, out var placement);
-                if (allocated == Result.Success)
-                {
-                    _memoryPlacement = placement;
-                    Backing.Memory = placement.Memory;
-                }
-            }
-            else allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
+            allocationAttempted = true;
+            allocated = device.AllocateMemory(allocateInfo, out Backing.Memory);
             if (allocated == Result.Success)
             {
                 break;
             }
         }
 
-        if (allocated != Result.Success)
+        var bindingResult = allocated == Result.Success
+            ? vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, 0)
+            : allocated;
+        if (bindingResult != Result.Success)
         {
             vk.DestroyImage(device.Device, Backing.Handle, null);
             ReleaseMemory();
             Backing.Handle = default;
             Backing.Memory = default;
-            // Running out of memory is recoverable: the cache can free images and try again.
-            if (allocated is Result.ErrorOutOfDeviceMemory or Result.ErrorOutOfHostMemory)
-                throw new ImageOutOfMemoryException(CreateFailureMessage(create, "vkAllocateMemory", allocated, requirements.Size));
-            throw CreateFailure(create, "vkAllocateMemory", allocated, requirements.Size);
-        }
-
-        var bindResult = vk.BindImageMemory(device.Device, Backing.Handle, Backing.Memory, _memoryPlacement?.Offset ?? 0);
-        if (bindResult != Result.Success)
-        {
-            vk.DestroyImage(device.Device, Backing.Handle, null);
-            ReleaseMemory();
-            Backing.Handle = default;
-            Backing.Memory = default;
-            throw CreateFailure(create, "vkBindImageMemory", bindResult, requirements.Size);
+            reportAllocationFailure?.Invoke();
+            throw CreateFailure(create, !allocationAttempted ? "select_device_local_memory_type" :
+                allocated != Result.Success ? "vkAllocateMemory" : "vkBindImageMemory",
+                bindingResult, requirements.Size, requirements.MemoryTypeBits);
         }
 
         Backing.AllocationSize = requirements.Size;
     }
 
-    private void ReleaseMemory()
-    {
-        if (_memoryPlacement is { } placement) _memoryPool!.Free(placement);
-        else _device.FreeMemory(Backing.Memory);
-        _memoryPlacement = null;
-    }
-
-    private Exception CreateFailure(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
-        SubmissionScheduler.Fatal(CreateFailureMessage(create, operation, result, requiredBytes));
-
-    private string CreateFailureMessage(in ImageCreateInfo create, string operation, Result result, ulong requiredBytes) =>
-            $"The image could not be created: operation={operation} result={result} required_bytes={requiredBytes} " +
+    private static Exception CreateFailure(in ImageCreateInfo create, string operation, Result result,
+        ulong allocationSize = 0, uint memoryTypeBits = 0) =>
+        SubmissionScheduler.Fatal(
+            $"The image could not be created: operation={operation} result={result} result_code={(int)result} " +
             $"extent={create.Extent.Width}x{create.Extent.Height}x{create.Extent.Depth} format={create.Format}({(int)create.Format}) " +
             $"layers={create.ArrayLayers} levels={create.MipLevels} usage=0x{(uint)create.Usage:X} flags=0x{(uint)create.Flags:X} " +
-            $"live_allocations={_device.LiveAllocations} allocation_limit={_device.MaxMemoryAllocationCount} " +
-            $"image_pool_allocated={_memoryPool?.AllocatedBytes ?? 0} image_pool_placed={_memoryPool?.PlacedBytes ?? 0} " +
-            $"last_failed_allocation_bytes={_device.LastFailedAllocationBytes} guest_address=0x{Description.Data.Address:X16} " +
-            (_memoryDiagnostics?.Invoke() ?? string.Empty);
-
-    // The device ran out of memory for the image's backing. Nothing was left allocated.
-    internal sealed class ImageOutOfMemoryException(string message) : Exception(message);
+            $"samples={create.Samples} allocation_bytes={allocationSize} memory_type_bits=0x{memoryTypeBits:X}.");
 
     internal static bool TrySelectSupportedImageConfiguration(IImageFormatSupport device, ref ImageCreateInfo configuration, bool allowCompressedImageFallback)
     {

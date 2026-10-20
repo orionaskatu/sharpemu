@@ -4,7 +4,7 @@
 using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Scheduling;
-using SharpEmu.ShaderCompiler.Resources;
+using SharpEmu.Libs.VideoOut;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
@@ -306,36 +306,16 @@ public sealed partial class RenderExecutor
         }
 
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
-        // A zero dimension executes no work. Check before materializing shaders: an indirect
-        // buffer can be read here only when no pending GPU write can change its contents.
-        var zeroDispatch = false;
-        if (indirectArgumentsAddress == 0 || useThreadDimensions)
-        {
-            zeroDispatch = groupsX == 0 || groupsY == 0 || groupsZ == 0;
-        }
-        else
-        {
-            Span<byte> arguments = stackalloc byte[3 * sizeof(uint)];
-            if (_host.TryReadCleanGuestBytes(indirectArgumentsAddress, arguments))
-            {
-                zeroDispatch = BinaryPrimitives.ReadUInt32LittleEndian(arguments) == 0 ||
-                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[sizeof(uint)..]) == 0 ||
-                    BinaryPrimitives.ReadUInt32LittleEndian(arguments[(2 * sizeof(uint))..]) == 0;
-            }
-        }
-
-        if (zeroDispatch)
+        if ((indirectArgumentsAddress == 0 || useThreadDimensions) && (groupsX == 0 || groupsY == 0 || groupsZ == 0))
         {
             if (RenderTrace.Enabled && RenderTrace.ZeroDispatch())
             {
-                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} " +
-                    $"indirect=0x{indirectArgumentsAddress:X16} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
+                RenderTrace.Write($"Skipping a zero-sized dispatch: groups={groupsX}x{groupsY}x{groupsZ} initiator=0x{dispatchInitiator:X8} shader=0x{compute.Address:X16}");
             }
 
             return;
         }
 
-        var dbgT0 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
         var dbgT1 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         if (computeProgram.Consumed)
@@ -655,7 +635,16 @@ public sealed partial class RenderExecutor
             PipelineHandle pipeline;
             while (!_pipelines.TryCreateComputePipeline(input, computeProgram.Program, out pipeline))
             {
-                Thread.Sleep(1);
+                using var waitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ComputePipelineWait);
+                var completion = _pipelines.GetComputePipelineCompletion(computeProgram.Program);
+                if (completion is null)
+                {
+                    Thread.Sleep(1);
+                }
+                else
+                {
+                    completion.GetAwaiter().GetResult();
+                }
             }
 
             dbgT3 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
@@ -693,21 +682,7 @@ public sealed partial class RenderExecutor
                 physicalGroups[axisOrder[logical]] = logicalGroups[logical];
             }
 
-            if (_host.DebugCapturing) // TEMP: expose the resolved buffers so captures can name them by slot
-            {
-                var dbgBuffers = new (ulong, ulong)[input.Stage.Resources.Buffers.Length];
-                for (var index = 0; index < dbgBuffers.Length; index++)
-                {
-                    if (input.Stage.Resources.Buffers[index].Length >= 4)
-                    {
-                        var dbgDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[index]);
-                        dbgBuffers[index] = (dbgDescriptor.Address, dbgDescriptor.Footprint() ?? 0);
-                    }
-                }
-
-                _host.DebugSetDispatchBuffers(dbgBuffers);
-            }
-
+            var imageSnapshot = _host.BeginComputeImageSnapshot(bindings);
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
@@ -721,6 +696,8 @@ public sealed partial class RenderExecutor
                 if (fillDescriptor.Footprint() is { } fillFootprint && fillDescriptor.Address != 0 && fillFootprint != 0)
                     _host.DebugFillBuffer(fillDescriptor.Address & ~3UL, (fillFootprint + 3) & ~3UL, fillValue);
             }
+            _host.EndComputeImageSnapshot(imageSnapshot, bindings);
+            _host.ShaderAccessBarrier();
         }
 
         DbgDispStat(program.Hash, dbgT0, dbgT1, dbgT2, dbgT3, dbgT4, dbgT5, System.Diagnostics.Stopwatch.GetTimestamp(), program.Buffers.Length, program.Images.Length); // TEMP
@@ -1231,9 +1208,10 @@ public sealed partial class RenderExecutor
             return RefuseBoundedFill(program, "value unreadable");
         }
 
-        if (fill.PatternLength is { } lengthWord)
+        if (fill.Pattern is { } pattern)
         {
-            if (fill.Pattern is not { } pattern || !TryResolveFillWord(lengthWord, userData, out var length) || length == 0 || length > pattern.Length)
+            var length = (uint)pattern.Length;
+            if (fill.PatternLength is { } lengthWord && (!TryResolveFillWord(lengthWord, userData, out length) || length == 0 || length > pattern.Length))
             {
                 return RefuseBoundedFill(program, "pattern length");
             }

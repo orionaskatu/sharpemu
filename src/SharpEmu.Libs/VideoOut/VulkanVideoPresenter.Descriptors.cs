@@ -34,6 +34,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             public readonly RenderScratchPool<TextureResource> Images = new();
             public readonly RenderScratchPool<Sampler> Samplers = new();
+            public readonly RenderScratchPool<byte> SamplerClasses = new();
             public readonly RenderScratchPool<uint> ShaderData = new();
             public readonly RenderScratchPool<BufferView> Buffers = new();
             public readonly RenderScratchPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)> Sources = new();
@@ -87,7 +88,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ShaderStageKind.Vertex => ShaderStage.Vertex,
             ShaderStageKind.Pixel => ShaderStage.Pixel,
             ShaderStageKind.Compute => ShaderStage.Compute,
-            ShaderStageKind.TessellationEvaluation => ShaderStage.TessellationEvaluation,
+            ShaderStageKind.Mesh => ShaderStage.Mesh,
             _ => throw SubmissionScheduler.Fatal($"The stage kind is unknown: stage={program.Stage} hash=0x{program.Hash:X16}."),
         };
 
@@ -124,8 +125,27 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private static bool[] FindResidentBindlessImages(ShaderResourceInfo info, uint[] flattenedTable)
         {
-            var resident = new bool[info.Images.Count];
-            for (var index = 0; index < info.Images.Count; index++)
+            public uint[]? Words;
+            public ulong Generation;
+            public TextureRequestResolution Resolution;
+            public TextureRequestResolution OriginalResolution;
+            public ResourceSlotIdentifier Found;
+            public uint MetadataBaseLayer;
+            public bool CompletesLookup;
+
+            public readonly bool Matches(uint[] words, ulong generation) =>
+                Words is not null && Generation == generation && words.AsSpan().SequenceEqual(Words);
+        }
+
+        private Dictionary<ShaderProgramInfo, ImageBindingMemo[]>? _imageBindingMemos;
+        private ShaderProgramInfo? _lastMemoProgram;
+        private ImageBindingMemo[] _lastMemos = [];
+
+        // A draw's images resolve one after another for one program, so the last program's memos
+        // are kept at hand.
+        private ref ImageBindingMemo ImageBindingMemoOf(ShaderProgramInfo program, int index)
+        {
+            if (!ReferenceEquals(program, _lastMemoProgram) || index >= _lastMemos.Length)
             {
                 if (info.Images[index].IndirectRoot == DescriptorConstants.NoIndex)
                 {
@@ -194,218 +214,26 @@ internal static unsafe partial class VulkanVideoPresenter
             return resident;
         }
 
-        private TextureResource ResolveNonResidentImage(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
+        private readonly HashSet<string> _imageLookupTraceEntries = new(StringComparer.Ordinal);
+
+        private void TraceImageLookup(ImageResource image, uint[] words, ShaderProgramInfo program, int index, in ImageRequest request)
         {
-            // Every unreferenced slot of a table binds the same null image: one binding serves the preparation.
-            var nullKey = (ShapeOf(image), image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage);
-            if (_prepareMemoActive && _nullTextures.TryGetValue(nullKey, out var sharedNull))
-            {
-                return sharedNull;
-            }
+            if (!ImageClearTrace.Enabled ||
+                !ImageTraceRange.Overlaps(request.Description.Data.Address, 1) ||
+                _imageLookupTraceEntries.Count >= 256)
+                return;
 
-            var created = ResolveNonResidentImageCore(image, words);
-            if (_prepareMemoActive)
-            {
-                _nullTextures[nullKey] = created;
-            }
-
-            return created;
+            var description = request.Description;
+            var message = $"ImageLookup shader=0x{program.Hash:X16} stage={program.Stage} image={index} indirectRoot={image.IndirectRoot} " +
+                $"address=0x{description.Data.Address:X16} size=0x{description.Data.Size:X} type={description.Type} tile={description.TileMode} " +
+                $"extent={description.Extent.Width}x{description.Extent.Height}x{description.Extent.Depth} levels={description.Resources.Levels} layers={description.Resources.Layers} format={description.PixelFormat} " +
+                $"view={request.View} words={string.Join(',', words.Select(word => word.ToString("X8")))}";
+            if (!_imageLookupTraceEntries.Add(message)) return;
+            Console.Error.WriteLine($"[GPU][TRACE] {message}");
+            if (_imageLookupTraceEntries.Count == 256)
+                Console.Error.WriteLine("[GPU][TRACE] ImageLookup limit=256. Further entries are omitted.");
         }
 
-        private readonly Dictionary<(ShaderImageShape, bool), TextureResource> _nullTextures = new();
-
-        private TextureResource ResolveNonResidentImageCore(ImageResource image, uint[] words)
-        {
-            var descriptor = new TextureDescriptorWords(words);
-            var resolution = ImageRequestBuilders.NullTextureResolution(ShapeOf(image));
-            _ = BeginBatchedGuestCommands();
-            var request = resolution.Request;
-            var imageIdentifier = _imageCache.FindImage(ref request);
-            resolution = resolution with { Request = request };
-            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
-            BindImage(imageIdentifier, image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage);
-            return new TextureResource
-            {
-                Address = descriptor.BaseAddress,
-                ImageIdentifier = imageIdentifier,
-                Request = request,
-                IsStorage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage,
-                IsResident = true,
-                Width = descriptor.Width,
-                Height = descriptor.Height,
-                DestinationSelect = resolution.Swizzle,
-            };
-        }
-
-        private readonly struct TextureBindingKey : IEquatable<TextureBindingKey>
-        {
-            private readonly ulong _words0, _words1, _words2, _words3;
-            private readonly int _length;
-            private readonly ShaderImageShape _shape;
-            private readonly bool _storage;
-            // Whether the shader writes through the view; it is part of the image request.
-            private readonly bool _shaderWrite;
-            private readonly int _hash;
-
-            public TextureBindingKey(uint[] words, ShaderImageShape shape, bool storage, bool shaderWrite)
-            {
-                _words0 = Pack(words, 0);
-                _words1 = Pack(words, 2);
-                _words2 = Pack(words, 4);
-                _words3 = Pack(words, 6);
-                _length = words.Length;
-                _shape = shape;
-                _storage = storage;
-                _shaderWrite = shaderWrite;
-                var mixed = (_words0 * 0x9E3779B97F4A7C15UL) ^ (_words1 * 0xC2B2AE3D27D4EB4FUL) ^ (_words2 * 0x165667B19E3779F9UL) ^
-                            (_words3 * 0x27D4EB2F165667C5UL) ^ (ulong)_length ^ (storage ? 0x8000UL : 0UL) ^ (shaderWrite ? 0x4000UL : 0UL);
-                _hash = (int)(mixed ^ (mixed >> 32));
-            }
-
-            public bool Equals(TextureBindingKey other) =>
-                _hash == other._hash && _words0 == other._words0 && _words1 == other._words1 && _words2 == other._words2 &&
-                _words3 == other._words3 && _length == other._length && _storage == other._storage && _shaderWrite == other._shaderWrite && _shape.Equals(other._shape);
-
-            public override bool Equals(object? obj) => obj is TextureBindingKey other && Equals(other);
-
-            public override int GetHashCode() => _hash;
-
-            private static ulong Pack(uint[] words, int index) =>
-                (index < words.Length ? words[index] : 0u) | ((ulong)(index + 1 < words.Length ? words[index + 1] : 0u) << 32);
-        }
-
-        private sealed class CachedTextureBinding
-        {
-            public ResourceSlotIdentifier Image;
-            public ImageRequest Request;
-            // The image-cache version this lookup is valid for and the addresses it depends on.
-            public long Version;
-            public ulong RangeStart;
-            public ulong RangeEnd;
-            // The binding built for it during the preparation numbered SharedEpoch.
-            public TextureResource? Shared;
-            public int SharedEpoch;
-            // The view's base layer before the lookup, and whether a reuse still has to run the
-            // lookup's DCC work (GuestImageCache.CompleteLookup) as a fresh lookup would.
-            public uint MetadataBaseLayer;
-            public bool CompletesLookup;
-        }
-
-        private readonly Dictionary<TextureBindingKey, CachedTextureBinding> _textureBindings = new();
-        private const int MaxTextureBindings = 1 << 16;
-        private bool _prepareMemoActive;
-        private int _prepareEpoch;
-        private const int BoundSetMinimumImages = 256;
-        private static readonly bool BoundSetsEnabled = Environment.GetEnvironmentVariable("SHARPEMU_BOUND_SETS") != "0";
-        private delegate TextureResource ResolveOne(int index);
-        private readonly List<int> _setChanged = new();
-        private readonly Dictionary<ShaderResourceInfo, BoundImageSet> _boundSets = new(ReferenceEqualityComparer.Instance);
-
-        // The resolved bindings of one bindless table, reusable while the table's descriptors,
-        // the resident subset and the image cache's structure are unchanged.
-        private (ulong Start, ulong End) TextureRange(TextureResource texture)
-        {
-            var data = texture.Request.Description.Data;
-            var start = data.Address;
-            var end = data.Address + Math.Max(data.Size, 1);
-            if (_imageCache.TryGetImage(texture.ImageIdentifier, out var image))
-            {
-                var found = image.Description.Data;
-                start = Math.Min(start, found.Address);
-                end = Math.Max(end, found.Address + Math.Max(found.Size, 1));
-            }
-
-            return (start, end);
-        }
-
-        private enum SetMatch { Miss, Hit, Delta }
-
-        // The resolved bindings of one bindless table, reusable while the table's descriptors,
-        // the resident subset and the image cache's structure are unchanged. A table that changed
-        // in a few entries keeps the bindings of the others.
-        private sealed class BoundImageSet(uint[][] words, bool[]? resident, TextureResource[] images, (ulong Start, ulong End)[] ranges, long version)
-        {
-            public uint[][] Words = (uint[][])words.Clone();
-            public bool[]? Resident = (bool[]?)resident?.Clone();
-            public TextureResource[] Images = images;
-            public (ulong Start, ulong End)[] Ranges = ranges;
-            public TextureResource[]? Unique;
-            public long Version = version;
-            public const int MaxDelta = 1024;
-
-            public SetMatch Match(uint[][] current, bool[]? currentResident, GuestImageCache imageCache, List<int> changed)
-            {
-                changed.Clear();
-                if (current.Length != Words.Length || (Resident is null) != (currentResident is null))
-                {
-                    return SetMatch.Miss;
-                }
-
-                var cachedWords = Words;
-                for (var index = 0; index < cachedWords.Length; index++)
-                {
-                    var same = ReferenceEquals(cachedWords[index], current[index]) ||
-                               cachedWords[index].AsSpan().SequenceEqual(current[index]);
-                    if (same && Resident is not null && Resident[index] != currentResident![index])
-                    {
-                        same = false;
-                    }
-
-                    if (!same)
-                    {
-                        if (changed.Count >= MaxDelta)
-                        {
-                            return SetMatch.Miss;
-                        }
-
-                        changed.Add(index);
-                    }
-                }
-
-                if (imageCache.StructureVersion != Version)
-                {
-                    // Images came and went since; the bindings hold unless one overlaps a texture of the set.
-                    Span<(ulong Start, ulong End)> changes = stackalloc (ulong, ulong)[256];
-                    if (!imageCache.TryGetChangesSince(Version, changes, out var changeCount, out var validated))
-                    {
-                        return SetMatch.Miss;
-                    }
-
-                    for (var index = 0; index < Ranges.Length; index++)
-                    {
-                        var (start, end) = Ranges[index];
-                        for (var change = 0; change < changeCount; change++)
-                        {
-                            if (changes[change].Start < end && start < changes[change].End)
-                            {
-                                return SetMatch.Miss;
-                            }
-                        }
-                    }
-
-                    Version = validated;
-                }
-
-                return changed.Count == 0 ? SetMatch.Hit : SetMatch.Delta;
-            }
-        }
-        private int _textureMark;
-        private readonly HashSet<(ResourceSlotIdentifier, bool)> _preparedImages = new();
-
-        private CachedTextureBinding ResolveTextureBinding(uint[] words, ShaderImageShape shape, bool shaderWrite)
-        {
-            var resolution = ImageRequestBuilders.Texture(words, shape);
-            var binding = new CachedTextureBinding { Request = resolution.Request };
-            binding.Request.ShaderWrite = shaderWrite;
-            binding.MetadataBaseLayer = binding.Request.View.BaseLayer;
-            binding.Image = _imageCache.FindImage(ref binding.Request, resolution.ExactFormat);
-            binding.Image = ImageRequestBuilders.ValidateTextureOwner(_imageCache, binding.Image, resolution with { Request = binding.Request });
-            binding.CompletesLookup = !ImageDescription.IsEmptyRange(binding.Request.Description.Data) &&
-                (binding.Request.Description.Metadata.Kind == MetadataKind.Dcc ||
-                 _imageCache.GetImage(binding.Image).Description.DccSliceSize != 0);
-            return binding;
-        }
-        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _tracedTextureBindings = new();
         // Render-state discovery for one shader image; the view is acquired later with the draw.
         [System.Runtime.CompilerServices.SkipLocalsInit]
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
@@ -415,7 +243,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"An image descriptor is too short: image={index} words={words.Length} hash=0x{program.Hash:X16}.");
             }
 
-            if (VisibilityFeedback.Enabled && words.Length >= 8)
+            var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
+            _ = BeginBatchedGuestCommands();
+            var originalResolution = memo.Matches(words, _imageCache.LookupGeneration)
+                ? memo.OriginalResolution
+                : ImageRequestBuilders.Texture(words, ShapeOf(image), program.Hash, index);
+            TraceImageLookup(image, words, program, index, originalResolution.Request);
+            CompleteOverlappingPublications(originalResolution.Request.Description.Data.Address,
+                originalResolution.Request.Description.Data.Size, includeLabels: false);
+            _imageCache.SynchronizeColorMetadata(originalResolution.Request);
+            _ = BeginBatchedGuestCommands();
+            TextureRequestResolution resolution;
+            ResourceSlotIdentifier imageIdentifier;
+            if (memo.Matches(words, _imageCache.LookupGeneration) && _imageCache.TryTouchRemembered(memo.Found))
             {
                 // The visibility pass reads the id target the world pass wrote last frame.
                 if (VisibilityFeedback.IdTarget != 0 && VisibilityFeedback.IdTargetWords is null && image.ResourceClass != ShaderCompiler.Resources.ImageResourceClass.Storage &&
@@ -437,67 +277,40 @@ internal static unsafe partial class VulkanVideoPresenter
             var structureVersion = _imageCache.StructureVersion;
             if (_textureBindings.Count > MaxTextureBindings)
             {
-                _textureBindings.Clear();
-            }
-
-            var shaderWrite = storage && (image.Written || image.Atomic);
-            var key = new TextureBindingKey(words, shape, storage, shaderWrite);
-            var found = _textureBindings.TryGetValue(key, out var known);
-            if (found && known!.Version != structureVersion)
-            {
-                // Images came and went since; the lookup holds unless one of them overlaps it.
-                if (_imageCache.TryRevalidate(known.Version, known.RangeStart, known.RangeEnd, out var validated))
-                {
-                    known.Version = validated;
-                }
-                else
-                {
-                    found = false;
-                }
-            }
-
-            if (!found)
-            {
-                known = ResolveTextureBinding(words, shape, shaderWrite);
-                if (_imageCache.StructureVersion == structureVersion)
-                {
-                    known.Version = structureVersion;
-                    var data = known.Request.Description.Data;
-                    var start = data.Address;
-                    var end = data.Address + Math.Max(data.Size, 1);
-                    if (_imageCache.TryGetImage(known.Image, out var foundImage))
+                resolution = originalResolution;
+                var request = resolution.Request;
+                var metadataBaseLayer = request.View.BaseLayer;
+                imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);
+                resolution = resolution with { Request = request };
+                memo = !ImageDescription.IsEmptyRange(request.Description.Data)
+                    ? new ImageBindingMemo
                     {
-                        var foundData = foundImage.Description.Data;
-                        start = Math.Min(start, foundData.Address);
-                        end = Math.Max(end, foundData.Address + Math.Max(foundData.Size, 1));
+                        Words = (uint[])words.Clone(),
+                        Generation = _imageCache.LookupGeneration,
+                        Resolution = resolution,
+                        OriginalResolution = originalResolution,
+                        Found = imageIdentifier,
+                        MetadataBaseLayer = metadataBaseLayer,
+                        CompletesLookup = request.Description.Metadata.Kind == MetadataKind.Dcc ||
+                            _imageCache.GetImage(imageIdentifier).Description.DccSliceSize != 0,
                     }
-
-                    known.RangeStart = start;
-                    known.RangeEnd = end;
-                    _textureBindings[key] = known;
-                }
+                    : default;
             }
 
-            var imageIdentifier = known.Image;
-            if (_prepareMemoActive && !storage && found && known.SharedEpoch == _prepareEpoch && known.Shared is { } sharedHit)
+            _imageCache.TraceTextureMetadata(resolution.Request);
+            if (Gpu.Images.ImageClearTrace.Enabled)
             {
-                return sharedHit;
+                Gpu.Images.ImageTraceRange.NoteFollowedImage(program.Hash, index,
+                    resolution.Request.Description.Data.Address, resolution.Request.Description.Data.Size);
+                _imageCache.TraceTextureBinding(program.Hash, index, words, resolution.Request);
             }
-
-            // Within one preparation a repeated image needs its recency touch and binding mark once.
-            if (!_prepareMemoActive || _preparedImages.Add((imageIdentifier, storage)))
-            {
-                if (found)
-                {
-                    _imageCache.TouchFoundImage(known.Image);
-                    if (known.CompletesLookup)
-                    {
-                        _imageCache.CompleteLookup(known.Image, known.Request, known.MetadataBaseLayer);
-                    }
-                }
-
-                BindImage(imageIdentifier, storage);
-            }
+            if (MeshDrawTrace.Active) MeshDrawTrace.Write("image-binding", $"stage={program.Stage} hash=0x{program.Hash:X16} slot={index} storage={storage} address=0x{resolution.Request.Description.Data.Address:X16} size=0x{resolution.Request.Description.Data.Size:X} view={resolution.Request.View} words={string.Join(",", words.Select(value => value.ToString("X8")))}");
+            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
+            _imageCache.ApplyNativeColorClear(imageIdentifier, resolution.Request);
+            if (Gpu.Images.ImageClearTrace.Enabled)
+                _imageCache.TraceVolumeClear("resolved-shader-image", resolution.Request, _imageCache.GetImage(imageIdentifier),
+                    $"stage={program.Stage} hash=0x{program.Hash:X16} slot={index}");
+            BindImage(imageIdentifier, storage);
             var descriptor = new TextureDescriptorWords(words);
             if (ShouldTraceTextureBindings() &&
                 (!_traceVolumeTextureBindingsOnly || image.Dimension == ImageDimension.Dim3D))
@@ -574,28 +387,21 @@ internal static unsafe partial class VulkanVideoPresenter
             _texturePool.Push(texture);
         }
 
-        // Compare bits stay only on depth-compare samplers; a forced point sampler drops its filters.
-        // A sampler takes the numeric class of the views it samples; integer only when every
-        // paired view is integer, since a float view needs a float border and filtering.
-        private static bool SamplesIntegerViews(ShaderResourceInfo info, TextureResource[] images, int sampler)
+        // A float view overrides integer views. Unpaired and movie-only samplers stay unclassified.
+        private static void ClassifySamplerViews(ShaderResourceInfo info, TextureResource[] images, byte[] classes)
         {
-            var paired = false;
+            Array.Clear(classes);
+            if (classes.Length == 0) return;
             foreach (var pair in info.SampledPairs)
             {
-                if (pair.Sampler != sampler || pair.Image >= images.Length || images[pair.Image].IsHostMovie || !images[pair.Image].IsResident)
+                if (pair.Sampler >= info.Samplers.Count || pair.Image >= images.Length || images[pair.Image].IsHostMovie)
                 {
                     continue;
                 }
 
-                if (!ViewFormatRules.IsIntegerFormat(images[pair.Image].Request.View.Format))
-                {
-                    return false;
-                }
-
-                paired = true;
+                classes[pair.Sampler] |= ViewFormatRules.IsIntegerFormat(images[pair.Image].Request.View.Format)
+                    ? (byte)1 : (byte)2;
             }
-
-            return paired;
         }
 
         private Sampler ResolveSampler(SamplerResource sampler, uint[] words, ShaderProgramInfo program, int index, ShaderStageResources stage,
@@ -656,6 +462,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public IPreparedBindings PrepareBindings(ShaderStageResources stage)
         {
+            if (MeshDrawTrace.Active) MeshDrawTrace.Write("stage-binding", $"stage={stage.Program?.Stage} hash=0x{stage.Program?.Hash:X16} shaderBase=0x{stage.ShaderBase:X16} userData={string.Join(",", stage.Resources.UserData.Select(value => value.ToString("X8")))}");
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var preparation = RequirePreparation();
             var program = RequireProgram(stage);
@@ -663,6 +470,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var layout = program.Bindings!;
             var snapshot = stage.Resources;
             var info = resources.Info;
+            using var stallProfile = DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.Prepare, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count);
             if (snapshot.Images.Length != info.Images.Count || snapshot.Samplers.Length != info.Samplers.Count || snapshot.Buffers.Length != info.Buffers.Count)
             {
                 throw SubmissionScheduler.Fatal(
@@ -677,18 +485,8 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Images = Scratch.Images.Rent(info.Images.Count);
             var movieCandidates = _hostMovieFramePixels is null ? null : MovieCandidates(resources, snapshot);
             var hostMovie = movieCandidates is null ? HostMovieTextureBindings.None : FindHostMovieTextureBindings(movieCandidates);
-            var residentImages = layout.UsesBindlessImages ? FindResidentBindlessImages(info, snapshot.FlattenedResourceTable) : null;
-            _preparedImages.Clear();
-            _prepareEpoch++;
-            _nullTextures.Clear();
-            _prepareMemoActive = info.Images.Count >= 64;
-            // A bindless table that names the same textures as the previous preparation of this
-            // program keeps that preparation's bindings; only the per-draw marks are repeated.
-            var setEligible = BoundSetsEnabled && info.Images.Count >= BoundSetMinimumImages && movieCandidates is null;
-            var structureVersionBefore = _imageCache.StructureVersion;
-            BoundImageSet? boundSet = null;
-            var match = SetMatch.Miss;
-            if (setEligible && _boundSets.TryGetValue(info, out var candidateSet))
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ResolveImages, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+            for (var index = 0; index < info.Images.Count; index++)
             {
                 match = candidateSet.Match(snapshot.Images, residentImages, _imageCache, _setChanged);
                 if (match != SetMatch.Miss)
@@ -783,10 +581,20 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             descriptors.Samplers = Scratch.Samplers.Rent(info.Samplers.Count);
-            for (var index = 0; index < info.Samplers.Count; index++)
+            var samplerClasses = Scratch.SamplerClasses.Rent(info.Samplers.Count);
+            try
             {
-                descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
-                    SamplesIntegerViews(info, descriptors.Images, index));
+                using var samplerProfile = DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ResolveSamplers, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count);
+                ClassifySamplerViews(info, descriptors.Images, samplerClasses);
+                for (var index = 0; index < info.Samplers.Count; index++)
+                {
+                    descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
+                        samplerClasses[index] == 1);
+                }
+            }
+            finally
+            {
+                Scratch.SamplerClasses.Return(samplerClasses);
             }
 
             var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
@@ -811,33 +619,19 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             stage.WriteDispatchThreadLimits(shaderData);
-            stage.WriteTessellationData(shaderData);
-            stage.WriteObjectId(shaderData);
-            if (layout.UsesRenderScale)
-            {
-                ulong scaledImages = 0;
-                var scaledCount = Math.Min(info.Images.Count, 64);
-                for (var index = 0; index < scaledCount; index++)
-                {
-                    var identifier = descriptors.Images[index].ImageIdentifier;
-                    if (identifier.IsValid && _imageCache.GetImage(identifier).IsScaled)
-                    {
-                        scaledImages |= 1UL << index;
-                    }
-                }
-
-                stage.WriteRenderScale(shaderData, scaledImages, RenderScalePolicy.Scale);
-            }
-
+            stage.WriteMeshDrawParameters(shaderData);
             prepared.ShaderData = shaderData;
             if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
             {
                 descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
             }
 
-            FindDeviceAddressBuffers(prepared);
-            FindBuffers(prepared);
-            ValidateDrawImageTypes(prepared);
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.FindAddressBuffers, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+                FindDeviceAddressBuffers(prepared);
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.FindBuffers, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+                FindBuffers(prepared);
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ValidateImages, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+                ValidateDrawImageTypes(prepared);
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
                 RenderTrace.Write(
@@ -893,6 +687,23 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private static int _unresidentPrtBufferLines;
+
+        private bool IsUnresidentPrtPage(ulong address)
+        {
+            if (_guestMemory.CanRead(address, 1) || !Kernel.KernelRuntimeCompatExports.ContainsPrtRange(address, 1))
+            {
+                return false;
+            }
+
+            if (Interlocked.Exchange(ref _unresidentPrtBufferLines, 1) == 0)
+            {
+                Console.Error.WriteLine($"[GPU][INFO] A buffer starts in an unresident PRT page and binds as a null buffer: address=0x{address:X16}.");
+            }
+
+            return true;
+        }
+
         // The cache buffer each descriptor's range lives in; a null descriptor has none.
         private void FindBuffers(PreparedStageBindings prepared)
         {
@@ -911,7 +722,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var descriptor = BufferDescriptorWords.From(words);
                 var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal(
                     $"A storage buffer descriptor footprint overflows: buffer={index} stride={descriptor.Stride} records={descriptor.RecordCount} hash=0x{program.Hash:X16}.");
-                if (descriptor.Address == 0 || requested == 0)
+                if (descriptor.Address == 0 || requested == 0 || IsUnresidentPrtPage(descriptor.Address))
                 {
                     sources[index] = (descriptor, default);
                     continue;
@@ -1017,15 +828,14 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var stage = (PreparedStageBindings)prepared;
-            BindBuffers(stage);
-            ObtainDeviceAddressRanges(stage);
-            BindImages(stage);
-            if (stage.Layout.Find(DescriptorBindingKind.RuntimeDescriptorTable) is not null)
-            {
-                BindRuntimeDescriptors(stage);
-            }
-
-            BindFlattenedResourceTable(stage);
+            var info = stage.Resources.Info;
+            using var stallProfile = DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.Bind, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count);
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.BindBuffers, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+                BindBuffers(stage);
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ObtainAddressRanges, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+                ObtainDeviceAddressRanges(stage);
+            using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.BindImages, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
+                BindImages(stage);
             _preparedTextures.Add(stage.Textures);
         }
 
@@ -1103,12 +913,13 @@ internal static unsafe partial class VulkanVideoPresenter
             tailPadding = 0;
             var address = descriptor.Address;
             var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal($"A storage buffer descriptor footprint overflows: buffer={slot} hash=0x{program.Hash:X16}.");
-            if (address == 0 || requested == 0)
+            if (address == 0 || requested == 0 || IsUnresidentPrtPage(address))
             {
                 return NullStorageBuffer();
             }
 
             var size = ClampMappedSize(address, requested);
+            if (MeshDrawTrace.Active) MeshDrawTrace.Write("buffer-binding", $"stage={program.Stage} hash=0x{program.Hash:X16} slot={slot} address=0x{address:X16} requested=0x{requested:X} size=0x{size:X} written={resource.Written} formatted={resource.Formatted}");
             var alignment = _minStorageBufferOffsetAlignment;
             var maxRange = _deviceInfo.MaxStorageBufferRange;
             if (alignment == 0 || size > maxRange)
@@ -1116,7 +927,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"A storage buffer range or the device alignment is unsupported: buffer={slot} size=0x{size:X} alignment={alignment} hash=0x{program.Hash:X16}.");
             }
 
-            var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier);
+            var (buffer, offset) = _bufferCache.ObtainBuffer(address, size, resource.Written, isTexelBuffer: resource.Formatted, bufferIdentifier, program.Hash);
+            TraceBufferParameter(program.Hash, slot, address, size, buffer.Handle.Handle, offset, resource.Written);
             var alignedOffset = offset - offset % alignment;
             var adjustment = offset - alignedOffset;
             // A buffer read only through byte-assembled accesses may start mid-dword.
@@ -1140,6 +952,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw SubmissionScheduler.Fatal($"A padded storage buffer exceeds the device limit or its cache buffer: buffer={slot} range=0x{range:X} offset=0x{alignedOffset:X} cache_size=0x{buffer.Size:X}.");
                 }
                 range += tailPadding;
+            }
+            else if (resource.Written)
+            {
+                _imageCache.InvalidateMemoryCopiesFromGpu(address, size);
             }
 
             if (resource.Written && !resource.Formatted)
@@ -1416,7 +1232,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (range.Written)
                 {
-                    _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true);
+                    _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true, traceShaderHash: program.Hash);
                     _imageCache.InvalidateMemoryCopiesFromGpu(range.Base, size);
                 }
                 else
@@ -1658,7 +1474,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var stage = (PreparedStageBindings)prepared;
                 var stageFlag = DescriptorWriter.ShaderStageFlag(StageOf(stage.Program));
-                if ((bindPoint == PipelineBindPoint.Graphics && (stageFlag & (ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit | ShaderStageFlags.TessellationEvaluationBit)) == 0) ||
+                if ((bindPoint == PipelineBindPoint.Graphics && (stageFlag & (ShaderStageFlags.VertexBit | ShaderStageFlags.MeshBitExt | ShaderStageFlags.FragmentBit)) == 0) ||
                     (bindPoint == PipelineBindPoint.Compute && stageFlag != ShaderStageFlags.ComputeBit))
                 {
                     throw SubmissionScheduler.Fatal($"A stage does not belong to the bind point: stage={stage.Program.Stage} bindPoint={bindPoint}.");
@@ -1879,7 +1695,16 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     for (var index = 0; index < descriptors.Images.Length && !stage.Layout.UsesBindlessImages; index++)
                     {
-                        var expected = descriptors.Images[index].MipViews.Length == 0 ? 1u : (uint)descriptors.Images[index].MipViews.Length;
+                        var resources = stage.Resources.Info;
+                        var canonical = resources.GetCanonicalImageBinding((uint)index);
+                        if (canonical >= descriptors.Images.Length || resources.GetCanonicalImageBinding(canonical) != canonical)
+                        {
+                            throw SubmissionScheduler.Fatal($"An image alias has no canonical binding: image={index} canonical={canonical} hash=0x{program.Hash:X16}.");
+                        }
+
+                        var expected = canonical == index
+                            ? Math.Max(1u, (uint)descriptors.Images[index].MipViews.Length)
+                            : 0u;
                         if (occurrences[index] != expected)
                         {
                             throw SubmissionScheduler.Fatal($"An image is bound a different number of times than its views: image={index} occurrences={occurrences[index]} views={expected} hash=0x{program.Hash:X16}.");
@@ -1904,8 +1729,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if (hasPushData)
                 {
-                    var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit |
-                        (entry.Description?.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit) : ShaderStageFlags.ComputeBit;
+                    var pushStages = bindPoint == PipelineBindPoint.Graphics
+                        ? ((entry.Description?.VertexStage.Stage == ShaderStageKind.Mesh
+                            ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
+                           ShaderStageFlags.FragmentBit)
+                        : ShaderStageFlags.ComputeBit;
                     PushConstantsShadowed(command, entry.Layout, pushStages, pushData);
                 }
 

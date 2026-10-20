@@ -87,6 +87,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
     public static ISharpEmuRuntime CreateDefault(SharpEmuRuntimeOptions options = default)
     {
+        Console.Error.WriteLine("[MEDIA][INFO] BINK VIDEO PLAYBACK MODE: " +
+            SharpEmu.Libs.Media.HostMovieBridge.GetPlaybackModeName(Environment.GetEnvironmentVariable("SHARPEMU_BINK_MODE")));
         var cpuExecutionOptions = new CpuExecutionOptions
         {
             CpuEngine = options.CpuEngine,
@@ -96,7 +98,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         };
         var virtualMemory = new PhysicalVirtualMemory(
             viewHost: HostViewMemory.Create(),
-            preReserveGuestAddressSpace: true);
+            preReserveGuestAddressSpace: true,
+            adoptStartupAddressReservations: options.AdoptStartupAddressReservations);
         var moduleManager = new ModuleManager();
         // The compile-time generated registry (SharpEmu.SourceGenerators) is the sole
         // registration source; content tests in SharpEmu.Libs.Tests pin its invariants.
@@ -144,7 +147,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
         var mountRoot = Path.GetDirectoryName(fullPath);
 
-        return _selfLoader.Load(bytes.AsSpan(), _virtualMemory, _moduleManager, _fileSystem, mountRoot);
+        return _selfLoader.Load(bytes.AsSpan(), _virtualMemory, _moduleManager, _fileSystem, mountRoot, Path.GetFileName(fullPath));
     }
 
     public OrbisGen2Result Run(string ebootPath)
@@ -821,7 +824,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
                     _virtualMemory,
                     _moduleManager,
                     _fileSystem,
-                    Path.GetDirectoryName(modulePath));
+                    Path.GetDirectoryName(modulePath),
+                    Path.GetFileName(modulePath));
 
                 mergedImportCount += MergeImportStubs(importStubs, moduleImage.ImportStubs, modulePath);
                 mergedSymbolCount += MergeRuntimeSymbols(runtimeSymbols, moduleImage.RuntimeSymbols);
@@ -893,7 +897,8 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
                     _virtualMemory,
                     _moduleManager,
                     _fileSystem,
-                    Path.GetDirectoryName(modulePath));
+                    Path.GetDirectoryName(modulePath),
+                    Path.GetFileName(modulePath));
                 var candidateImportStubs = new Dictionary<ulong, string>(activeImportStubs);
                 var candidateRuntimeSymbols = new Dictionary<string, ulong>(activeRuntimeSymbols, StringComparer.Ordinal);
                 _ = MergeImportStubs(candidateImportStubs, moduleImage.ImportStubs, modulePath);

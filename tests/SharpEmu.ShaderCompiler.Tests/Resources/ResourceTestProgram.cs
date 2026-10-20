@@ -179,12 +179,12 @@ internal static class ResourceTestProgram
         var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
         var layout = BindingLayout.Allocate(
             resources.Info,
-            BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount),
+            BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount, plan.Graph.ExcludedUserDataRegisters),
             BindingLayout.UsesGlobalDataShare(program),
             ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
             BindingLayout.ReadsShaderBase(program),
             pushDataStartDword,
-            usesBindlessImages: usesBindlessImages);
+            usesMeshDrawParameters: stage == ShaderStage.Mesh);
         return (plan, resources, layout);
     }
 

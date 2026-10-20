@@ -149,8 +149,7 @@ public static partial class Gen5SpirvTranslator
 
             if ((enabledInputs & (1u << 13)) != 0)
             {
-                _module.AddExtension("SPV_EXT_shader_viewport_index_layer");
-                _module.AddCapability(SpirvCapability.ShaderViewportIndexLayerExt);
+                _module.AddCapability(SpirvCapability.ShaderLayer);
                 _ancillaryLayerInput = _module.AddGlobalVariable(
                     _module.TypePointer(SpirvStorageClass.Input, _uintType), SpirvStorageClass.Input);
                 _module.AddDecoration(_ancillaryLayerInput, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Layer);
@@ -175,8 +174,9 @@ public static partial class Gen5SpirvTranslator
             UInt(_request.PixelFrontFaceAllBits ? 1u : 0x3F800000u),
             UInt(_request.PixelFrontFaceAllBits ? 0u : 0xBF800000u));
 
+        // ANCILLARY stores the render-target layer in bits 16 through 26.
         private uint LoadAncillaryInput() =>
-            ShiftLeftLogical(Load(_uintType, _ancillaryLayerInput), UInt(16));
+            ShiftLeftLogical(BitwiseAnd(Load(_uintType, _ancillaryLayerInput), UInt(0x7ff)), UInt(16));
 
         private uint LoadSampleCoverageInput()
         {

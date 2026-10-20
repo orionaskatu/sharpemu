@@ -83,7 +83,7 @@ internal sealed unsafe class Videodec2Decoder : IDisposable
     private readonly Thread _worker;
     private readonly Thread _scheduler;
 
-    // Kept alive until both threads have finished accepted decode and presentation work.
+    // Cancelled on Dispose so both loops stop within one access unit; disposed only after both have joined.
     private readonly CancellationTokenSource _workerCts = new();
 
     private readonly object _protocolGate = new();
@@ -201,12 +201,21 @@ internal sealed unsafe class Videodec2Decoder : IDisposable
             // Must be set before any ffmpeg.* call, or bindings resolve against the empty default RootPath.
             ffmpeg.RootPath = Path.Combine(AppContext.BaseDirectory, "plugins");
             DynamicallyLoadedBindings.Initialize();
+            ffmpeg.av_log_set_level(ffmpeg.AV_LOG_ERROR);
         }
     }
 
     public bool EnqueueAccessUnit(byte[] accessUnit)
     {
-        return _workChannel.Writer.TryWrite(accessUnit);
+        lock (_gate)
+        {
+            if (_disposed || _disposing)
+            {
+                return false;
+            }
+
+            return _workChannel.Writer.TryWrite(accessUnit);
+        }
     }
 
     /// <summary>Queues an end-of-stream drain: flush FFmpeg and emit one more buffered picture, if any.</summary>
@@ -803,14 +812,16 @@ internal sealed unsafe class Videodec2Decoder : IDisposable
             _disposing = true;
         }
 
-        // Stop accepting access units, then finish the work already accepted. The
-        // scheduler must stay alive while the worker drains its bounded frame queue.
-        RequestDrain();
+        // Stop accepting access units and drop the work still queued: a title deletes its
+        // decoder to end or skip a movie, and playing out the backlog at the movie's frame rate
+        // would hold it for seconds. Both loops observe the cancellation within one access unit;
+        // they are joined without a timeout so FFmpeg is never freed under a running worker.
         _workChannel.Writer.TryComplete();
         _worker.Join();
         _frameQueue.Writer.TryComplete();
-        _scheduler.Join();
         _workerCts.Cancel();
+        _worker.Join();
+        _scheduler.Join();
         _workerCts.Dispose();
 
         lock (_gate)

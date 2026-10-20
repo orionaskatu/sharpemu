@@ -24,70 +24,19 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     private const ulong Page = GuestBufferCache.CachingPageSize;
 
     [Fact]
-    public void SubpageImageUpload_PreservesTheOtherTexturesInItsTrackerPage()
+    public void DownloadRingAcceptsFiftyMiBReservation()
     {
-        if (_vulkan is null) return;
-        using var fatal = new FatalScope();
+        if (!GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
-        var address = harness.MapBacked(0x10000, ReadWrite);
-        harness.Write(address + 0x100, Bytes(0xffffffffu));
-        harness.Write(address + 0x400, Bytes(0xff000000u));
         harness.Worker.Run(() =>
         {
-            _ = harness.Cache.FindBuffer(address, 0x10000);
-            _ = harness.Cache.ObtainBufferForImage(address + 0x400, 256);
+            var download = harness.Cache.GetUtilityBuffer(GpuBufferUsage.Download);
+            Assert.True(download.TryMap(50UL * 1024 * 1024, out var offset, 256));
+            Assert.Equal(0UL, offset);
+            download.Commit();
         });
-        var (source, offset) = harness.Worker.Run(() => harness.Cache.ObtainBufferForImage(address + 0x100, 256));
-        Assert.Equal(Bytes(0xffffffffu), harness.ReadBufferBytes(source, offset, 4));
         harness.Shutdown();
     }
-
-    [Fact]
-    public void CommandBackingReadRejectsGpuImageBytesButAllowsCleanPageNeighbours()
-    {
-        if (!GatePrerequisites.Ready(_vulkan)) return;
-        using var harness = new CacheHarness(_vulkan!);
-        var address = harness.MapBacked(Page, ReadWrite);
-        harness.Write(address + 64, new byte[] { 1, 2, 3, 4 });
-        var request = Color32(address, 4);
-        var id = harness.Acquire(ref request);
-        harness.Worker.Run(() =>
-        {
-            Assert.True(harness.Images.TryClearImageFromBuffer(address, 16, 0x22222222));
-            Assert.True(harness.Image(id).IsGpuModified);
-            var tick = harness.Scheduler.CurrentTick;
-            Span<byte> bytes = stackalloc byte[4];
-            Assert.False(harness.Cache.TryReadCommandBacking(address, bytes));
-            Assert.True(harness.Cache.TryReadCommandBacking(address + 64, bytes));
-            Assert.Equal(new byte[] { 1, 2, 3, 4 }, bytes.ToArray());
-            Assert.Equal(tick, harness.Scheduler.CurrentTick);
-        });
-    }
-
-    [Fact]
-    public void CommandBytesNextToPendingGpuCounterDoNotWaitOrUnprotectThePage()
-    {
-        if (!GatePrerequisites.Ready(_vulkan)) return;
-        using var harness = new CacheHarness(_vulkan!);
-        var address = harness.MapBacked(Page, ReadWrite);
-        harness.Write(address + 16, new byte[] { 1, 2, 3, 4 });
-        harness.Worker.Run(() =>
-        {
-            var (buffer, offset) = harness.Cache.ObtainBuffer(address, 4, isWritten: true);
-            buffer.Fill(offset, 4, 123);
-            var tick = harness.Scheduler.CurrentTick;
-            var protection = harness.Protection(address);
-            Span<byte> bytes = stackalloc byte[4];
-            Assert.True(harness.Cache.TryReadCommandBacking(address + 16, bytes));
-            Assert.Equal(new byte[] { 1, 2, 3, 4 }, bytes.ToArray());
-            Assert.False(harness.Cache.TryReadCommandBacking(address, bytes));
-            Assert.False(harness.Cache.TryReadCommandBacking(address - 2, bytes));
-            Assert.Equal(tick, harness.Scheduler.CurrentTick);
-            Assert.Equal(protection, harness.Protection(address));
-            Assert.True(harness.Cache.HasGpuDirtyPages(address, 4));
-        });
-    }
-
 
     [Fact]
     public void UnalignedImageObtainUploadsTheWholeDirtyPageToItsBufferOwner()

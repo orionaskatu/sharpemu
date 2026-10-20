@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2026 SharpEmu Emulator Project
+// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
@@ -133,6 +133,7 @@ public static class PlayGoExports
 
             if (!_metadata.Available)
             {
+                TracePlayGo("open result=0x80B2000E metadata_unavailable");
                 return OrbisPlayGoErrorNotSupportPlayGo;
             }
 
@@ -707,9 +708,19 @@ public static class PlayGoExports
 
     private static PlayGoMetadata LoadPlayGoMetadata()
     {
+        var disableMetadataFallback = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PLAYGO_DISABLE_METADATA_FALLBACK"),
+            "1",
+            StringComparison.Ordinal);
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         if (string.IsNullOrWhiteSpace(app0Root))
         {
+            if (disableMetadataFallback)
+            {
+                TracePlayGo("metadata_unavailable app0_unset fallback_disabled=1");
+                return PlayGoMetadata.Empty;
+            }
+
             // No app0 override to probe for sidecar files: same fully-installed
             // single-chunk fallback as below, or scePlayGoOpen fails fatally.
             return new PlayGoMetadata(
@@ -727,8 +738,29 @@ public static class PlayGoExports
         var pgmChunkIds = LoadPlayGoPgmChunkIds(playGoPgm);
         if (pgmChunkIds.Length > 0)
         {
-            TracePlayGo($"metadata_pgm chunks={pgmChunkIds.Length}");
-            return new PlayGoMetadata(true, pgmChunkIds, PlayGoChunkIdKnowledge.Assumed);
+            if (disableMetadataFallback)
+            {
+                TracePlayGo("metadata_missing fallback_disabled=1");
+                return PlayGoMetadata.Empty;
+            }
+
+            // No PlayGo sidecar: derive the installed chunk set from the pak files
+            // actually present on disk. A locally dumped title has all of its data
+            // installed, and a package that splits content across chunks names them
+            // pakchunk<N>-<platform>.pak, so those N are exactly the chunks that
+            // exist. Reporting only chunk 0 told such a title its remaining content
+            // was missing: The Invincible (PPSA06426) ships pakchunk0..8 and spun
+            // forever re-querying scePlayGoGetLocus for a chunk that never became
+            // available. Available must stay true or scePlayGoOpen fails with
+            // NotSupportPlayGo (fatal PS5-component init failure for UE titles).
+            // Ids outside the discovered set still return BAD_CHUNK_ID, so
+            // title-side chunk enumeration still terminates.
+            var installedChunkIds = DiscoverInstalledChunkIds(app0Root);
+            TracePlayGo($"metadata_missing; fully-installed chunks=[{string.Join(',', installedChunkIds)}]");
+            return new PlayGoMetadata(
+                true,
+                installedChunkIds,
+                PlayGoChunkIdKnowledge.Authoritative);
         }
 
         var chunkIds = LoadChunkIds(chunkDefsXml);

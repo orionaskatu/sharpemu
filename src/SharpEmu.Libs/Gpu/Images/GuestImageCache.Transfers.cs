@@ -3,8 +3,10 @@
 
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
+using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
+using SharpEmu.Libs.Kernel;
 using Silk.NET.Vulkan;
 
 using SharpEmu.Libs.VideoOut;
@@ -407,6 +409,20 @@ public sealed unsafe partial class GuestImageCache
         var destination = _slots[association.DepthOwner];
         var info = StencilPlaneLayout(destination, association.Description.Data, "upload");
         var fullSliceSize = info.Data.Size / info.Resources.Layers;
+        var rowHeight = info.IsTiled ? DepthBlock(info).BlockHeight : 1u;
+        var rowBytes = (ulong)info.Pitch * rowHeight;
+        var fittingHeight = rowBytes == 0 ? 0 : fullSliceSize / rowBytes * rowHeight;
+        if (fittingHeight == 0)
+        {
+            throw SubmissionScheduler.Fatal(
+                $"The stencil plane is smaller than one row: address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X} pitch={info.Pitch} layers={info.Resources.Layers}.");
+        }
+
+        if (fittingHeight < info.Extent.Height)
+        {
+            info.Extent.Height = (uint)fittingHeight;
+        }
+
         var copies = DepthCopies(info, fullSliceSize, ImageAspectFlags.StencilBit);
         var linear = new TilerBufferSpan(source.Handle, sourceOffset, source.Size - sourceOffset);
         if (info.IsTiled)
@@ -418,61 +434,7 @@ public sealed unsafe partial class GuestImageCache
         UploadRegions(destination, copies.ToList(), linear);
     }
 
-    private static uint ExpandedColorChannels(CachedImage image) =>
-        image.Backing.Format is Format.R8G8B8A8Srgb or Format.R8G8B8A8Unorm
-            ? image.Description.GuestFormat switch
-            {
-                GuestPixelFormat.Bits8Srgb => 1u,
-                GuestPixelFormat.Bits8_8Srgb => 2u,
-                _ => 0u,
-            }
-            : 0u;
-
-    private static List<BufferImageCopy> ExpandedColorRegions(List<BufferImageCopy> guestRegions, out ulong size)
-    {
-        var result = new List<BufferImageCopy>(guestRegions.Count);
-        size = 0;
-        foreach (var guest in guestRegions)
-        {
-            var wide = guest;
-            wide.BufferOffset = size;
-            var pitch = guest.BufferRowLength == 0 ? guest.ImageExtent.Width : guest.BufferRowLength;
-            var height = guest.BufferImageHeight == 0 ? guest.ImageExtent.Height : guest.BufferImageHeight;
-            size = checked(size + (ulong)pitch * height * 4);
-            result.Add(wide);
-        }
-        return result;
-    }
-
-    private void ConvertExpandedColor(TilerBufferSpan guest, TilerBufferSpan wide,
-        List<BufferImageCopy> guestRegions, List<BufferImageCopy> wideRegions, uint channels, bool widen)
-    {
-        for (var index = 0; index < guestRegions.Count; index++)
-        {
-            var region = guestRegions[index];
-            if (region.ImageExtent.Depth != 1 || region.ImageSubresource.LayerCount != 1)
-                throw SubmissionScheduler.Fatal("Expanded color transfers require one slice per copy region.");
-            var pitch = region.BufferRowLength == 0 ? region.ImageExtent.Width : region.BufferRowLength;
-            var height = region.BufferImageHeight == 0 ? region.ImageExtent.Height : region.BufferImageHeight;
-            var narrowRow = checked((ulong)pitch * channels);
-            var wideRow = checked((ulong)pitch * 4);
-            if (region.BufferOffset > guest.Size || wideRegions[index].BufferOffset > wide.Size)
-                throw SubmissionScheduler.Fatal("Expanded color transfer offset exceeds its buffer span.");
-            var narrow = new TilerBufferSpan(guest.Buffer, checked(guest.Offset + region.BufferOffset), guest.Size - region.BufferOffset);
-            var expanded = new TilerBufferSpan(wide.Buffer, checked(wide.Offset + wideRegions[index].BufferOffset), wide.Size - wideRegions[index].BufferOffset);
-            _tiler.ConvertNarrowColor(widen ? narrow : expanded, widen ? expanded : narrow, channels, widen,
-                new DepthConversionLayout
-                {
-                    Width = region.ImageExtent.Width, Height = region.ImageExtent.Height, Layers = 1,
-                    SourceRowStride = widen ? narrowRow : wideRow,
-                    TargetRowStride = widen ? wideRow : narrowRow,
-                    SourceSliceStride = checked((widen ? narrowRow : wideRow) * height),
-                    TargetSliceStride = checked((widen ? wideRow : narrowRow) * height),
-                });
-        }
-    }
-
-    private void UploadFromBuffer(CachedImage image, in ImageRequest request, GpuBuffer source, ulong sourceOffset)
+    private void UploadFromBuffer(CachedImage image, in ImageRequest request, GpuBuffer source, ulong sourceOffset, byte[]? backingBytes = null, uint firstLayer = 0)
     {
         if (image.DepthOwner.IsValid)
         {
@@ -484,11 +446,30 @@ public sealed unsafe partial class GuestImageCache
         if (request.Role != ImageRole.DepthTarget)
         {
             var plan = PlanColorTransfer(image, request.Role, TransferDirection.Upload);
+            if (ImageClearTrace.Enabled && info.IsVolume) ReportVolumeProvenance(image);
+            if (ImageClearTrace.Enabled && IsTracedImage(info))
+            {
+                TraceVolumeState("upload", image, request,
+                    $"sourceBuffer=0x{source.Handle.Handle:X} sourceOffset=0x{sourceOffset:X} tiled={plan.Tiled} linearSize=0x{plan.LinearSize:X} regions={plan.Regions.Count} tiles={plan.Tiles.Count}");
+                foreach (var region in plan.Regions)
+                    TraceVolumeState("upload-region", image, request,
+                        $"offset=0x{region.BufferOffset:X} rowLength={region.BufferRowLength} imageHeight={region.BufferImageHeight} mip={region.ImageSubresource.MipLevel} depth={region.ImageExtent.Depth}");
+            }
             if (!plan.Valid)
             {
                 throw SubmissionScheduler.Fatal(
                     $"The color upload is invalid: role={request.Role} address=0x{info.Data.Address:X16} size=0x{info.Data.Size:X16} format={(uint)info.GuestFormat} tile={(uint)info.TileMode} " +
                     $"kind={(uint)plan.Layout.Surface.Texture.Block.Kind} extent={info.Extent.Width}x{info.Extent.Height}x{info.Extent.Depth} pitch={info.Pitch} levels={info.Resources.Levels} layers={info.Resources.Layers} samples={info.Samples}.");
+            }
+
+            if (firstLayer != 0)
+            {
+                if (info.Resources.Levels != 1 || firstLayer >= info.Resources.Layers ||
+                    plan.Regions.Count != info.Resources.Layers || (plan.Tiled && plan.Tiles.Count != plan.Regions.Count))
+                    throw SubmissionScheduler.Fatal("The partial array upload layout is invalid.");
+                // Keep the original offsets and slice indices for the tiling equations.
+                plan.Regions.RemoveRange(0, checked((int)firstLayer));
+                if (plan.Tiled) plan.Tiles.RemoveRange(0, checked((int)firstLayer));
             }
 
             var linear = new TilerBufferSpan(source.Handle, sourceOffset, info.Data.Size);
@@ -508,17 +489,8 @@ public sealed unsafe partial class GuestImageCache
                 linear = _tiler.SwapBgra16(linear);
             }
 
-            if (ExpandedColorChannels(image) is var channels && channels != 0)
-            {
-                var wideRegions = ExpandedColorRegions(plan.Regions, out var wideSize);
-                var wide = _tiler.GetScratchBuffer(wideSize);
-                ConvertExpandedColor(linear, wide, plan.Regions, wideRegions, channels, widen: true);
-                UploadRegions(image, wideRegions, wide);
-            }
-            else
-            {
-                UploadRegions(image, plan.Regions, linear);
-            }
+            DumpVolumeUpload(image, source, sourceOffset, linear, plan, backingBytes);
+            UploadRegions(image, plan.Regions, linear);
             return;
         }
 
@@ -580,7 +552,7 @@ public sealed unsafe partial class GuestImageCache
     }
 
     // Uploads the guest bytes when the guest or a buffer owns them; watches the image first.
-    private void PopulateFromGuest(ResourceSlotIdentifier imageIdentifier, in ImageRequest request, string uploadPath)
+    private void PopulateFromGuest(ResourceSlotIdentifier imageIdentifier, in ImageRequest request, string uploadPath, uint firstLayer = 0)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageUpload);
         var image = _slots[imageIdentifier];
@@ -597,6 +569,7 @@ public sealed unsafe partial class GuestImageCache
         }
 
         var measureUpload = RenderPhaseProfile.ImageUploadDetailsEnabled;
+        ReportImageLifetime(image, "populate-attempt");
         var watchStarted = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         WatchImage(imageIdentifier);
         var watchFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -619,26 +592,28 @@ public sealed unsafe partial class GuestImageCache
         var upload = image.IsBufferModified || image.IsCpuDirty;
         if (upload)
         {
+            if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-upload", image.Description.Data.Address, image.Description.Data.Size, $"cpuDirty={image.IsCpuDirty} bufferDirty={image.IsBufferModified}");
             var reason = image.IsBufferModified
                 ? (image.IsCpuDirty ? "buffer-and-cpu-dirty" : "buffer-dirty")
                 : (image.IsMaybeCpuDirty ? "maybe-cpu-dirty" : "cpu-dirty");
             var sourceStarted = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             dataImported = true;
             long sourceFinished;
-            if (TryUploadChangedPieces(image, request))
+            if (firstLayer == 0 && TryUploadChangedPieces(image, request))
             {
                 sourceFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             }
             else
             {
                 // Hash before staging: a write racing the copy then shows up as a changed piece next time.
-                var piecePlan = !image.IsBufferModified && !_bufferCache.HasGpuDirtyBytes(image.Description.Data.Address, image.Description.Data.Size)
+                var piecePlan = firstLayer == 0 && !image.IsBufferModified && !_bufferCache.HasGpuDirtyBytes(image.Description.Data.Address, image.Description.Data.Size)
                     ? PieceHashPlan(image, request)
                     : null;
                 var pieceHashes = piecePlan != null ? HashGuestPieces(image.Description.Data, piecePlan.Tiles) : null;
+                var backingBytes = SnapshotVolumeBacking(image);
                 var (source, sourceOffset) = _bufferCache.ObtainBufferForImage(image.Description.Data.Address, image.Description.Data.Size);
                 sourceFinished = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                UploadFromBuffer(image, request, source, sourceOffset);
+                UploadFromBuffer(image, request, source, sourceOffset, backingBytes, firstLayer);
                 image.SetGuestPieceHashes(pieceHashes);
             }
 
@@ -778,6 +753,7 @@ public sealed unsafe partial class GuestImageCache
 
     private void DownloadToBuffer(CachedImage image, GpuBuffer destination, ulong destinationOffset, ulong destinationSize, ImageDownloadPlan plan)
     {
+        if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-to-buffer", image.Description.Data.Address, image.Description.Data.Size, $"destinationOffset=0x{destinationOffset:X} destinationSize=0x{destinationSize:X}");
         if (!plan.Valid)
         {
             throw SubmissionScheduler.Fatal($"The image download plan is invalid: address=0x{image.Description.Data.Address:X16} size=0x{image.Description.Data.Size:X}.");
@@ -1072,6 +1048,7 @@ public sealed unsafe partial class GuestImageCache
         var range = image.Description.Data;
         var ring = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Download);
         GpuBuffer download = ring;
+        if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-to-guest-planned", range.Address, range.Size, "");
         if (ring.TryMap(range.Size, out var offset, Math.Max(image.Description.BytesPerBlock, 4u)))
         {
             ring.Commit();
@@ -1107,7 +1084,11 @@ public sealed unsafe partial class GuestImageCache
         lock (_publishingDownloads) _publishingDownloads.Add(publishing);
         _scheduler.QueuePriorityCompletionAction(() =>
         {
-            try
+            download.Invalidate(offset, range.Size);
+            GpuWritebackEpoch.Advance();
+            var published = download.Mapped.Slice((int)offset, (int)range.Size);
+            if (!backing.TryWriteBacking(range.Address, published) &&
+                !KernelMemoryCompatExports.TryWritePrtBacking(backing, range.Address, published))
             {
                 download.Invalidate(offset, range.Size);
                 GpuWritebackEpoch.Advance();
@@ -1120,6 +1101,7 @@ public sealed unsafe partial class GuestImageCache
             {
                 lock (_publishingDownloads) _publishingDownloads.Remove(publishing);
             }
+            if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("image-published", range.Address, range.Size, "completion-callback=true");
         });
         // Completion actions wait for the priority readback before freeing spill buffers.
         if (download != ring) _scheduler.QueueCompletionAction(download.Dispose);

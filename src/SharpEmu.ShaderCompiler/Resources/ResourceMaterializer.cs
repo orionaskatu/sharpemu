@@ -9,7 +9,7 @@ namespace SharpEmu.ShaderCompiler.Resources;
 
 // Resolves a plan against one draw: descriptor sources, indirect image tables and the
 // specialization. Both outputs change only when the whole materialisation succeeds.
-public static class ResourceMaterializer
+public static partial class ResourceMaterializer
 {
     private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
     private const ulong MaxIndirectImageProbes = 65536;
@@ -101,9 +101,32 @@ public static class ResourceMaterializer
             materialized.FlattenedTable[offset + 2] = (uint)Math.Min(range.Size, uint.MaxValue);
         }
 
-        if (!BuildSpecialization(plan, materialized, out var nextSnapshot, out var nextSpecialization, out failure, captureIndirectImageFailure))
+        var guard = Volatile.Read(ref plan.SpecializationGuard);
+        MaterializedSnapshot nextSnapshot;
+        ResourceSpecialization nextSpecialization;
+        if (guard is not null && MatchesGuard(plan, materialized, guard))
         {
-            return false;
+            using var guardProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.SpecializationGuardHit);
+            ApplyGuard(materialized, guard);
+            nextSnapshot = materialized;
+            nextSpecialization = guard.Specialization.Clone();
+        }
+        else
+        {
+            var candidate = CaptureGuard(plan, materialized);
+            var originalSamplers = materialized.Samplers;
+            if (!BuildSpecialization(plan, materialized, out nextSnapshot, out nextSpecialization, out failure, captureIndirectImageFailure))
+                return false;
+            if (candidate is not null && MatchesGuard(plan, materialized, candidate, checkSamplers: false))
+            {
+                candidate.SamplerSources = materialized.Samplers.Select(words => Array.FindIndex(originalSamplers,
+                    original => ReferenceEquals(original, words))).ToArray();
+                if (candidate.SamplerSources.All(index => index >= 0))
+                {
+                    candidate.Specialization = nextSpecialization.Clone();
+                    Volatile.Write(ref plan.SpecializationGuard, candidate);
+                }
+            }
         }
 
         using var outputProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.OutputAssembly);
@@ -124,13 +147,18 @@ public static class ResourceMaterializer
 
     // Evaluates only the flattened table, laid out as a full materialization lays it out
     // before specialization; the written device-address slots are left zero for the caller.
-    public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table) =>
-        TryEvaluateTable(plan, inputs, out table, null);
-
-    public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table,
-        List<TableWordPatch>? patches) =>
-        RuntimeValueEvaluator.EvaluateSources(plan, [], inputs, plan.CleanFlatSlots, evaluateTable: true, out _, out table, out _,
-            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount), patches);
+    public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table)
+    {
+        var additionalTableWords = checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount);
+        // Only this table-only caller can omit descriptor branch activity.
+        if (RuntimeValueEvaluator.HasResourceStructure(plan) && plan.CompiledTableTransaction is { } transaction)
+        {
+            ResourceMaterializationCache.RecordEvaluationPath(plan, "compiled_table");
+            return transaction.Evaluate(inputs, additionalTableWords, out _, out table);
+        }
+        return RuntimeValueEvaluator.EvaluateSources(plan, [], inputs, plan.CleanFlatSlots, evaluateTable: true,
+            out _, out table, out _, additionalTableWords: additionalTableWords);
+    }
 
     // ---- snapshot ----
 
@@ -906,6 +934,7 @@ public static class ResourceMaterializer
                         $"{Hex(baseAddress + relative)} (heap base={Hex(baseAddress)} offset={Hex(relative)})");
             }
 
+            inputs.TraceImageCandidate?.Invoke(image.Source, key, baseAddress, baseAddress + entry, candidate);
             if (!UsableImageCandidate(candidate, r128))
                 Array.Clear(candidate);
             probed.Add(candidate);
@@ -1227,7 +1256,7 @@ public static class ResourceMaterializer
             var words = new DescriptorWords(candidate);
             if (!indices.TryGetValue(candidate, out var found))
             {
-                if (result.Descriptors.Count >= ShaderResourceInfo.MaxImages)
+                if (result.Descriptors.Count >= ShaderResourceInfo.MaxIndirectImageCandidates)
                 {
                     failure = ResourceMaterializationFailure.ImageCapacityExceeded;
                     return Fail($"indirect image table has more than {ShaderResourceInfo.MaxImages} distinct descriptors among {probed.Count} candidates");
@@ -1374,14 +1403,8 @@ public static class ResourceMaterializer
                 return Fail("indirect image table has an invalid root or candidate count");
             }
 
-            if (imageCount + table.Descriptors.Count - 1 > ShaderResourceInfo.MaxImages)
-            {
-                failure = ResourceMaterializationFailure.ImageCapacityExceeded;
-                return Fail($"indirect image candidates exceed the dense image resource limit: images={imageCount} candidates={table.Descriptors.Count} keys={table.Keys.Count} limit={ShaderResourceInfo.MaxImages}");
-            }
-
-            imageCount += table.Descriptors.Count - 1;
-            mappingWordCount = checked(mappingWordCount + 1 + MappingCapacity(table.Keys.Count) * 2);
+            imageCount = checked(imageCount + table.Descriptors.Count - 1);
+            mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
         }
 
         foreach (var table in snapshot.BufferCandidateTables)
@@ -1730,7 +1753,7 @@ public static class ResourceMaterializer
 
         // ApplyTo appends a depth-compare copy of every sampler shared by ordinary and
         // depth-reference sampling, after the point samplers; the snapshot needs the same words there.
-        var compareUsage = new byte[ShaderResourceInfo.MaxSamplers];
+        var compareUsage = new byte[snapshot.Samplers.Length];
         foreach (var pair in info.SampledPairs)
         {
             var image = info.Images[(int)pair.Image];
@@ -1746,11 +1769,6 @@ public static class ResourceMaterializer
         {
             if (compareUsage[index] == 3)
             {
-                if (snapshot.Samplers.Length >= ShaderResourceInfo.MaxSamplers)
-                {
-                    return Fail("specialized sampler layout exceeds its resource limit");
-                }
-
                 Array.Resize(ref snapshot.Samplers, snapshot.Samplers.Length + 1);
                 snapshot.Samplers[^1] = snapshot.Samplers[index];
             }
@@ -1821,6 +1839,8 @@ public static class ResourceMaterializer
             Buffers = buffers,
             Images = images,
             BufferCandidateTables = candidateTables,
+            ImageDescriptorGroups = DescriptorBindingAliases.Group(snapshot.Images),
+            SamplerDescriptorGroups = DescriptorBindingAliases.Group(snapshot.Samplers.Take(info.Samplers.Count).ToArray()),
         };
         specializedSnapshot = snapshot;
         return true;
@@ -1835,7 +1855,7 @@ public static class ResourceMaterializer
 
     private sealed class SamplerPlan
     {
-        public uint[] PointSampler = new uint[ShaderResourceInfo.MaxSamplers];
+        public uint[] PointSampler = [];
         public uint SamplerCount;
     }
 
@@ -1843,15 +1863,11 @@ public static class ResourceMaterializer
     // copy; when every pair does, the sampler itself switches.
     private static bool BuildSamplerPlan(ShaderResourceInfo info, IReadOnlyList<ImageSpecialization> images, out SamplerPlan plan)
     {
-        plan = new SamplerPlan();
-        if (info.Samplers.Count > plan.PointSampler.Length)
-        {
-            return false;
-        }
+        plan = new SamplerPlan { PointSampler = new uint[info.Samplers.Count] };
 
         Array.Fill(plan.PointSampler, DescriptorConstants.NoIndex);
         plan.SamplerCount = (uint)info.Samplers.Count;
-        var usage = new byte[ShaderResourceInfo.MaxSamplers];
+        var usage = new byte[info.Samplers.Count];
         foreach (var pair in info.SampledPairs)
         {
             if (pair.Image >= images.Count || pair.Sampler >= info.Samplers.Count)
@@ -1876,11 +1892,6 @@ public static class ResourceMaterializer
             }
             else
             {
-                if (plan.SamplerCount >= ShaderResourceInfo.MaxSamplers)
-                {
-                    return false;
-                }
-
                 plan.PointSampler[index] = plan.SamplerCount++;
             }
         }
@@ -2017,16 +2028,16 @@ public static class ResourceMaterializer
         // sampling. Vulkan bakes compareEnable into VkSampler, so those uses cannot
         // share one host sampler. Split only the mixed cases; compare-only samplers
         // can use their existing slot.
-        var compareUsage = new byte[ShaderResourceInfo.MaxSamplers];
+        var compareUsage = new byte[info.Samplers.Count];
         foreach (var pair in info.SampledPairs)
         {
             var image = info.Images[(int)pair.Image];
             compareUsage[pair.Sampler] |= image.DepthCompare ? (byte)2 : (byte)1;
         }
 
-        var compareSampler = new uint[ShaderResourceInfo.MaxSamplers];
+        var compareSampler = new uint[info.Samplers.Count];
         Array.Fill(compareSampler, DescriptorConstants.NoIndex);
-        for (var index = 0; index < info.Samplers.Count; index++)
+        for (var index = 0; index < compareUsage.Length; index++)
         {
             if ((compareUsage[index] & 2) == 0)
             {
@@ -2038,11 +2049,6 @@ public static class ResourceMaterializer
                 info.Samplers[index].DepthCompare = true;
                 compareSampler[index] = (uint)index;
                 continue;
-            }
-
-            if (info.Samplers.Count >= ShaderResourceInfo.MaxSamplers)
-            {
-                throw new ResourcePlanException($"shader resource specialization exceeds the sampler limit: hash=0x{plan.Hash:X16}");
             }
 
             var sampler = info.Samplers[index].Clone();
@@ -2091,6 +2097,7 @@ public static class ResourceMaterializer
             }
         }
 
+        DescriptorBindingAliases.Apply(info, source, specialization);
         return new SpecializedResourceInfo { Info = info, SamplerByMemoryIndex = samplerByMemory };
     }
 }

@@ -162,23 +162,7 @@ public sealed partial class RenderExecutor
             depthState.BackMasks,
             state.ColorCount,
             colorWriteMask,
-            depthState.DepthMinBounds,
-            depthState.DepthMaxBounds);
-    }
-
-    // A guest scissor in host texels. The edges round outward so no guest pixel the game
-    // asked for loses its host coverage, and the result stays inside the attachment.
-    public static ScissorRectangle ScaleScissor(ScissorRectangle scissor, float scale, uint hostWidth, uint hostHeight)
-    {
-        static int Floor(int value, float scale) => (int)MathF.Floor(value * scale);
-        static int Ceiling(int value, float scale) => (int)MathF.Ceiling(value * scale);
-        var left = Math.Clamp(Floor(scissor.Left, scale), 0, (int)hostWidth);
-        var top = Math.Clamp(Floor(scissor.Top, scale), 0, (int)hostHeight);
-        return new ScissorRectangle(
-            left,
-            top,
-            Math.Clamp(Ceiling(scissor.Right, scale), left, (int)hostWidth),
-            Math.Clamp(Ceiling(scissor.Bottom, scale), top, (int)hostHeight));
+            context.DepthCountControl);
     }
 
     // The screen, window, generic, viewport and clip rectangles intersected and clamped to the extent.

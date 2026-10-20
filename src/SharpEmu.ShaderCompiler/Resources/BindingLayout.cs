@@ -358,23 +358,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint MemoryOffsetDword { get; init; }
     public uint MemoryOffsetCount { get; init; }
     public bool UsesDispatchThreadLimits { get; init; }
-    public bool UsesTessellationData { get; init; }
-
-    // The host writes each buffer's descriptor stride into shader data (two 16-bit halves
-    // per dword) and the shader indexes with it, so the stride is not compiled in: one
-    // program serves every stride a title binds instead of one compile per stride.
-    public bool UsesRuntimeBufferStrides { get; init; }
-    // Vulkan can put image arrays in one persistent descriptor set. The per-draw
-    // flattened table then starts with the local-image -> heap-slot mapping.
-    public bool UsesBindlessImages { get; init; }
-
-    // The module reads the internal-resolution dwords: the factor that maps a guest pixel
-    // onto host texels, its reciprocal, the mask of scaled image resources and the factor
-    // the pixel position is divided by.
-    public bool UsesRenderScale { get; init; }
-
-    // The pixel module writes an object/primitive ID target and reads the draw's object ID.
-    public bool UsesObjectId { get; init; }
+    public bool UsesMeshDrawParameters { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
 
@@ -411,7 +395,11 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     // One dword per image resource: the LOD statistics counter the pixel program reports into.
     public uint MipStatisticsCount { get; init; }
 
-    public uint MipStatisticsDword => RenderScaleDword + (UsesRenderScale ? RenderScaleDwordCount : 0u);
+    public uint MipStatisticsDword => DispatchThreadLimitsDword + (UsesDispatchThreadLimits ? 3u : 0u);
+
+    public uint MeshDrawParametersDword => MipStatisticsDword + MipStatisticsCount;
+
+    public uint ShaderDataDwordCount => MeshDrawParametersDword + (UsesMeshDrawParameters ? 6u : 0u);
 
     public bool UsesPushData => PushDataStartDword != PushData.NoStart;
 
@@ -445,7 +433,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     // The user-data registers live at program entry: those some path reads before it
     // writes them, found by liveness over the control-flow graph, in ascending order.
-    public static IReadOnlyList<uint> CollectUserDataRegisters(Gen5ShaderProgram program, uint userDataBase, uint userDataCount)
+    public static IReadOnlyList<uint> CollectUserDataRegisters(Gen5ShaderProgram program, uint userDataBase, uint userDataCount,
+        ulong excludedUserDataRegisters = 0)
     {
         var controlFlow = IrControlFlowGraph.Build(program.Instructions, Gen5IrBranchResolver.Instance);
         var blockCount = controlFlow.Blocks.Count;
@@ -512,7 +501,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         for (uint index = 0; index < userDataCount && blockCount != 0; index++)
         {
             var register = userDataBase + index;
-            if (register < ScalarRegisterCount && (liveIn[register >> 6] & (1UL << (int)(register & 63))) != 0)
+            if (register < ScalarRegisterCount && (liveIn[register >> 6] & (1UL << (int)(register & 63))) != 0 &&
+                (register >= 64 || (excludedUserDataRegisters & (1UL << (int)register)) == 0))
             {
                 registers.Add(register);
             }
@@ -545,19 +535,19 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             }
         }
 
-        // These read the register their destination field names: the bit sets and the SOPK
-        // accumulations modify it, and the SOPK compares only read it.
+        // Include prior destination values for partial updates and conditional moves.
+        // SOPK comparisons read the destination field without writing it.
         var comparesDestination = instruction.Encoding == Gen5ShaderEncoding.Sopk &&
             instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal);
         if (comparesDestination ||
-            instruction.Opcode is "SBitset0B32" or "SBitset1B32" ||
+            instruction.Opcode is "SBitset0B32" or "SBitset1B32" or "SCmovB64" ||
             instruction.Encoding == Gen5ShaderEncoding.Sopk && instruction.Opcode is "SAddkI32" or "SMulkI32" or "SCmovkI32")
         {
             foreach (var destination in instruction.Destinations)
             {
                 if (destination.Kind == Gen5OperandKind.ScalarRegister)
                 {
-                    Use(destination.Value, 1);
+                    Use(destination.Value, instruction.Opcode == "SCmovB64" ? 2u : 1u);
                 }
             }
         }
@@ -618,7 +608,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             return;
         }
 
-        var perDestination = scalarDestinations.Count > 1 ? 1u : width;
+        var perDestination = scalarDestinations.Count > 1 ? 1u : instruction.DestinationWidth;
         foreach (var destination in scalarDestinations)
         {
             for (uint index = 0; index < perDestination && destination.Value + index < ScalarRegisterCount; index++)
@@ -644,11 +634,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesShaderBase,
         uint pushDataStartDword = 0,
         bool usesDispatchThreadLimits = false,
-        bool usesRenderScale = false,
-        bool usesBindlessImages = false,
-        bool usesRuntimeBufferStrides = false,
-        bool usesTessellationData = false,
-        bool usesObjectId = false)
+        bool usesMeshDrawParameters = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
@@ -656,12 +642,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         usesRuntimeBufferStrides &= memoryOffsetCount != 0;
         var mipStatisticsCount = info.Images.Any(static image => image.MipStatistics) ? (uint)info.Images.Count : 0u;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 +
-            (usesRuntimeBufferStrides ? (memoryOffsetCount + 1) / 2 : 0u) + (usesDispatchThreadLimits ? 3u : 0u) +
-            (usesTessellationData ? Gen5TessellationData.DwordCount : 0u) + (usesRenderScale ? RenderScaleDwordCount : 0u) +
-            mipStatisticsCount + (usesObjectId ? 1u : 0u);
-        // The fixed-function control bridge shares the domain stage's runtime
-        // buffer. Keep that ABI independent of per-stage push-data packing.
-        var pushStart = usesTessellationData ? PushData.NoStart : PushData.StartFor(pushDataStartDword, shaderDataDwords);
+            (usesDispatchThreadLimits ? 3u : 0u) + mipStatisticsCount + (usesMeshDrawParameters ? 6u : 0u);
+        var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
         {
@@ -671,6 +653,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         var imageGroups = new List<uint>[ImageBindingCount];
         for (var index = 0; index < info.Images.Count; index++)
         {
+            if (info.GetCanonicalImageBinding((uint)index) != index) continue;
             var image = info.Images[index];
             var kind = ImageDescriptorBinding.ForImage(image);
             if (kind is null)
@@ -705,7 +688,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
         if (info.Samplers.Count != 0)
         {
-            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.Samplers, Enumerable.Range(0, info.Samplers.Count).Select(index => (uint)index).ToArray()));
+            descriptors.Add(new DescriptorBinding(DescriptorBindingKind.Samplers, Enumerable.Range(0, info.Samplers.Count)
+                .Select(index => (uint)index).Where(index => info.SamplerBinding(index) == index).ToArray()));
         }
 
         if (usesGlobalDataShare)
@@ -763,7 +747,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             UsesBindlessImages = usesBindlessImages,
             UsesRenderScale = usesRenderScale,
             MipStatisticsCount = mipStatisticsCount,
-            UsesObjectId = usesObjectId,
+            UsesMeshDrawParameters = usesMeshDrawParameters,
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -782,14 +766,15 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         UsesBindlessImages == other.UsesBindlessImages &&
         UsesRenderScale == other.UsesRenderScale &&
         MipStatisticsCount == other.MipStatisticsCount &&
-        UsesObjectId == other.UsesObjectId &&
+        UsesMeshDrawParameters == other.UsesMeshDrawParameters &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));
 
     public override bool Equals(object? obj) => Equals(obj as BindingLayout);
 
-    public override int GetHashCode() => HashCode.Combine(PushDataStartDword, MemoryOffsetDword, MemoryOffsetCount, Descriptors.Count, UsesDispatchThreadLimits, UsesRenderScale);
+    public override int GetHashCode() => HashCode.Combine(PushDataStartDword, MemoryOffsetDword, MemoryOffsetCount,
+        Descriptors.Count, UsesDispatchThreadLimits, UsesMeshDrawParameters);
 }
 
 // Recomputes the layout an emitter was given from the same inputs and the same push
@@ -811,7 +796,14 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a compute shader can use dispatch thread limits.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.UsesRenderScale, layout.UsesBindlessImages, layout.UsesRuntimeBufferStrides, layout.UsesTessellationData, layout.UsesObjectId);
+        if (layout.UsesMeshDrawParameters && stage != ShaderStage.Mesh)
+        {
+            throw new ResourcePlanException("Only a mesh shader can use mesh draw parameters.");
+        }
+
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare,
+            usesFlattenedTable, usesShaderBase, layout.AllocationCursor,
+            layout.UsesDispatchThreadLimits, layout.UsesMeshDrawParameters);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

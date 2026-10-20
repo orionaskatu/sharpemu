@@ -239,45 +239,16 @@ public sealed class RuntimeValueEvaluator
             return false;
         }
 
-        DbgFlags.CurrentRawRead = (long)value.Payload; // TEMP
-        return ReadRawWord(value.Kind, low, high, (uint)offset, records, (int)memory.Offset, out result);
+        return ReadRawWord(value.Kind, low, high, (uint)offset, records, (int)memory.Offset, out result, value);
     }
 
-    // A buffer load past its V# range reads zero without touching memory.
-    private const ulong OutOfRangeRead = ulong.MaxValue;
+    internal ScalarValue GetCompiledReadNode(int index) => _compiled!.Values[index];
 
-    // The aligned dword a raw read loads, without loading it; OutOfRangeRead for a buffer
-    // load past its records.
-    internal bool TryResolveRawRead(ScalarValue value, out ulong address, out ulong baseAddress)
-    {
-        address = 0;
-        baseAddress = 0;
-        if (value.Kind is not (ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord) ||
-            value.MemoryIndex >= _plan.Memory.Count)
-        {
-            return false;
-        }
+    internal void RecordPrefetchedConsumer(ScalarValue node, ulong address) =>
+        ResourceMaterializationCache.RecordReadConsumer(_plan, node, address);
 
-        var memory = _plan.Memory[value.MemoryIndex];
-        if (!TryEvaluateRawBase(value.Operands[0], value.Kind, out baseAddress, out var high, out var records) ||
-            !Operand(value, 1, out var offset))
-        {
-            return false;
-        }
-
-        switch (ResolveRawAddress(value.Kind, baseAddress, high, records, (int)memory.Offset, (uint)offset, out address))
-        {
-            case RawAddress.Failed:
-                return false;
-            case RawAddress.Zero:
-                address = OutOfRangeRead;
-                return true;
-        }
-
-        return true;
-    }
-
-    internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate, out ulong result)
+    internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate,
+        out ulong result, ScalarValue node)
     {
         result = 0;
         var baseAddress = ((high << 32) | (uint)low) & AddressMask;
@@ -305,6 +276,7 @@ public sealed class RuntimeValueEvaluator
         }
 
         result = word;
+        ResourceMaterializationCache.RecordReadConsumer(_plan, node, address);
         return true;
     }
 
@@ -332,9 +304,8 @@ public sealed class RuntimeValueEvaluator
             var size = stride == 0 ? (ulong)(uint)records : (ulong)stride * (uint)records;
             if (aligned > size || size - aligned < sizeof(uint))
             {
-                // Scalar loads outside the descriptor range return zero on hardware, bound or not.
-                // Reads are evaluated up front, including ones in branches the shader skips.
-                return RawAddress.Zero;
+                // An unbound (empty) V# reads as zero; overrunning a bound buffer stays a failure.
+                return (uint)records == 0 || offset >= 0x8000_0000u ? RawAddress.Zero : RawAddress.Failed;
             }
 
             address = ((baseAddress & ~3ul) + byteOffset) & ~3ul;
@@ -479,9 +450,27 @@ public sealed class RuntimeValueEvaluator
         int additionalTableWords = 0,
         List<TableWordPatch>? patches = null)
     {
+        using var sourceProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.SourceEvaluation);
         results = [];
         table = [];
         activeSources = [];
+        if (evaluateTable && sources.Count == 0 && !HasResourceStructure(plan) && ReferenceEquals(cleanFlatSlots, plan.CleanFlatSlots) &&
+            plan.CompiledTableTransaction is { } tableTransaction)
+        {
+            ResourceMaterializationCache.RecordEvaluationPath(plan, "compiled_table");
+            return tableTransaction.Evaluate(inputs, additionalTableWords, out results, out table);
+        }
+        if (evaluateTable && ReferenceEquals(sources, plan.MaterializationSources) &&
+            ReferenceEquals(cleanFlatSlots, plan.CleanFlatSlots) && plan.CompiledTransaction is { } transaction)
+        {
+            ResourceMaterializationCache.RecordEvaluationPath(plan, "compiled_whole");
+            // A failed transaction must not replay guest reads through the fallback evaluator.
+            return transaction.Evaluate(inputs, additionalTableWords, out results, out table);
+        }
+        ResourceMaterializationCache.RecordEvaluationPath(plan,
+            plan.ResourceBranches.Count != 0 ? "fallback_branches" :
+            plan.IndirectImages.Count != 0 ? "fallback_indirect_images" :
+            plan.BufferCandidateTables.Count != 0 ? "fallback_buffer_candidates" : "fallback_other_or_unavailable");
         var anyClean = false;
         foreach (var clean in cleanFlatSlots)
         {
@@ -498,9 +487,14 @@ public sealed class RuntimeValueEvaluator
         var cleanEvaluator = new RuntimeValueEvaluator(cleanScratch, plan, inputs.WithReader(inputs.ReadCleanMemory));
         var evaluator = new RuntimeValueEvaluator(scratch, plan, inputs, cleanFlatSlots, cleanEvaluator);
         if (evaluateTable && plan.ResourceBranches.Count != 0)
+        {
+            using var branchProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.BranchSelection);
             activeSources = EvaluateActiveSources(plan, inputs, cleanEvaluator, cleanScratch);
+        }
         var evaluated = new List<DescriptorWords>(sources.Count);
-        RawReadPrefetch.PrefetchSources(plan, sources, activeSources, evaluator);
+        using (ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.DescriptorPrefetch))
+            RawReadPrefetch.PrefetchSources(plan, sources, activeSources, evaluator);
+        using (ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.DescriptorEvaluation))
         foreach (var sourceIndex in sources)
         {
             if (sourceIndex >= plan.DescriptorSources.Count)
@@ -531,7 +525,9 @@ public sealed class RuntimeValueEvaluator
             inputs.TablePhase?.Invoke(true);
             try
             {
-                RawReadPrefetch.PrefetchTable(plan, evaluator, cleanEvaluator, cleanFlatSlots);
+                using (ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.TablePrefetch))
+                    RawReadPrefetch.PrefetchTable(plan, evaluator, cleanEvaluator, cleanFlatSlots);
+                using var tableProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.TableEvaluation);
                 for (var index = 0; index < plan.TableReads.Count; index++)
                 {
                     var read = plan.TableReads[index];
@@ -564,6 +560,9 @@ public sealed class RuntimeValueEvaluator
         table = flattened;
         return true;
     }
+
+    internal static bool HasResourceStructure(ShaderResourcePlan plan) =>
+        plan.ResourceBranches.Count != 0 || plan.IndirectImages.Count != 0 || plan.BufferCandidateTables.Count != 0;
 
     private static bool[] EvaluateActiveSources(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, RuntimeValueEvaluator cleanEvaluator,
         RuntimeEvaluationScratch scratch)

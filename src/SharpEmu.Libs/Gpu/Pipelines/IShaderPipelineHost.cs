@@ -32,6 +32,21 @@ public sealed class ComputePipelineDescription
     public required ShaderProgramInfo Stage { get; init; }
 }
 
+public readonly record struct MeshShaderLimits(
+    uint MaxInvocations,
+    uint OutputVertexCapacity,
+    uint OutputPrimitiveCapacity,
+    uint MaxSharedMemoryBytes,
+    uint MaxGroupCountX,
+    uint MaxGroupCountY,
+    uint MaxGroupTotalCount,
+    uint MaxWorkGroupSizeX,
+    uint MaxOutputMemoryBytes,
+    uint MaxPayloadAndOutputMemoryBytes,
+    uint OutputPerVertexGranularity,
+    uint OutputPerPrimitiveGranularity,
+    uint MaxOutputComponents);
+
 // The host objects the shader and pipeline caches need: modules, pipelines, limits and guest readers.
 internal interface IShaderPipelineHost
 {
@@ -83,6 +98,11 @@ internal interface IShaderPipelineHost
     // returns zero on this device; the translator then stops bounds-checking every guest word.
     bool ZeroOutOfBoundsBufferReads => false;
 
+    bool MeshShadersSupported => false;
+
+    MeshShaderLimits MeshLimits => default;
+    uint MeshSubgroupSize => ComputeWave64Supported ? 64u : 32u;
+
     RenderHostLimits Limits { get; }
 
     // The device can blend with a second fragment output (dualSrcBlend).
@@ -124,6 +144,8 @@ internal interface IShaderPipelineHost
     PipelineHandle CreateGraphicsPipeline(GraphicsPipelineDescription description);
 
     PipelineHandle CreateComputePipeline(ComputePipelineDescription description);
+
+    Task? GetComputePipelineCompletion(ShaderProgram program) => null;
 
     // Creates the compute pipeline without blocking the command stream on the host
     // shader compiler: false means the compile is still running and the caller should ask

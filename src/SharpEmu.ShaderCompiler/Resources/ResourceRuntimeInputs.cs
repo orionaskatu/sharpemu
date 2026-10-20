@@ -24,6 +24,7 @@ public sealed record ResourceRuntimeInputs
     // the callers probe with ReadMemory instead.
     public Func<ulong, bool>? IsMapped { get; init; }
     public ComputeSelectorState? ComputeState { get; init; }
+    public Action<uint, uint, ulong, ulong, ReadOnlyMemory<uint>>? TraceImageCandidate { get; init; }
 
     // Told true before the flattened table's words are evaluated and false after, so a reader
     // wrapper can tell the words only the table reads from those the descriptors depend on.
@@ -45,6 +46,11 @@ public sealed record ResourceRuntimeInputs
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => this with
     {
         ReadMemory = reader,
+        ReadCleanMemory = ReadCleanMemory,
+        ComputeState = ComputeState,
+        TraceImageCandidate = TraceImageCandidate,
+        TablePhase = TablePhase,
+        ReadResidentMemory = ReadResidentMemory,
         ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
     };
 }

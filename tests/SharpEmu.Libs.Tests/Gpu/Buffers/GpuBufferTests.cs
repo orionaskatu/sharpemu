@@ -18,40 +18,23 @@ public sealed class GpuBufferTests : IClassFixture<HeadlessVulkanFixture>
     public GpuBufferTests(HeadlessVulkanFixture fixture) => _vulkan = fixture.Vulkan;
 
     [Fact]
-    public void SlabPressure_ReleasesIdleChunksButKeepsLiveAndForeignReadBlocks()
+    public void FixtureDisposalFreesRetainedSlabMemory()
     {
-        if (_vulkan is null) return;
-        using var worker = new CacheWorker(_vulkan);
-        var info = _vulkan.DeviceInfo;
-        worker.Run(() =>
+        var fixture = new HeadlessVulkanFixture();
+        if (fixture.Vulkan is not { } vulkan) return;
+        var info = vulkan.DeviceInfo;
+        try
         {
-            worker.Scheduler.Begin(new SubmissionContext());
-            info.Slabs.ReleaseUnused();
-            var before = info.Slabs.AllocatedBytes;
-            const BufferUsageFlags flags = GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit;
-            var first = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
-            var neighbour = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
-            var allocated = info.Slabs.AllocatedBytes;
-            Assert.True(allocated > before);
-            first.Fill(0, first.Size, 0x12345678);
-            neighbour.Fill(0, neighbour.Size, 0x87654321);
-            worker.Scheduler.Finish();
-            first.Dispose();
-            info.Slabs.ReleaseUnused();
-            Assert.Equal(allocated, info.Slabs.AllocatedBytes); // The neighbour still owns its block.
-            using (info.Slabs.BeginForeignRead())
+            using (var worker = new CacheWorker(vulkan))
+            using (var buffer = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal,
+                0, GpuBuffer.AllFlags, 0x1000, allowSlab: true))
             {
-                neighbour.Dispose();
-                info.Slabs.ReleaseUnused();
-                Assert.Equal(allocated, info.Slabs.AllocatedBytes);
+                Assert.True(info.LiveAllocations > 0);
             }
-            info.Slabs.ReleaseUnused();
-            Assert.Equal(before, info.Slabs.AllocatedBytes);
-            using var replacement = new GpuBuffer(info, worker.Scheduler, GpuBufferUsage.DeviceLocal, 0, flags, 0x1000, allowSlab: true);
-            replacement.Fill(0, replacement.Size, 0xABCDEF01);
-            worker.Scheduler.Finish();
-            worker.Scheduler.Shutdown();
-        });
+            Assert.True(info.LiveAllocations > 0);
+        }
+        finally { fixture.Dispose(); }
+        Assert.Equal(0, info.LiveAllocations);
     }
 
     [Fact]

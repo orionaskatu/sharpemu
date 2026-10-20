@@ -24,6 +24,7 @@ public static class ConstantFillDetector
     private const uint Shift64 = 134; // inline constant 6
     private const uint ZeroConstant = 128;
     private const uint NullScalar = 125;
+    private static readonly string[] Opcodes = ["VLshlAddU32", "SBufferLoadDword", "VMovB32", "BufferStoreFormatX", "SEndpgm"];
 
     public static ImmediateConstantFill? DetectImmediate(Gen5ShaderProgram program)
     {
@@ -48,8 +49,8 @@ public static class ConstantFillDetector
 
     public static ConstantFill? Detect(Gen5ShaderProgram program)
     {
-        var instructions = program.Instructions.Where(instruction => instruction.Opcode != "SWaitcnt").ToArray();
-        if (instructions.Length != 5)
+        var instructions = ShaderOpcodePattern.Match(program.Instructions, Opcodes, ignoreMarkers: false);
+        if (instructions is null)
         {
             return null;
         }

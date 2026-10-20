@@ -131,12 +131,9 @@ public sealed partial class GuestImageCache
     {
         using var held = _lock.Hold();
         var tick = endsFrame ? _collectionTick++ : _collectionTick;
-        _allocationCollectionBlocked = false;
-        if (MemoryUnderPressure)
-            ReleaseUnusedMemoryCore();
-        else
-            _imageMemoryPool.ReleaseRetained();
-        if (CollectionMemoryBytes < _collectionStartBytes)
+        if (endsFrame && SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled && tick % 300 == 0)
+            ReportImageMemory("collection", true, tick);
+        if (_totalUsedMemory < _collectionStartBytes)
         {
             return;
         }
@@ -172,12 +169,10 @@ public sealed partial class GuestImageCache
 
     private void Collect(ulong tick, bool allowAggressive)
     {
-        var pressured = CollectionMemoryBytes >= _memoryPressureBytes;
-        var aggressive = allowAggressive && CollectionMemoryBytes >= _criticalMemoryBytes;
-        // Under pressure, retain the current collection interval's bindings only.
-        // Recorded GPU references are protected by deferred destruction in DeleteImage;
-        // waiting more frames as memory fills prevents reclamation in slow titles.
-        var age = pressured ? 1UL : 16UL;
+        var pressured = _totalUsedMemory >= _memoryPressureBytes;
+        var aggressive = allowAggressive && _totalUsedMemory >= _criticalMemoryBytes;
+        var profile = SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled;
+        var age = aggressive ? 160UL : pressured ? 80UL : 16UL;
         if (tick < age && !pressured && !aggressive)
         {
             return;
@@ -187,35 +182,20 @@ public sealed partial class GuestImageCache
         var deletions = aggressive ? 40 : pressured ? 20 : 10;
         var candidates = new List<ResourceSlotIdentifier>(deletions);
         // Deleting a depth image also deletes its stencil association, so the recency walk ends first.
-        _recencyQueue.ForEachItemAtOrBeforeTick(tick - age, imageIdentifier =>
-        {
-            candidates.Add(imageIdentifier);
-            // A protected prefix must not hide older reclaimable images behind it.
-            // Stop after successful retirements below, not after visiting candidates.
-            return false;
-        });
+        _recencyQueue.CollectNextAtOrBeforeTick(tick - age, deletions, candidates);
         foreach (var imageIdentifier in candidates)
         {
-            if (deletions <= 0)
+            if (deletions == 0 || _totalUsedMemory < _collectionStartBytes)
             {
                 break;
             }
 
-            if (pressured && _scheduler.Active && !_scheduler.InsideTickCallback &&
-                _tiler.ScratchOverBudget)
-            {
-                // Readback scratch and retired images are still resident until
-                // completion. Bound the batch before allocating the next copy.
-                // Completion publishes guest data and can re-enter this cache.
-                _lock.Exit();
-                try { _scheduler.Finish(); }
-                finally { _lock.Enter(); }
-                ReleaseUnusedMemoryCore();
-            }
-
+            deletions--;
+            if (profile) _collectionCandidates++;
             var owner = _slots.TryGet(imageIdentifier);
             if (owner == null || !owner.Registered || owner.DepthOwner.IsValid)
             {
+                if (profile && owner?.DepthOwner.IsValid == true) _collectionAssociations++;
                 continue;
             }
 
@@ -232,25 +212,38 @@ public sealed partial class GuestImageCache
                 // A dirty buffer overlap does not prove that it replaces the image contents.
                 if (!safe && owner.SafeToDownload)
                 {
+                    if (profile) _collectionBufferOverlapRetentions++;
+                    continue;
+                }
+                if (safe && owner.Description.IsTiled)
+                {
+                    if (profile) _collectionTiledRetentions++;
                     continue;
                 }
 
                 if (safe && !pressured)
                 {
+                    if (profile) _collectionUnpressuredRetentions++;
                     continue;
                 }
 
                 if (safe && !TryDownloadToGuest(imageIdentifier))
                 {
+                    if (profile) _collectionReadbackFailures++;
                     continue;
                 }
 
-                // Only the safe path published the contents first; the other one loses them.
-                owner.ClearGpuModified(safe ? "EvictionAfterDownload" : "EvictionWithoutDownload", 0);
+                ReportImageLifetime(owner, safe ? "collect-readback-queued" : "collect-unreadable-gpu", deletion: true);
+                owner.ClearGpuModified();
+            }
+            else
+            {
+                ReportImageLifetime(owner, "collect-no-gpu-ownership", deletion: true);
             }
 
-            deletions -= DeleteImage(imageIdentifier);
-            if (CollectionMemoryBytes < _criticalMemoryBytes && aggressive)
+            DeleteImage(imageIdentifier);
+            if (profile) _collectionDeletions++;
+            if (_totalUsedMemory < _criticalMemoryBytes && aggressive)
             {
                 deletions >>= 2;
                 aggressive = false;
@@ -452,6 +445,7 @@ public sealed partial class GuestImageCache
     internal void RegisterHtileMetadataForTest(ulong address)
     {
         using var held = _lock.Hold();
+        IncludeMetadataWriteRange(address, 1);
         if (!_surfaceMetadata.TryGetValue(address, out var metadata))
         {
             metadata = new SurfaceMetadata();
@@ -465,6 +459,7 @@ public sealed partial class GuestImageCache
     internal void RegisterDccMetadataForTest(ulong address, ulong size)
     {
         using var held = _lock.Hold();
+        IncludeMetadataWriteRange(address, size);
         _surfaceMetadata[address] = new SurfaceMetadata { Kind = SurfaceMetadataKind.Dcc, Size = size };
     }
 

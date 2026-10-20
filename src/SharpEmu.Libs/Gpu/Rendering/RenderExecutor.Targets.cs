@@ -39,10 +39,25 @@ public sealed partial class RenderExecutor
                 break;
             }
 
-            // Every attachment is back at guest resolution now; resolve them again so the
-            // draw sees the replacements instead of the images that were just released.
-            state.ColorCount = 0;
-            state.Depth = default;
+            if (ColorTargetResolver.Resolve(context, slot, DrawLayerOffset, ignoreTargetMask: false, out var resolvedSlot) is not { } resolution)
+            {
+                continue;
+            }
+
+            var request = resolution.Request;
+            if (MeshDrawTrace.Active) MeshDrawTrace.Write("color-request", $"slot={slot} address=0x{request.Description.Data.Address:X16} size=0x{request.Description.Data.Size:X} view={request.View}");
+            var image = _host.FindImage(ref request, exactFormat: false);
+            _host.BindRenderTarget(image);
+            state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image);
+        }
+
+        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _host.Fatal) is { } depthTarget)
+        {
+            var request = depthTarget.Target.Request;
+            if (MeshDrawTrace.Active) MeshDrawTrace.Write("depth-request", $"address=0x{request.Description.Data.Address:X16} size=0x{request.Description.Data.Size:X} view={request.View}");
+            var image = _host.FindImage(ref request, exactFormat: false);
+            _host.BindRenderTarget(image);
+            state.Depth = new DepthAttachmentState(in depthTarget, image);
         }
 
         state.PixelActive = HasActivePixelShader(banks);

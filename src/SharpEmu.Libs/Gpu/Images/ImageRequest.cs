@@ -18,6 +18,10 @@ public struct ImageRequest
     public ImageDescription Description;
     public ImageViewDescription View;
     public ImageRole Role;
+    internal ulong TraceTextureMetadataAddress;
+    internal string? TraceTextureDescriptor;
+    internal bool TraceMetadataCompress;
+    internal bool TraceWriteCompress;
 
     // The bound program stores into this image, rather than only reading it.
     public bool ShaderWrite;

@@ -19,8 +19,11 @@ public static class ZArchiveCache
         "sce_sys/pic0.png",
         "sce_sys/pic1.png",
         "sce_sys/snd0.at9",
+        "sce_sys/trophy2/trophy00.ucp",
     ];
 
+    // Fallback for portable layouts; system installs pass the user data root
+    // explicitly (SharpEmu.HLE cannot see SharpEmu.Libs).
     private static string DefaultCacheParent => Path.Combine(AppContext.BaseDirectory, "user", "zar-cache");
 
     // The cache folder an archive uses, without creating or checking it.
