@@ -717,8 +717,10 @@ internal sealed class ShaderProgramCache
             using var layoutScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramLayoutRequest);
             resources = ResourceMaterializer.ApplyTo(plan, specialization);
             layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
-                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
-                usesMeshDrawParameters: source.Stage == ShaderStage.Mesh);
+                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions, source.Stage, _host,
+                options.Tessellation is not null || options.TessellationHull is not null,
+                source.Stage == ShaderStage.Pixel && options.PixelOutputs.Any(static output => output.ObjectPrimitiveId),
+                source.Stage == ShaderStage.Mesh);
         }
         catch (ResourcePlanException exception)
         {
@@ -985,6 +987,7 @@ internal sealed class ShaderProgramCache
                     HostComputeSubgroup32 = info.WaveSize == 64 && !_host.ComputeWave64SubgroupNative && _host.ComputeRunsOn32LaneSubgroups(info),
                     EnableExecGuardElision = info.WaveSize != 64 || _host.ExecGuardElisionEnabled,
                     TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
+                    IeeeMode = info.IeeeMode,
                     ScratchDwords = info.ScratchDwords,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
                     SupportsExactFloat16Conversions = exactFloat16Conversions,
@@ -1042,6 +1045,8 @@ internal sealed class ShaderProgramCache
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, IShaderPipelineHost host) =>
         new(plan, resources, layout)
         {
+            NativeHalfConversionExact = host.NativeHalfConversionExact,
+            ZeroOutOfBoundsBufferReads = host.ZeroOutOfBoundsBufferReads,
             WaveSize = info.WaveSize, ForceGenericBufferFormats = DbgGenericFormats,
             HostWave64Supported = info.WaveSize == 64 && host.ComputeWave64SubgroupNative,
             HostComputeSubgroup32 = info.WaveSize == 64 && !host.ComputeWave64SubgroupNative && host.ComputeRunsOn32LaneSubgroups(info),

@@ -446,6 +446,9 @@ public static partial class Gen5SpirvTranslator
                 {
                     return false;
                 }
+
+                // Publishes the missing pages an invocation met, once, as it ends.
+                FlushPendingDeviceFaults();
                 profile.Switch(ShaderTranslationProfile.Part.Finalization);
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
@@ -784,7 +787,20 @@ public static partial class Gen5SpirvTranslator
             }
             _ldsDwordCount = dwordCount;
             _ldsDwordMask = dwordCount - 1;
+            _ldsIsWorkgroup = storageClass == SpirvStorageClass.Workgroup;
             var arrayDwordCount = _stage == Gen5SpirvStage.Mesh ? dwordCount : _waveLowering.ReserveLdsDwords(dwordCount);
+            if (_ldsIsWorkgroup)
+            {
+                // The translator's dwords follow the guest's: one kept at zero, which guest
+                // accesses past the declared size resolve to (the hardware reads 0 there and
+                // drops writes), then the wave lowering's exchange. A shader declaring the full
+                // 32 KiB keeps the array at that size: the reserved dwords take its top, and guest
+                // addresses there count as out of range.
+                var reserved = 1 + _waveLowering.ReserveLdsDwords(0);
+                arrayDwordCount = Math.Min(dwordCount + reserved, LdsDwordCount);
+                _ldsZeroDword = arrayDwordCount - reserved;
+                _ldsGuestDwordLimit = Math.Min(dwordCount, _ldsZeroDword);
+            }
 
             var ldsArrayType = _module.TypeArray(_uintType, arrayDwordCount);
             var ldsPointer = _module.TypePointer(storageClass, ldsArrayType);
@@ -1480,6 +1496,11 @@ public static partial class Gen5SpirvTranslator
                             sizeRegister,
                             BitwiseOr(UInt(waves & 0x3F), ShiftLeftLogical(BitwiseAnd(waveIndex, UInt(0x3F)), UInt(6))));
                     }
+                }
+
+                if (_request.TessellationHull is not null)
+                {
+                    EmitHullInputState();
                 }
 
                 if (_stage == Gen5SpirvStage.Mesh)
@@ -9127,6 +9148,25 @@ public static partial class Gen5SpirvTranslator
             _savedLaneValues.Clear();
             // With EXEC known to be all ones the write needs no EXEC test.
             var exec = _execKnownFull ? 0 : Load(_boolType, _exec);
+            if (_vectorRegisters != 0)
+            {
+                // The complete bank backs relative addressing: one masked dynamic store.
+                var pointer = DynamicVectorPointer(registerIndex);
+                if (exec != 0)
+                {
+                    value = _module.AddInstruction(SpirvOp.Select, _uintType, exec, value,
+                        Load(_uintType, pointer));
+                }
+
+                if (_executingWave != 0)
+                {
+                    value = GuardCooperativeUint(value, Load(_uintType, pointer));
+                }
+
+                Store(pointer, value);
+                return;
+            }
+
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
             {
                 var pointer = VectorPointer(register);
@@ -9173,19 +9213,23 @@ public static partial class Gen5SpirvTranslator
                 return variable;
             }
 
-            var arrayType = _module.TypeArray(_vec2Type, VectorRegisterCount);
-            _packedHalfRegisters = _module.AddGlobalVariable(
-                _module.TypePointer(SpirvStorageClass.Private, arrayType),
-                SpirvStorageClass.Private,
-                _module.ConstantNull(arrayType));
-            _interfaces.Add(_packedHalfRegisters);
-            _module.AddName(_packedHalfRegisters, "vgprPackedHalf");
-            if (_pairedMeshLanes)
-                _meshLaneRegisters[_logicalHalf] = _meshLaneRegisters[_logicalHalf] with
-                {
-                    PackedHalves = _packedHalfRegisters,
-                };
-            return _packedHalfRegisters;
+            if (_packedHalfRegisters == 0)
+            {
+                var arrayType = _module.TypeArray(_vec2Type, VectorRegisterCount);
+                _packedHalfRegisters = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, arrayType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(arrayType));
+                _interfaces.Add(_packedHalfRegisters);
+                _module.AddName(_packedHalfRegisters, "vgprPackedHalf");
+                if (_pairedMeshLanes)
+                    _meshLaneRegisters[_logicalHalf] = _meshLaneRegisters[_logicalHalf] with
+                    {
+                        PackedHalves = _packedHalfRegisters,
+                    };
+            }
+
+            return _module.AddInstruction(SpirvOp.AccessChain, _privateVec2Pointer, _packedHalfRegisters, UInt(register));
         }
 
         private uint LoadS(uint register) =>
@@ -9894,7 +9938,8 @@ public static partial class Gen5SpirvTranslator
         private bool UsesSubgroupOperations() =>
             _pairedLanes ||
             _enableGraphicsSubgroupOperations &&
-            ((_stage == Gen5SpirvStage.Mesh && _request.Mesh?.DeviceSubgroupLaneCount > 0) ||
+            (_request.CooperativeWave64Workgroup ||
+             (_stage == Gen5SpirvStage.Mesh && _request.Mesh?.DeviceSubgroupLaneCount > 0) ||
              UsesSubgroupShuffle() ||
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||

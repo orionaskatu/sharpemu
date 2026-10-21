@@ -738,29 +738,10 @@ public static class PlayGoExports
         var pgmChunkIds = LoadPlayGoPgmChunkIds(playGoPgm);
         if (pgmChunkIds.Length > 0)
         {
-            if (disableMetadataFallback)
-            {
-                TracePlayGo("metadata_missing fallback_disabled=1");
-                return PlayGoMetadata.Empty;
-            }
-
-            // No PlayGo sidecar: derive the installed chunk set from the pak files
-            // actually present on disk. A locally dumped title has all of its data
-            // installed, and a package that splits content across chunks names them
-            // pakchunk<N>-<platform>.pak, so those N are exactly the chunks that
-            // exist. Reporting only chunk 0 told such a title its remaining content
-            // was missing: The Invincible (PPSA06426) ships pakchunk0..8 and spun
-            // forever re-querying scePlayGoGetLocus for a chunk that never became
-            // available. Available must stay true or scePlayGoOpen fails with
-            // NotSupportPlayGo (fatal PS5-component init failure for UE titles).
-            // Ids outside the discovered set still return BAD_CHUNK_ID, so
-            // title-side chunk enumeration still terminates.
-            var installedChunkIds = DiscoverInstalledChunkIds(app0Root);
-            TracePlayGo($"metadata_missing; fully-installed chunks=[{string.Join(',', installedChunkIds)}]");
-            return new PlayGoMetadata(
-                true,
-                installedChunkIds,
-                PlayGoChunkIdKnowledge.Authoritative);
+            TracePlayGo($"metadata_pgm chunks={pgmChunkIds.Length}");
+            // The PGM header names each chunk the title ships, but nothing proves
+            // the list is complete, so outside ids stay queryable (Assumed).
+            return new PlayGoMetadata(true, pgmChunkIds, PlayGoChunkIdKnowledge.Assumed);
         }
 
         var chunkIds = LoadChunkIds(chunkDefsXml);
@@ -782,6 +763,14 @@ public static class PlayGoExports
                 true,
                 Array.Empty<ushort>(),
                 PlayGoChunkIdKnowledge.Unknown);
+        }
+
+        if (disableMetadataFallback)
+        {
+            // Without any sidecar there is nothing to parse: the derivation below
+            // would invent an installed set a real device would not report.
+            TracePlayGo("metadata_missing fallback_disabled=1");
+            return PlayGoMetadata.Empty;
         }
 
         // Derive the installed chunk set from pak files when no usable chunk map

@@ -55,7 +55,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         _pageCount = pageCount;
         _faultBufferSize = pageCount / 8;
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
-            _faultBufferSize + 64UL);
+            2 * _faultBufferSize + 64UL);
+        _writeDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
         _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * 256);
         _downloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
 
@@ -205,7 +206,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
 
             if (_traceDownloadBuffer is not null && !_traceInitialized)
             {
-                _faultBuffer.Fill(_faultBufferSize, 64, 0);
+                _faultBuffer.Fill(2 * _faultBufferSize, 64, 0);
                 _traceInitialized = true;
             }
             return _faultBuffer;
@@ -264,9 +265,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         var scanTick = _scheduler.CurrentTick;
         if (_traceDownloadBuffer is not null)
         {
-            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _faultBufferSize, area * 256UL, 64,
+            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, 2 * _faultBufferSize, area * 256UL, 64,
                 destinationAfter: AccessFlags.HostReadBit);
-            _faultBuffer.Fill(_faultBufferSize, 64, 0);
+            _faultBuffer.Fill(2 * _faultBufferSize, 64, 0);
         }
         _scheduler.QueueCompletionAction(() =>
         {

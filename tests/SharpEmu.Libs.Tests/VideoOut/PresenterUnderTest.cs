@@ -91,7 +91,12 @@ internal sealed class PresenterUnderTest : IDisposable
             "_preparedImages", "_nullTextures", "_textureBindings", "_boundSets", "_setChanged", "_acquiredViews", "_replacedTextures",
         })
         {
-            var field = PresenterType.GetField(name, InstanceMembers)!;
+            var field = PresenterType.GetField(name, InstanceMembers);
+            if (field is null)
+            {
+                continue; // Field absent from the presenter variant under test.
+            }
+
             field.SetValue(Instance, Activator.CreateInstance(field.FieldType, nonPublic: true));
         }
 
