@@ -77,6 +77,10 @@ internal interface IShaderPipelineHost
     // so the stride leaves the permutation key.
     bool RuntimeBufferStridesEnabled => false;
     bool UsesBindlessImages => false;
+
+    // The device supports shaderImageInt64Atomics, so an atomic on a 64-bit image texel
+    // (a 32_32 UINT image) can be compiled; without it such a program is rejected.
+    bool ImageInt64AtomicsEnabled => false;
     bool ShaderSignedZeroInfNanPreserveFloat32Supported => false;
     bool ExecGuardElisionEnabled => true;
     ShaderPrewarmList? ShaderPrewarm => null;

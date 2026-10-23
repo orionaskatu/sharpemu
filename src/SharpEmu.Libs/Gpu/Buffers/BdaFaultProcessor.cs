@@ -23,6 +23,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly SubmissionScheduler _scheduler;
     private readonly GuestBufferCache _cache;
     private readonly SpanSet _faultRanges = new();
+    private readonly List<GuestSpan> _faultWindows = new();
     private readonly ulong _pageSize;
     private readonly ulong _pageCount;
     private readonly ulong _faultBufferSize;
@@ -298,6 +299,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
 
             _downloadBuffer.Invalidate(offset, PageFaultAreaSize);
             _faultRanges.Clear();
+            _faultWindows.Clear();
             var faults = MemoryMarshal.Cast<byte, ulong>(_downloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
             var count = Math.Min((uint)faults[0], MaxPageFaults - 1);
             if (count != 0 && DbgFaultLog) // TEMP
@@ -311,19 +313,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 Diagnostics.DbgTargetWatch.CheckPhysical("devfault", faults[(int)index], _pageSize, () => "");
             for (var index = 1; index <= count; index++)
             {
-                var insideMapping = KernelMemoryCompatExports.TryGetMappedRange(faults[index], out var mappingStart, out var mappingLength);
-                if (!insideMapping && !_cache.IsGuestMemoryMapped(faults[index], _pageSize))
-                {
-                    continue;
-                }
-
-                if (DbgFaultLog && _dbgMappingSeen.Add(insideMapping ? mappingStart : faults[index] & ~0xFFFFFUL)) // TEMP
-                    Console.Error.WriteLine($"[DBG][BDAMAP] page=0x{faults[index]:X} inside={insideMapping} mapping=0x{mappingStart:X}+0x{mappingLength:X} ({mappingLength >> 20} MB)");
-                var window = insideMapping
-                    ? GuestBufferCache.DeviceAddressFaultSpan(faults[index], _pageSize, mappingStart, mappingLength)
-                    : new GuestSpan(faults[index], _pageSize);
-                _faultRanges.Add(window.Address, window.Size);
-                _cache.NoteDeviceAddressFault(window.Address, window.Size, insideMapping);
+                var range = _cache.DeviceAddressFaultRange(faults[index], _pageSize);
+                _faultRanges.Add(range.Address, range.Size);
+                _faultWindows.Add(range);
                 GuestGpuMemoryHook.SelectDeviceFaultTracePage(faults[index]);
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(faults[index], _pageSize))
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(faults[index], _pageSize,
@@ -342,7 +334,22 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                     throw SubmissionScheduler.Fatal("The fault range exceeds the buffer.");
                 }
 
-                _ = _cache.FindBuffer(start, size);
+                // Adjacent fault ranges of two mappings join into a range one read cannot cover; each keeps its own buffer.
+                if (_cache.CanReadGuest(start, size))
+                {
+                    _ = _cache.FindBuffer(start, size);
+                }
+                else
+                {
+                    foreach (var window in _faultWindows)
+                    {
+                        if (window.Address >= start && window.End <= start + size)
+                        {
+                            _ = _cache.FindBuffer(window.Address, window.Size);
+                        }
+                    }
+                }
+
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(start, size))
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(start, size,
                         $"device-address-fault-prepared scan_tick={scanTick} submission_tick={_scheduler.CurrentTick} registered={_cache.IsRegionRegistered(start, size)}");

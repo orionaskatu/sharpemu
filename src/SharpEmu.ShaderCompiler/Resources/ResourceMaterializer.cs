@@ -22,6 +22,12 @@ public static partial class ResourceMaterializer
 
     public static string? LastFailureDetail => _lastFailureDetail;
 
+    // The smallest and largest layouts of a table selected by a loop counter; see FitSharedImageTables.
+    private const int MinSharedCandidates = 8;
+    private const int MaxSharedCandidates = 256;
+    private const int MinSharedKeyCapacity = 32;
+    private const int MaxSharedKeyCapacity = 1024;
+
     // Written to standard error like every specialization refusal; the host turns it
     // into its fatal.
     public static Action<string> SpecializationFailed { get; set; } = message => Console.Error.WriteLine($"shader resource specialization failed: {message}");
@@ -36,6 +42,8 @@ public static partial class ResourceMaterializer
         public uint[] HeapDescriptor = [];
         public uint SelectorStride;
         public uint SelectorOffset;
+        public bool Shared;
+        public int KeyCapacity;
         public IndirectSelectorDiagnostic? SelectorDiagnostic;
     }
 
@@ -271,22 +279,27 @@ public static partial class ResourceMaterializer
                     }
                     continue;
                 }
-                if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _))
+                IndirectImageTable indirectTable;
+                if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _) ||
+                    !MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image, inputs, captureSelectorDiagnostic, out indirectTable, out failure))
                 {
-                    return Detail($"image {imageIndex} material/heap sources: " +
-                        DiagnoseSources(plan, cleanInputs, [indirect.MaterialSource, indirect.HeapSource]));
-                }
+                    if (!indirect.SharedSelector)
+                    {
+                        return Detail($"image {imageIndex} material/heap sources: " +
+                            DiagnoseSources(plan, cleanInputs, [indirect.MaterialSource, indirect.HeapSource]));
+                    }
 
-                if (!MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image, inputs,
-                    captureSelectorDiagnostic, out var indirectTable, out failure))
-                {
-                    return false;
+                    // The table is unreadable now: keep the null image this access read as before it had a table.
+                    snapshot.Images[imageIndex] = new uint[8];
+                    failure = ResourceMaterializationFailure.None;
+                    continue;
                 }
 
                 snapshot.Images[imageIndex] = indirectTable.Descriptors[(int)indirectTable.Candidates[0]].Dwords;
                 if (indirectTable.Descriptors.Count > 1)
                 {
                     indirectTable.Resource = (uint)imageIndex;
+                    indirectTable.Shared = indirect.SharedSelector;
                     snapshot.IndirectImages.Add(indirectTable);
                 }
             }
@@ -302,6 +315,7 @@ public static partial class ResourceMaterializer
             }
         }
 
+        FitSharedImageTables(plan, snapshot);
         snapshot.Samplers = new uint[plan.Info.Samplers.Count][];
         for (var index = 0; index < snapshot.Samplers.Length; index++)
         {
@@ -662,6 +676,28 @@ public static partial class ResourceMaterializer
         return blockBytes == 0 || (baseAddress & (blockBytes - 1)) == 0;
     }
 
+    // The instruction samples one kind of image. A descriptor of another kind (the default heap entry, or a key read from some
+    // other field of the record) is not something it can sample, so a shared selector reads it as null.
+    private static bool SamplesAs(ReadOnlySpan<uint> descriptor, ImageResource image)
+    {
+        var dimension = DescriptorDimension(descriptor, image.Dimension);
+        return dimension == image.Dimension ||
+            image.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray &&
+            dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray;
+    }
+
+    private static bool CompatibleCandidates(ImageSpecialization image, ImageSpecialization exemplar, bool separateSampledDimensions)
+    {
+        // Each sampled candidate has its own binding and coordinate width.
+        var compatibleDimensions = image.Dimension == exemplar.Dimension ||
+            separateSampledDimensions && !image.Cube && !exemplar.Cube &&
+            image.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray &&
+            exemplar.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray;
+        return image.NumericClass == exemplar.NumericClass && compatibleDimensions &&
+            image.MipCount == exemplar.MipCount && image.ConversionFormat == exemplar.ConversionFormat &&
+            image.ShaderSwizzle == exemplar.ShaderSwizzle && image.Cube == exemplar.Cube;
+    }
+
     private static bool UsableImageCandidate(ReadOnlySpan<uint> candidate, bool r128) =>
         !NullImageDescriptor(candidate) && ValidImageDescriptor(candidate, r128) && ReservedImageBitsClear(candidate) &&
         GuestImageFormat.SampledNumericClass(GuestImageFormat.FormatOf(candidate)) != ImageNumericClass.Unsupported;
@@ -774,15 +810,24 @@ public static partial class ResourceMaterializer
                 diagnostic.ProvenOffsets = provenOffsets ?? [];
             }
         }
-        // Bound 1, from the shader: a selector it clamps or masks reaches exactly
-        // selector * stride + offset for selector in [0, bound].
-        // Absent a proven bound, the exhaustive enumeration of every residue + k * step (the
-        // product wraps modulo 2^32 for an unbounded selector) stays exact while it fits the
-        // cap. Material-table size does not bound the selector, so past the cap the plan fails.
+        var records = (ulong)material.Dwords[2];
         IEnumerable<ulong> offsets;
         if (provenOffsets is not null)
         {
             offsets = provenOffsets.Select(offset => (ulong)offset);
+        }
+        else if (indirect.SharedSelector)
+        {
+            if (records > MaxIndirectImageProbes)
+            {
+                return false;
+            }
+
+            // A loop counter walks the table record by record: a shared selector's keys are the ones
+            // its records hold, not every dword the stride lattice reaches. Anything past the
+            // last record reads as zero, which is key 0.
+            offsets = Enumerable.Range(0, (int)records)
+                .Select(index => (ulong)unchecked(indirect.SelectorOffset + (uint)index * materialStride));
         }
         else if (indirect.SelectorBound is { } bound)
         {
@@ -816,21 +861,21 @@ public static partial class ResourceMaterializer
             // but a real table index stays inside the table: past the cap, probe the record-aligned
             // offsets the table holds (Ghost of Yotei's water particles have no selector clamp, and
             // failing the plan stopped the emulator). The plan fails only when even those exceed it.
-            var records = indirect.SelectorStride != 0 && indirect.SelectorOffset <= limit
+            var tableRecords = indirect.SelectorStride != 0 && indirect.SelectorOffset <= limit
                 ? (limit - indirect.SelectorOffset) / indirect.SelectorStride + 1
                 : 0;
-            if (records == 0 || records > MaxIndirectImageProbes)
+            if (tableRecords == 0 || tableRecords > MaxIndirectImageProbes)
             {
                 return Detail($"indirect image {Hex(image.FirstUsePc)}: {probeCount} unbounded selector probes exceed {MaxIndirectImageProbes} (material V# {Words(material.Dwords)} stride={indirect.SelectorStride} offset={indirect.SelectorOffset})");
             }
 
-            ReportTableBoundedFallback(image.FirstUsePc, indirect.SelectorStride, probeCount, records);
+            ReportTableBoundedFallback(image.FirstUsePc, indirect.SelectorStride, probeCount, tableRecords);
             if (diagnostic is not null)
             {
                 diagnostic.SelectionMode = "table_bounded";
             }
 
-            offsets = Enumerable.Range(0, (int)records).Select(index => indirect.SelectorOffset + (ulong)index * indirect.SelectorStride);
+            offsets = Enumerable.Range(0, (int)tableRecords).Select(index => indirect.SelectorOffset + (ulong)index * indirect.SelectorStride);
         }
 
         var keys = new List<uint> { 0 };
@@ -876,7 +921,7 @@ public static partial class ResourceMaterializer
                 }
             }
 
-            if (!UsableImageCandidate(candidate, image.R128))
+            if (!UsableImageCandidate(candidate, image.R128) || (indirect.SharedSelector && !SamplesAs(candidate, image)))
             {
                 Array.Clear(candidate);
             }
@@ -887,7 +932,8 @@ public static partial class ResourceMaterializer
                 probed,
                 keys,
                 out var table,
-                out failure))
+                out failure,
+                keepFirstCandidates: indirect.SharedSelector))
         {
             return false;
         }
@@ -1244,20 +1290,28 @@ public static partial class ResourceMaterializer
         IReadOnlyList<uint[]> probed,
         IEnumerable<uint> keys,
         out IndirectImageTable result,
-        out ResourceMaterializationFailure failure)
+        out ResourceMaterializationFailure failure,
+        bool keepFirstCandidates = false)
     {
         failure = ResourceMaterializationFailure.Other;
         result = new IndirectImageTable();
-        result.Keys.AddRange(keys);
-        // A bindless table holds tens of thousands of candidates; index them by content.
+        using var keyEnumerator = keys.GetEnumerator();
         var indices = new Dictionary<uint[], int>(DescriptorContentComparer.Instance);
         foreach (var candidate in probed)
         {
+            keyEnumerator.MoveNext();
             var words = new DescriptorWords(candidate);
             if (!indices.TryGetValue(candidate, out var found))
             {
-                if (result.Descriptors.Count >= ShaderResourceInfo.MaxIndirectImageCandidates)
+                // A table selected by a loop counter may name up to its largest layout (see FitSharedImageTables).
+                if (result.Descriptors.Count >= (keepFirstCandidates ? MaxSharedCandidates + 1 : ShaderResourceInfo.MaxIndirectImageCandidates))
                 {
+                    if (keepFirstCandidates)
+                    {
+                        // The key is left out of the mapping and reads the first candidate, like any key the table lacks.
+                        continue;
+                    }
+
                     failure = ResourceMaterializationFailure.ImageCapacityExceeded;
                     return Fail($"indirect image table has more than {ShaderResourceInfo.MaxImages} distinct descriptors among {probed.Count} candidates");
                 }
@@ -1265,10 +1319,107 @@ public static partial class ResourceMaterializer
                 result.Descriptors.Add(words);
                 indices.Add(candidate, found);
             }
+            result.Keys.Add(keyEnumerator.Current);
             result.Candidates.Add((uint)found);
         }
         return true;
     }
+
+    // A table selected by a loop counter keeps every volume its records name: a volume left out reads the first candidate,
+    // and its light goes missing wherever it covers the view. The plan's loop-selected tables share one layout, the most
+    // candidates and keys any of them has needed so far, rounded up to powers of two and never shrinking: a view that
+    // names another set of volumes does not compile another pipeline. A table that names more than the largest layout
+    // keeps the volumes of its first records, and one that names fewer pads with null images; a key whose candidate was
+    // dropped is left out of the mapping and reads the table's first candidate, like any key the table lacks.
+    private static void FitSharedImageTables(ShaderResourcePlan plan, MaterializedSnapshot snapshot)
+    {
+        var shared = new List<int>();
+        for (var index = 0; index < plan.Info.Images.Count; index++)
+        {
+            if (plan.DescriptorSources[(int)plan.Info.Images[index].Source].IndirectImage is { SharedSelector: true })
+            {
+                shared.Add(index);
+            }
+        }
+
+        if (shared.Count == 0)
+        {
+            return;
+        }
+
+        var neededCandidates = 0;
+        var neededKeys = 0;
+        foreach (var table in snapshot.IndirectImages.Where(table => table.Shared))
+        {
+            neededCandidates = Math.Max(neededCandidates, table.Descriptors.Count - 1);
+            neededKeys = Math.Max(neededKeys, table.Keys.Count);
+        }
+
+        var candidateCapacity = Grow(ref plan.SharedImageCandidates, SizeClass(neededCandidates, MinSharedCandidates, MaxSharedCandidates));
+        var keyCapacity = Grow(ref plan.SharedImageKeys, SizeClass(neededKeys, MinSharedKeyCapacity, MaxSharedKeyCapacity));
+        foreach (var resource in shared)
+        {
+            var table = snapshot.IndirectImages.Find(entry => entry.Resource == resource);
+            if (table is null)
+            {
+                continue;
+            }
+
+            var extra = candidateCapacity;
+            // Whatever reads the first candidate is the same as a key the mapping lacks, so only the others are kept.
+            table.KeyCapacity = keyCapacity;
+            var keys = new List<uint> { 0 };
+            var candidates = new List<uint> { 0 };
+            for (var index = 0; index < table.Keys.Count && keys.Count < keyCapacity; index++)
+            {
+                var candidate = table.Candidates[index];
+                if (candidate != 0 && candidate <= extra)
+                {
+                    keys.Add(table.Keys[index]);
+                    candidates.Add(candidate);
+                }
+            }
+
+            table.Keys = keys;
+            table.Candidates = candidates;
+            if (table.Descriptors.Count > extra + 1)
+            {
+                table.Descriptors.RemoveRange(extra + 1, table.Descriptors.Count - extra - 1);
+            }
+
+            while (table.Descriptors.Count < extra + 1)
+            {
+                table.Descriptors.Add(DescriptorWords.Empty(8));
+            }
+        }
+    }
+
+    // The power of two that holds count, between minimum and maximum.
+    private static int SizeClass(int count, int minimum, int maximum) =>
+        Math.Clamp((int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(count, 1)), minimum, maximum);
+
+    // Raises a plan's layout to size and returns the layout in force, which never shrinks.
+    private static int Grow(ref int capacity, int size)
+    {
+        var current = Volatile.Read(ref capacity);
+        while (current < size)
+        {
+            var seen = Interlocked.CompareExchange(ref capacity, size, current);
+            if (seen == current)
+            {
+                return size;
+            }
+
+            current = seen;
+        }
+
+        return current;
+    }
+
+    // The words a table's key mapping reserves: a loop-selected table reserves its size class, so neither its search
+    // depth nor the offsets of the tables after it move with each key.
+    private static int MappingCapacity(IndirectImageTable table) =>
+        table.Shared ? Math.Max(table.KeyCapacity, table.Keys.Count) : table.Keys.Count;
 
     // ---- specialization ----
 
@@ -1404,12 +1555,12 @@ public static partial class ResourceMaterializer
             }
 
             imageCount = checked(imageCount + table.Descriptors.Count - 1);
-            mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
+            mappingWordCount = checked(mappingWordCount + 1 + MappingCapacity(table) * 2);
         }
 
         foreach (var table in snapshot.BufferCandidateTables)
         {
-            mappingWordCount = checked(mappingWordCount + 1 + MappingCapacity(table.Keys.Count) * 2);
+            mappingWordCount = checked(mappingWordCount + 1 + table.Keys.Count * 2);
         }
 
         // Each draw owns these arrays. Only indirect candidates require a larger table.
@@ -1439,9 +1590,9 @@ public static partial class ResourceMaterializer
             {
                 IndirectRoot = table.Resource,
                 IndirectMappingOffset = mappingOffset,
-                IndirectSearchIterations = (uint)BitOperations.Log2((uint)MappingCapacity(table.Keys.Count)) + 1,
+                IndirectSearchIterations = (uint)BitOperations.Log2((uint)MappingCapacity(table)) + 1,
             };
-            mappingCursor += 1 + MappingCapacity(table.Keys.Count) * 2;
+            mappingCursor += 1 + MappingCapacity(table) * 2;
             var order = Enumerable.Range(0, table.Keys.Count).OrderBy(index => table.Keys[index]).ToArray();
             snapshot.FlattenedTable[(int)mappingOffset] = (uint)table.Keys.Count;
             for (var entry = 0; entry < order.Length; entry++)
@@ -1522,7 +1673,9 @@ public static partial class ResourceMaterializer
                     // A null-bound atomic keeps its declared numeric class
                     // (Uint or, since float image atomics were added, Float)
                     // instead of assuming every atomic image is Uint.
-                    NumericClass = baseImage.Atomic ? baseImage.NumericClass : ImageNumericClass.Float,
+                    NumericClass = baseImage.Atomic64
+                        ? ImageNumericClass.Uint64
+                        : baseImage.Atomic ? baseImage.NumericClass : ImageNumericClass.Float,
                     Dimension = ImageDimension.Dim2D,
                     Cube = false,
                 };
@@ -1543,9 +1696,12 @@ public static partial class ResourceMaterializer
             // MIMG op 0x1D-0x1F) are lowered as a compare-and-swap loop on the
             // raw bit pattern (Gen5SpirvTranslator) and legitimately target a
             // 32-bit float-format UAV instead - reject only formats that are
-            // neither.
-            if (baseImage.Atomic && format != GuestImageFormat.Format32Uint &&
-                GuestImageFormat.SampledNumericClass(format) != ImageNumericClass.Float)
+            // neither. An atomic on two data dwords works on a 64-bit texel,
+            // which the 32_32 UINT format holds.
+            if (baseImage.Atomic64
+                ? format != GuestImageFormat.Format32x2Uint
+                : baseImage.Atomic && format != GuestImageFormat.Format32Uint &&
+                    GuestImageFormat.SampledNumericClass(format) != ImageNumericClass.Float)
             {
                 return Fail($"atomic image descriptor {index} uses unsupported format {format}");
             }
@@ -1570,6 +1726,11 @@ public static partial class ResourceMaterializer
                 if (rawSintStorage || (baseImage.Atomic && numericClass == ImageNumericClass.Float))
                 {
                     numericClass = ImageNumericClass.Uint;
+                }
+
+                if (baseImage.Atomic64)
+                {
+                    numericClass = ImageNumericClass.Uint64;
                 }
             }
             else if (numericClass == ImageNumericClass.Unsupported)
@@ -1661,12 +1822,20 @@ public static partial class ResourceMaterializer
                 }
                 : images[(int)exemplar];
             var separateSampledDimensions = info.Images[rootIndex].ResourceClass == ImageResourceClass.Sampled;
+            var sharedSelector = plan.DescriptorSources[(int)info.Images[rootIndex].Source].IndirectImage is { SharedSelector: true };
             for (var candidate = 0; candidate < images.Count; candidate++)
             {
                 var image = images[candidate];
                 if (image.IndirectRoot != rootIndex)
                 {
                     continue;
+                }
+
+                // A shared selector read such a table as null before it had one: a candidate of another class reads as null too.
+                if (sharedSelector && !NullImageDescriptor(snapshot.Images[candidate]) &&
+                    !CompatibleCandidates(image, imageClass, separateSampledDimensions))
+                {
+                    Array.Clear(snapshot.Images[candidate]);
                 }
 
                 if (NullImageDescriptor(snapshot.Images[candidate]))
@@ -1826,10 +1995,10 @@ public static partial class ResourceMaterializer
                 snapshot.FlattenedTable[offset + 1] = table.Candidates[source];
             }
 
-            mappingCursor += 1 + MappingCapacity(table.Keys.Count) * 2;
+            mappingCursor += 1 + table.Keys.Count * 2;
             candidateTables.Add(new BufferCandidateTableSpecialization(
                 (uint)bufferCursor, (uint)table.Descriptors.Count, mappingOffset,
-                (uint)BitOperations.Log2((uint)MappingCapacity(table.Keys.Count)) + 1));
+                (uint)BitOperations.Log2((uint)table.Keys.Count) + 1));
             bufferCursor += table.Descriptors.Count;
         }
 
@@ -1839,19 +2008,12 @@ public static partial class ResourceMaterializer
             Buffers = buffers,
             Images = images,
             BufferCandidateTables = candidateTables,
-            ImageDescriptorGroups = DescriptorBindingAliases.Group(snapshot.Images),
+            ImageDescriptorGroups = DescriptorBindingAliases.Group(snapshot.Images, images),
             SamplerDescriptorGroups = DescriptorBindingAliases.Group(snapshot.Samplers.Take(info.Samplers.Count).ToArray()),
         };
         specializedSnapshot = snapshot;
         return true;
     }
-
-    // The key mapping's offset and search depth are baked into the shader. Reserving a
-    // power-of-two capacity keeps them stable while a table gains keys, so the shader is
-    // compiled again only when a table outgrows its reservation. The unused tail is never
-    // read: the search is bounded by the stored count.
-    private static int MappingCapacity(int keyCount) =>
-        (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(keyCount, 16));
 
     private sealed class SamplerPlan
     {

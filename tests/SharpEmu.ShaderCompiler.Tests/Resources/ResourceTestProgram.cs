@@ -173,7 +173,8 @@ internal static class ResourceTestProgram
 
     // The plan, its default specialization applied, and the layout of one program.
     public static (ShaderResourcePlan Plan, SpecializedResourceInfo Resources, BindingLayout Layout) Prepare(
-        Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0, bool usesBindlessImages = false)
+        Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0,
+        bool usesDispatchThreadLimits = false, bool usesBindlessImages = false)
     {
         var plan = ShaderResourcePlan.Extract(program, stage, Hash, userDataBase, userDataCount);
         var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
@@ -184,13 +185,15 @@ internal static class ResourceTestProgram
             ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
             BindingLayout.ReadsShaderBase(program),
             pushDataStartDword,
+            usesDispatchThreadLimits,
+            usesBindlessImages,
             usesMeshDrawParameters: stage == ShaderStage.Mesh);
         return (plan, resources, layout);
     }
 
     public static ShaderCompileRequest Request(Gen5ShaderProgram program, ShaderStage stage = ShaderStage.Compute, uint userDataBase = 0, uint userDataCount = 64, uint pushDataStartDword = 0, bool usesBindlessImages = false)
     {
-        var (plan, resources, layout) = Prepare(program, stage, userDataBase, userDataCount, pushDataStartDword, usesBindlessImages);
+        var (plan, resources, layout) = Prepare(program, stage, userDataBase, userDataCount, pushDataStartDword, usesBindlessImages: usesBindlessImages);
         return new ShaderCompileRequest(plan, resources, layout)
         {
             PixelOutputs = stage == ShaderStage.Pixel ? [new Gen5PixelOutputBinding(0, 0, Gen5PixelOutputKind.Float)] : [],

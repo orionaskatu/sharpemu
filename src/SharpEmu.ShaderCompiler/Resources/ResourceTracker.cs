@@ -190,6 +190,37 @@ public sealed partial class ResourceTracker
         return origins.Count == 0 ? string.Empty : $" (undefined from: {string.Join(", ", origins)})";
     }
 
+    // A value one lane picked for the wave (v_readfirstlane of a per-lane register, as a waterfall loop over a bindless
+    // descriptor index does) has no source the host can evaluate. Compute keeps rejecting it: its dense-table support
+    // proves a bound for the index first.
+    private static bool HasLaneChosenValue(ScalarValue value)
+    {
+        var seen = new HashSet<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        pending.Push(value);
+        while (pending.Count != 0)
+        {
+            var current = pending.Pop();
+            if (!seen.Add(current))
+            {
+                continue;
+            }
+
+            if (current.Kind == ScalarValueKind.FirstLane && current.Operands.Length == 2 &&
+                current.Operands[0].Kind == ScalarValueKind.Undefined)
+            {
+                return true;
+            }
+
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
     private bool HasUndefinedOrigin(ScalarValue value, string opcodePrefix)
     {
         var seen = new HashSet<ScalarValue>();
@@ -687,11 +718,22 @@ public sealed partial class ResourceTracker
             // implement. Rather than fail shader recompilation outright, degrade to a null
             // descriptor for that one access and let it read as a null/black texture,
             // mirroring KytyPS5's fallback for the same case (feat/shader-control-dependent-
-            // descriptor). Buffer/sampler-adjacent handles or any other validation failure
-            // still hard-fail, since those aren't safe to silently zero.
-            var dynamicImageFallback = allowNullFallback && expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
-                (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
-                 (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
+            // descriptor). Buffer handles or any other validation failure still hard-fail,
+            // since those aren't safe to silently zero. The control-dependent and
+            // unknown-origin arms only degrade when the access cannot be served by the
+            // runtime descriptor table: an access it serves re-reads the descriptors from
+            // the shader's registers instead, so those rejects take the runtime route.
+            // Main has no runtime route, so its own arms degrade regardless: a lane-chosen
+            // image reads as null in pixel stage and a sampler none of whose words is known
+            // reads as a null sampler (a block an s_cbranch_execz can skip reaches the join
+            // with the registers unwritten on the skip edge).
+            var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
+                (allowNullFallback &&
+                    (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
+                     (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32")))) ||
+                 (expected == ScalarValueKind.ImageHandle && _plan.Stage != ShaderStage.Compute &&
+                  source.Dwords.Any(HasLaneChosenValue)) ||
+                 (expected == ScalarValueKind.SamplerHandle && source.Dwords.All(dword => dword.IsUndefined)));
             if (dynamicImageFallback)
             {
                 _info.NullDescriptorFallbacks.Add((pc, expected == ScalarValueKind.ImageHandle ? $"image {memoryOpcode ?? "access"}" : $"sampler {memoryOpcode ?? "access"}"));
@@ -1015,7 +1057,12 @@ public sealed partial class ResourceTracker
         image.Read |= !write || atomic;
         image.Written |= write;
         image.Atomic |= atomic;
+        image.Atomic64 |= atomic && IsWideImageAtomic(memory);
     }
+
+    // IMAGE_ATOMIC_* names a 64-bit texel by two data dwords (compare-swap: the new value and the comparison, four).
+    private static bool IsWideImageAtomic(MemoryAccessInfo memory) =>
+        System.Numerics.BitOperations.PopCount(memory.Dmask) == (memory.Opcode == "ImageAtomicCmpswap" ? 4 : 2);
 
     private uint AddSampler(uint source, uint pc)
     {
@@ -1480,7 +1527,38 @@ public sealed partial class ResourceTracker
         !_readsByMemory.TryGetValue(index, out var readers) || readers.All(reader => ReferenceEquals(reader, owner));
 
     private bool UsesOnly(ScalarValue value, IReadOnlyList<ScalarValue> users) =>
-        _uses.TryGetValue(value, out var uses) && uses.Count != 0 && uses.All(user => users.Any(candidate => ReferenceEquals(candidate, user)));
+        UsesOnlyThroughInvariantPhis(value, value, users, []);
+
+    // A phi that only merges the value with itself forwards it, so its users are the value's users.
+    private bool UsesOnlyThroughInvariantPhis(ScalarValue origin, ScalarValue value, IReadOnlyList<ScalarValue> users, HashSet<ScalarValue> visited)
+    {
+        if (!_uses.TryGetValue(value, out var uses) || uses.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (var user in uses)
+        {
+            if (users.Any(candidate => ReferenceEquals(candidate, user)))
+            {
+                continue;
+            }
+
+            if (user.Kind != ScalarValueKind.Phi || !ReferenceEquals(_graph.ResolveInvariantPhi(user), origin))
+            {
+                return false;
+            }
+
+            if (visited.Add(user) && !UsesOnlyThroughInvariantPhis(origin, user, users, visited))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private ScalarValue Invariant(ScalarValue value) => _graph.ResolveInvariantPhi(value) ?? value;
 
     private bool MakeRuntimeBufferSource(ScalarValue handle, uint pc, out uint sourceIndex, out DescriptorSource source)
     {
@@ -1563,7 +1641,7 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        return stride != 0 && selector.Kind == ScalarValueKind.FirstLane;
+        return stride != 0;
     }
 
     // A material-table key selects a heap record whose eight dwords are the image
@@ -1582,7 +1660,7 @@ public sealed partial class ResourceTracker
         var memoryIndices = new int[8];
         for (var dword = 0; dword < 8; dword++)
         {
-            var read = handle.Operands[dword];
+            var read = Invariant(handle.Operands[dword]);
             heapReads[dword] = read;
             var memory = ScalarReadMemory(read, out var memoryIndex);
             if (memory is null || memory.Offset != (uint)dword * sizeof(uint) || !MemoryIndexBelongsTo(memoryIndex, read))
@@ -1599,9 +1677,9 @@ public sealed partial class ResourceTracker
             heapHandle = currentHandle;
             if (dword == 0)
             {
-                heapOffset = read.Operands[1];
+                heapOffset = Invariant(read.Operands[1]);
             }
-            else if (!_graph.Equivalent(heapOffset!, read.Operands[1]))
+            else if (!_graph.Equivalent(heapOffset!, Invariant(read.Operands[1])))
             {
                 return false;
             }
@@ -1615,7 +1693,7 @@ public sealed partial class ResourceTracker
             return false;
         }
 
-        var materialRead = heapOffset.Operands[0];
+        var materialRead = Invariant(heapOffset.Operands[0]);
         var materialMemory = ScalarReadMemory(materialRead, out var materialMemoryIndex);
         if (materialMemory is null || !MemoryIndexBelongsTo(materialMemoryIndex, materialRead))
         {
@@ -1623,7 +1701,14 @@ public sealed partial class ResourceTracker
         }
 
         var materialHandle = materialRead.Operands[0];
-        if (!MatchMaterialOffset(materialRead.Operands[1], out var selector, out var selectorStride, out var selectorOffset))
+        if (!MatchMaterialOffset(Invariant(materialRead.Operands[1]), out var selector, out var selectorStride, out var selectorOffset))
+        {
+            return false;
+        }
+
+        // A selector every lane shares (a loop counter, a user data dword) needs the candidate table only when the host
+        // cannot evaluate the descriptor as one runtime value; otherwise the direct source stays exact.
+        if (selector.Kind != ScalarValueKind.FirstLane && ValidateSource(new DescriptorSource { Dwords = handle.Operands }, out _))
         {
             return false;
         }
@@ -1658,6 +1743,7 @@ public sealed partial class ResourceTracker
                 SelectorValues = IndirectSelectorValues.Create(_plan, selector),
                 SelectorBound = IndirectSelectorBound.TryCreate(_plan, selector),
                 MaterialImmediate = materialMemory.Offset,
+                SharedSelector = selector.Kind != ScalarValueKind.FirstLane,
             },
         };
 

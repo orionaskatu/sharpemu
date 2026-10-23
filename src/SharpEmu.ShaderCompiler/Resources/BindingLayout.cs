@@ -58,8 +58,10 @@ public static class ImageDescriptorBinding
     private const uint SampledCompare2DBinding = 43;
     private const uint SampledCompare2DArrayBinding = 44;
     private const uint SampledCompareCubeBinding = 45;
-    private const uint StorageSintBinding = 46;
-    private const uint StorageCubeSintBinding = 51;
+    private const uint Atomic64UintBinding = 46;
+    private const uint StorageSintBinding = 51;
+    private const uint StorageCubeSintBinding = 56;
+    // Atomics on 64-bit texels declare their images with another format, so they get arrays of their own.
 
     public static DescriptorBindingKind? ForImage(ImageResource image)
     {
@@ -157,12 +159,18 @@ public static class ImageDescriptorBinding
         {
             if (image.Atomic)
             {
-                if (image.NumericClass != ImageNumericClass.Uint)
+                if (image.NumericClass == ImageNumericClass.Uint64)
+                {
+                    baseBinding = Atomic64UintBinding;
+                }
+                else if (image.NumericClass != ImageNumericClass.Uint)
                 {
                     return null;
                 }
-
-                baseBinding = AtomicUintBinding;
+                else
+                {
+                    baseBinding = AtomicUintBinding;
+                }
             }
             else
             {
@@ -325,6 +333,11 @@ public static class ImageDescriptorBinding
         if (index == StorageCubeSintBinding)
             return (ImageResourceClass.Storage, ImageNumericClass.Sint, ImageDimension.Dim2DArray, false);
 
+        if (index >= Atomic64UintBinding && index < (uint)DescriptorBindingKind.Samplers)
+        {
+            return (ImageResourceClass.Storage, ImageNumericClass.Uint64, StorageDimensions[index - Atomic64UintBinding], true);
+        }
+
         if (index >= AtomicUintBinding && index < SampledCubeFloatBinding)
         {
             return (ImageResourceClass.Storage, ImageNumericClass.Uint, StorageDimensions[index - AtomicUintBinding], true);
@@ -340,7 +353,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 {
     public const uint FirstImageBinding = 1;
     public const uint FirstStorageImageBinding = 22;
-    public const uint ImageBindingCount = 51;
+    public const uint ImageBindingCount = 56;
     // A bindless shader aliases all sampled image classes through one descriptor
     // binding and all storage classes through another. The local slot table still
     // keeps the guest image classes distinct.
@@ -623,7 +636,9 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             return;
         }
 
-        var perDestination = scalarDestinations.Count > 1 ? 1u : instruction.DestinationWidth;
+        // A vector compare or carry writes a lane mask: one SGPR in a wave32 wave.
+        var perDestination = scalarDestinations.Count > 1 || instruction.Encoding is Gen5ShaderEncoding.Vopc or
+            Gen5ShaderEncoding.Vop3 ? 1u : instruction.DestinationWidth;
         foreach (var destination in scalarDestinations)
         {
             for (uint index = 0; index < perDestination && destination.Value + index < ScalarRegisterCount; index++)

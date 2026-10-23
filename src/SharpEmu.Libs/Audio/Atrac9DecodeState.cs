@@ -353,15 +353,22 @@ internal sealed class Atrac9DecodeState
                         Trace(
                             $"decode_failed superframe_bytes={info.SuperframeBytes} " +
                             $"config={Convert.ToHexString(_configData ?? [])} " +
-                            $"head={Convert.ToHexString(_compressed.AsSpan(0, Math.Min(16, _compressed.Length)))} " +
-                            "playing_silence");
+                            $"head={Convert.ToHexString(_compressed.AsSpan(0, Math.Min(16, _compressed.Length)))}");
                         _decodeErrorLogged = true;
                     }
-                    superframe.Clear();
+                    // Union note: ours played silence for a corrupt superframe and kept
+                    // rendering; main surfaces the decoder failure as a failing status so
+                    // the mixer marks the voice with an error (stopped + errorCode gives
+                    // the 0x19 state mask). Adopt main's status semantics here — no test
+                    // asserts the silence-continue behavior, and the exception detail is
+                    // still traced through TryDecodeSuperframeNoLock's decode_exception.
+                    status |= ResultInvalidData | ResultCodecError;
+                    _compressedLength = 0;
                     lock (DecoderInitGate)
                     {
                         InitializeDecodersNoLock();
                     }
+                    break;
                 }
 
                 superframe.Slice(dropSamples * sampleBytes, writableSamples * sampleBytes)

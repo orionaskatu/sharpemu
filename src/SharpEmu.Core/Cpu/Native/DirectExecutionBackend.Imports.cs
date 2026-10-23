@@ -37,6 +37,8 @@ public sealed partial class DirectExecutionBackend
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private readonly Dictionary<string, long> _unresolvedImportLogSamples = new(StringComparer.Ordinal);
+	// Unresolved imports share the result sampler under the OK value, which no logged result uses.
+	private const int UnresolvedImportSampleKey = 0;
 	private int _il2CppExceptionDiagnosticCount;
 
     [ThreadStatic]
@@ -768,6 +770,7 @@ public sealed partial class DirectExecutionBackend
 				{
 					DumpIl2CppExceptionDiagnostic(cpuContext, value, num7);
 				}
+				// A title that polls an export we lack would otherwise write a warning on every call.
 				if (ShouldLogUnresolvedImport(importStubEntry.Nid, out var unresolvedCount))
 				{
 					Console.Error.WriteLine(

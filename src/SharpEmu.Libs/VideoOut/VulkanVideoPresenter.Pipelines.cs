@@ -134,6 +134,7 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.RuntimeBufferStridesEnabled => true;
         bool IShaderPipelineHost.UsesBindlessImages => BindlessImageHeapEnabled;
 
+        bool IShaderPipelineHost.ImageInt64AtomicsEnabled => ImageInt64AtomicsEnabled;
         bool IShaderPipelineHost.ShaderSignedZeroInfNanPreserveFloat32Supported =>
             _supportsShaderSignedZeroInfNanPreserveFloat32;
         // NVIDIA's compiler rejects the elided-EXEC wave64 compute module with NVVM error 3.
@@ -172,6 +173,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             word = 0;
+            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint), clean: false))
             {
@@ -236,28 +238,22 @@ internal static unsafe partial class VulkanVideoPresenter
         // A mapping query only: nothing is read, so nothing the GPU wrote is synchronized.
         public bool IsGuestMapped(ulong address) => _guestMemory.CanRead(address, sizeof(uint));
 
+        // A held-back command write or label lands in guest memory only when its publication runs; a resource
+        // read behind it in the command stream must see it, as the command processor's own reads do.
+        private void CompletePendingPublicationsForResourceRead(ulong address, ulong size)
+        {
+            if (!HasPendingMemoryPublication(address, size)) return;
+            if (_concurrentAssumptions is not null)
+                throw new SubmissionScheduler.AbandonedWorkException($"The resolution reads memory a pending publication writes: address=0x{address:X16}.");
+            CompleteOverlappingPublications(address, size);
+        }
+
         // Refused while a GPU buffer or image write may still own the range.
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             word = 0;
-            if (!_bufferCache.HasGpuDirtyPages(address, sizeof(uint)) && IsCleanReadPage(address, sizeof(uint), clean: true))
-            {
-                if (TryGetAliasPointer(address, sizeof(uint), out var alias))
-                {
-                    word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
-                    return true;
-                }
-
-                Span<byte> resident = stackalloc byte[sizeof(uint)];
-                if (_guestMemory.TryRead(address, resident))
-                {
-                    word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(resident);
-                    return true;
-                }
-            }
-
-            CleanReadVerifications++;
+            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
@@ -319,6 +315,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var size = (ulong)destination.Length;
+            CompletePendingPublicationsForResourceRead(address, size);
             if (!_guestMemory.CanRead(address, size))
             {
                 return false;

@@ -190,14 +190,14 @@ public sealed class Gen5ShaderAtomicDecodeTests
     [Theory]
     [InlineData(0xD8480004u, "DsMinF32")]
     [InlineData(0xD84C0008u, "DsMaxF32")]
-    public void DsFloatMinMax_CompareMemoryWithData0(uint word, string opcode)
+    public void DsFloatMinMax_UseTheAddressAndOneDataRegister(uint word, string opcode)
     {
-        // RDNA compares memory with DATA0 and stores DATA0 when it wins; DATA1 (v1) is not read.
+        // ds_min_f32 and ds_max_f32 reduce DATA0 into memory; the DATA1 field is not an operand.
         var instruction = DecodeSingle(word, 0x00010907);
 
         Assert.Equal(opcode, instruction.Opcode);
         Assert.Equal(
-            new[] { Gen5Operand.Vector(7), Gen5Operand.Vector(9), Gen5Operand.Vector(9) },
+            new[] { Gen5Operand.Vector(7), Gen5Operand.Vector(9) },
             instruction.Sources);
         Assert.Empty(instruction.Destinations);
     }

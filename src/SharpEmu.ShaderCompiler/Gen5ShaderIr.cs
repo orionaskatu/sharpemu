@@ -119,7 +119,7 @@ public readonly record struct Gen5ColorComponentMapping
     }
 }
 
-// SPI_SHADER_COL_FORMAT selects the representation carried by a compressed EXP.
+// SPI_SHADER_COL_FORMAT: what a compressed EXP of a color target carries in each half of a register.
 public enum Gen5PixelExportFormat : byte
 {
     Float16 = 4,
@@ -161,6 +161,7 @@ public readonly record struct Gen5PixelOutputBinding(
     // shares its location with the first and is not a render target.
     public uint Index { get; init; }
 
+    // The format of the export that feeds this slot.
     public Gen5PixelExportFormat ExportFormat { get; init; } = Gen5PixelExportFormat.Float16;
 
     // The slot receives the object ID plus the primitive ID instead of an export.

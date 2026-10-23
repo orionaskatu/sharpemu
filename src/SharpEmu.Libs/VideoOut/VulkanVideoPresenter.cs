@@ -102,6 +102,8 @@ internal static unsafe partial class VulkanVideoPresenter
     private static void SetBindlessImageHeapCapability(bool supported) =>
         Volatile.Write(ref _bindlessImageHeapSupported, supported ? 1 : 0);
 
+    private static int _imageInt64AtomicsSupported;
+
     // True when the device supports shaderSharedInt64Atomics, so LDS 64-bit
     // atomics can be emitted as real 64-bit atomics.
     internal static bool SharedInt64AtomicsEnabled =>
@@ -118,6 +120,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private static void SetExactFloat16ConversionsCapability(bool supported) =>
         Volatile.Write(ref _exactFloat16ConversionsSupported, supported ? 1 : 0);
+
+    // True when the device supports shaderImageInt64Atomics, so an atomic on a 64-bit
+    // image texel can be compiled.
+    internal static bool ImageInt64AtomicsEnabled =>
+        Volatile.Read(ref _imageInt64AtomicsSupported) != 0;
+
+    private static void SetImageInt64AtomicsCapability(bool supported) =>
+        Volatile.Write(ref _imageInt64AtomicsSupported, supported ? 1 : 0);
 
     internal static bool GraphicsSubgroupOperationsEnabled =>
         VulkanGraphicsSubgroupPolicy.ShouldUseNativeGraphicsSubgroups(
@@ -325,6 +335,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     DisposeVulkan();
                     RenderPhaseProfile.WriteFrameTrace();
                     SubmissionFlowProfile.WriteTrace();
+                    Gpu.Rendering.ScissorTrace.Instance?.Finish("presenter-exit");
                 },
                 WaitForRenderWork);
         }

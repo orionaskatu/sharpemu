@@ -59,6 +59,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             return subgroup.SubgroupSize;
         }
     }
+    public bool SupportsImageInt64Atomics { get; private init; }
 
     private static readonly string[] RenderingExtensionNames =
     [
@@ -347,6 +348,22 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             vk.GetPhysicalDeviceFeatures2(physical, &query);
         }
 
+        const string imageAtomicInt64Extension = "VK_EXT_shader_image_atomic_int64";
+        var imageAtomicInt64Features = new PhysicalDeviceShaderImageAtomicInt64FeaturesEXT
+        {
+            SType = StructureType.PhysicalDeviceShaderImageAtomicInt64FeaturesExt,
+        };
+        if (HasDeviceExtensions(vk, physical, [imageAtomicInt64Extension]))
+        {
+            var query = new PhysicalDeviceFeatures2
+            {
+                SType = StructureType.PhysicalDeviceFeatures2,
+                PNext = &imageAtomicInt64Features,
+            };
+            vk.GetPhysicalDeviceFeatures2(physical, &query);
+        }
+        var imageAtomicInt64 = (bool)imageAtomicInt64Features.ShaderImageInt64Atomics;
+
         var vulkan13Features = new PhysicalDeviceVulkan13Features
         {
             SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -447,7 +464,6 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             barycentricFeatures.PNext = vulkan13Features.PNext;
             vulkan13Features.PNext = &barycentricFeatures;
         }
-
         var exactFloat16 = SharpEmu.Libs.VideoOut.VulkanFloat16Support.SupportsExactConversions(vk, physical);
         var float16Features = new PhysicalDeviceShaderFloat16Int8Features
         {
@@ -458,6 +474,13 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         {
             float16Features.PNext = vulkan13Features.PNext;
             vulkan13Features.PNext = &float16Features;
+        }
+        imageAtomicInt64 &= baseFeatures.ShaderInt64;
+        if (imageAtomicInt64)
+        {
+            imageAtomicInt64Features.ShaderImageInt64Atomics = true;
+            imageAtomicInt64Features.PNext = vulkan13Features.PNext;
+            vulkan13Features.PNext = &imageAtomicInt64Features;
         }
         var extensionNames = new List<string>();
         if (meshShaders)
@@ -471,6 +494,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             vulkan13Features.PNext = &meshFeatures;
             extensionNames.Add(meshExtension);
         }
+        if (imageAtomicInt64) extensionNames.Add(imageAtomicInt64Extension);
         if (dynamicRendering) extensionNames.AddRange(RenderingExtensionNames);
         if (barycentric) extensionNames.Add(barycentricExtension);
         const string fillRectangleExtension = "VK_NV_fill_rectangle";
@@ -507,6 +531,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SupportsFillRectangle = fillRectangle,
             SupportsMeshShaders = meshShaders,
             CanRequireComputeSubgroup32 = computeSubgroup32,
+            SupportsImageInt64Atomics = imageAtomicInt64,
         };
         if (validation)
         {

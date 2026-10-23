@@ -259,6 +259,9 @@ public sealed class ShaderCompileRequest
     // false, because an out-of-range read is undefined without that promise.
     public bool ZeroOutOfBoundsBufferReads { get; init; }
 
+    // The device supports 64-bit integer atomics on images (shaderImageInt64Atomics). Without
+    // it a program that uses an atomic on a 64-bit texel is rejected at compile time.
+    public bool SupportsImageInt64Atomics { get; init; }
     public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
     public Gen5HullDispatch? HullDispatch { get; init; }

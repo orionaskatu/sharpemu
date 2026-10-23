@@ -53,6 +53,7 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
     public bool NonUniformImageIndexingEnabled { get; set; }
     public bool RuntimeBufferStridesEnabled { get; set; }
     public bool UsesBindlessImages { get; set; }
+    public bool ImageInt64AtomicsEnabled { get; set; }
     public bool MeshShadersSupported { get; set; }
 
     public MeshShaderLimits MeshLimits { get; set; }

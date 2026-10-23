@@ -31,6 +31,11 @@ public sealed class ShaderResourcePlan
     // How often ResourceMaterializationCache looked this plan up and found a reusable entry.
     internal int CacheLookups;
     internal int CacheHits;
+
+    // The layout of this plan's loop-selected image tables: the most candidates and keys any of
+    // them has needed so far (see ResourceMaterializer.FitSharedImageTables).
+    internal int SharedImageCandidates;
+    internal int SharedImageKeys;
     public uint UserDataBase => Graph.UserDataBase;
     public uint UserDataCount => Graph.UserDataCount;
     public MemoryAccessTable Memory => Graph.Memory;
