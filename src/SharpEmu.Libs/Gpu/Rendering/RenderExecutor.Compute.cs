@@ -1,11 +1,9 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.VideoOut;
-using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Silk.NET.Vulkan;
 using ResourceSnapshot = SharpEmu.ShaderCompiler.Resources.ResourceSnapshot;
@@ -16,7 +14,6 @@ public readonly record struct ComputeImageClear(BufferDescriptorWords Descriptor
 
 public sealed partial class RenderExecutor
 {
-
     private const uint DispatchInitiatorUseThreadDimensions = 1u << 5;
     private const uint DispatchInitiatorBaseBits = 0x41;
     private const uint DispatchInitiatorModifierBits = 0xA038;
@@ -27,220 +24,6 @@ public sealed partial class RenderExecutor
     private const uint ImageClearStride = 16;
     private const uint ImageClearUserDataCount = 8;
 
-    // TEMP: SHARPEMU_DBG_SKIP_CS=hash,... drops those dispatches to bound their cost.
-    // Ghost of Yotei culls its static world with a visibility feedback loop: compute 17444E6A... turns the
-    // previous frame's visibility-buffer images into a per-triangle bitmask that the compaction passes read.
-    // Those images (cleared with DCC constant-encoded fills) never receive visibility data in this emulation, so
-    // the bitmask stays empty and every static mesh is culled. Until the loop is emulated the pass is replaced by
-    // an all-ones fill (everything the frustum culler selected is drawn; occlusion culling is only an optimisation).
-    // SHARPEMU_DBG_FILL_WRITTEN_CS=off keeps the real pass; a hash list overrides the default.
-    private static readonly HashSet<ulong> DbgFillWrittenHashes = Environment.GetEnvironmentVariable("SHARPEMU_DBG_FILL_WRITTEN_CS") switch
-    {
-        null => [], // the real visibility pass: forcing every triangle visible draws all instances and garbage geometry
-        var text => new HashSet<ulong>(text.Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .Where(item => !item.Equals("off", StringComparison.OrdinalIgnoreCase))
-            .Select(item => Convert.ToUInt64(item.Replace("0x", ""), 16))),
-    };
-    // TEMP: SHARPEMU_DBG_BOOT_WINDOW=fromSeconds:lengthSeconds limits the replacement to that window of process time.
-    private static readonly (double From, double Length)? DbgBootWindow = Environment.GetEnvironmentVariable("SHARPEMU_DBG_BOOT_WINDOW") is { Length: > 0 } dbgWindow && dbgWindow.Split(':') is { Length: 2 } dbgWindowParts
-        ? (double.Parse(dbgWindowParts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(dbgWindowParts[1], System.Globalization.CultureInfo.InvariantCulture)) : null;
-    private static readonly long DbgProcessStart = System.Diagnostics.Stopwatch.GetTimestamp();
-    private static bool DbgInBootWindow()
-    {
-        if (DbgBootWindow is not { } window)
-            return true;
-        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds;
-        return elapsed >= window.From && elapsed < window.From + window.Length;
-    }
-
-    // TEMP: SHARPEMU_DBG_PROBE=1 prints per-frame draw totals by marker and the state of the culling buffers (frame-alternation hunt).
-    internal static readonly bool DbgProbeOn = Environment.GetEnvironmentVariable("SHARPEMU_DBG_PROBE") == "1";
-    private static readonly Dictionary<string, long[]> DbgProbeDraws = new();
-    private static int _dbgProbeFrame = -1;
-    private static readonly int DbgProbeTop = 200;
-    private static int _dbgProbeBuffersFrame = -1;
-    private static int _dbgTileFrame = -1;
-    private static readonly HashSet<(ulong, ulong, bool, int)> _dbgImageUses = new();
-
-    internal void DbgProbeDraw(string kind, long indices, long instances, bool raw = false)
-    {
-        if (!DbgProbeOn) return;
-        DbgProbeTick();
-        var key = raw ? kind : kind + " " + Diagnostics.DbgSequence.Marker;
-        lock (DbgProbeDraws)
-        {
-            if (!DbgProbeDraws.TryGetValue(key, out var entry)) DbgProbeDraws[key] = entry = new long[3];
-            entry[0]++; entry[1] += indices; entry[2] += instances;
-        }
-    }
-
-    private void DbgProbeTick()
-    {
-        var frame = Diagnostics.DbgSequence.Frames;
-        if (frame == _dbgProbeFrame) return;
-        lock (DbgProbeDraws)
-        {
-            if (_dbgProbeFrame >= 0)
-            {
-                var text = string.Join(" | ", DbgProbeDraws.OrderByDescending(pair => pair.Key.Contains("high-res terrain") ? long.MaxValue : pair.Value[0]).Take(DbgProbeTop).Select(pair => $"{pair.Key}: n={pair.Value[0]} idx={pair.Value[1]} inst={pair.Value[2]}"));
-                Console.Error.WriteLine($"[DBG][PROBE] frame={_dbgProbeFrame} t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F0} {text}");
-            }
-
-            DbgProbeDraws.Clear();
-            _dbgProbeFrame = frame;
-        }
-    }
-
-    private static int CountNonZero(byte[] bytes, int stride)
-    {
-        var count = 0;
-        for (var i = 0; i + stride <= bytes.Length; i += stride)
-        {
-            for (var k = 0; k < stride; k++) if (bytes[i + k] != 0) { count++; break; }
-        }
-
-        return count;
-    }
-
-    // "cpu/gpu": the guest's view of the range and the GPU buffer's own bytes.
-    private string DbgProbeNonZero(ulong address, int length, int stride)
-    {
-        var cpu = new byte[length];
-        var cpuCount = _host.TryReadGuest(address, cpu) ? CountNonZero(cpu, stride) : -1;
-        var gpu = new byte[length];
-        var gpuCount = _host.DebugReadGpu(address, gpu) ? CountNonZero(gpu, stride) : -1;
-        return $"{cpuCount}/{gpuCount}";
-    }
-
-    private void DbgProbeBuffers()
-    {
-        var frame = Diagnostics.DbgSequence.Frames;
-        if (frame == _dbgProbeBuffersFrame) return;
-        _dbgProbeBuffersFrame = frame;
-        var bits = new byte[0x400000];
-        long Pop(byte[] data) { long n = 0; for (var i = 0; i + 8 <= data.Length; i += 8) n += System.Numerics.BitOperations.PopCount(BitConverter.ToUInt64(data, i)); return n; }
-        var gpuBits = _host.DebugReadGpu(0x50633B0000UL, bits) ? Pop(bits) : -1;
-        // The two HiZ depth images (R32Sfloat 960x540): CPU view vs the GPU buffer holding the published copy.
-        foreach (var (name, address) in new[] { ("A", 0x504C270000UL), ("B", 0x504C51FC00UL) })
-        {
-            var size = 960 * 540 * 4;
-            var cpuImage = new byte[size];
-            var gpuImage = new byte[size];
-            var cpuOk = _host.TryReadGuest(address, cpuImage);
-            var gpuOk = _host.DebugReadGpu(address, gpuImage);
-            var mismatch = 0; var cpuFar = 0; var gpuFar = 0; var cpuNear = 0; var gpuNear = 0;
-            if (cpuOk && gpuOk)
-                for (var i = 0; i < size; i += 4)
-                {
-                    if (BitConverter.ToUInt32(cpuImage, i) != BitConverter.ToUInt32(gpuImage, i)) mismatch++;
-                }
-
-            for (var i = 0; i < size && cpuOk; i += 4) { var v = BitConverter.ToSingle(cpuImage, i); if (v >= 9.9e6f) cpuFar++; else if (v > 0) cpuNear++; }
-            for (var i = 0; i < size && gpuOk; i += 4) { var v = BitConverter.ToSingle(gpuImage, i); if (v >= 9.9e6f) gpuFar++; else if (v > 0) gpuNear++; }
-            if (cpuOk && Environment.GetEnvironmentVariable("SHARPEMU_DBG_DUMPDIR") is { Length: > 0 } dumpDir && (frame % 20 == 0 || (frame >= 250 && frame <= 256)))
-                File.WriteAllBytes(Path.Combine(dumpDir, $"hiz{name}_{frame}.f32"), cpuImage);
-            Console.Error.WriteLine($"[DBG][PROBE] frame={frame} hiz{name} cpuOk={cpuOk} gpuOk={gpuOk} mismatchTexels={mismatch} cpu(far/near)={cpuFar}/{cpuNear} gpu(far/near)={gpuFar}/{gpuNear}");
-        }
-
-        // CPU view vs GPU truth of the pages the guest CPU reads back (8-byte GPU results).
-        foreach (var page in new ulong[] { 0x50C3399000UL, 0x50C3398000UL, 0x50C3397000UL, 0x50C6598000UL, 0x50C6599000UL, 0x50C6597000UL, 0x504C57F000UL, 0x504C54E000UL, 0x200975F000UL })
-        {
-            var cpuPage = new byte[4096];
-            var gpuPage = new byte[4096];
-            var cpuOk = _host.TryReadGuest(page, cpuPage);
-            var gpuOk = _host.DebugReadGpu(page, gpuPage);
-            var mismatch = 0;
-            for (var i = 0; i < 4096; i++) if (cpuPage[i] != gpuPage[i]) mismatch++;
-            Console.Error.WriteLine($"[DBG][PROBE] frame={frame} page=0x{page:X} cpuOk={cpuOk} gpuOk={gpuOk} cpuNZ={CountNonZero(cpuPage, 8)} gpuNZ={CountNonZero(gpuPage, 8)} mismatchBytes={mismatch}");
-        }
-
-        // Compare the two instance arrays record by record.
-        {
-            const int Records = 0x1700000 / 92;
-            var even = new byte[Records * 92];
-            var odd = new byte[Records * 92];
-            if (_host.DebugReadGpu(0x50C1480000UL, even) && _host.DebugReadGpu(0x50C4680000UL, odd))
-            {
-                int both = 0, same = 0, onlyEven = 0, onlyOdd = 0; var diffWords = new int[23]; var sample = "";
-                for (var r = 0; r < Records; r++)
-                {
-                    var o = r * 92;
-                    var ez = true; var oz = true; var eq = true;
-                    for (var k = 0; k < 92; k++) { if (even[o + k] != 0) ez = false; if (odd[o + k] != 0) oz = false; if (even[o + k] != odd[o + k]) eq = false; }
-                    if (ez && oz) continue;
-                    if (ez) onlyOdd++; else if (oz) onlyEven++; else { both++; if (eq) same++; else { for (var w = 0; w < 23; w++) if (BitConverter.ToUInt32(even, o + w * 4) != BitConverter.ToUInt32(odd, o + w * 4)) diffWords[w]++; if (sample.Length == 0) sample = $"rec{r} even={string.Join(",", Enumerable.Range(0, 23).Select(w => BitConverter.ToUInt32(even, o + w * 4).ToString("X")))} odd={string.Join(",", Enumerable.Range(0, 23).Select(w => BitConverter.ToUInt32(odd, o + w * 4).ToString("X")))}"; } }
-                }
-
-                // Overlap of the two arrays as sets of (first 3 floats): do they hold the same objects at different indices?
-                {
-                    var evenSet = new HashSet<(uint, uint, uint)>();
-                    var oddSet = new HashSet<(uint, uint, uint)>();
-                    int evenN = 0, oddN = 0;
-                    for (var r = 0; r < Records; r++)
-                    {
-                        var o = r * 92;
-                        var e = (BitConverter.ToUInt32(even, o), BitConverter.ToUInt32(even, o + 4), BitConverter.ToUInt32(even, o + 8));
-                        var d = (BitConverter.ToUInt32(odd, o), BitConverter.ToUInt32(odd, o + 4), BitConverter.ToUInt32(odd, o + 8));
-                        if (e != (0u, 0u, 0u)) { evenSet.Add(e); evenN++; }
-                        if (d != (0u, 0u, 0u)) { oddSet.Add(d); oddN++; }
-                    }
-
-                    var overlap = evenSet.Count(item => oddSet.Contains(item));
-                    // Positions as floats near the camera-ish range: count records within 3000 units of the first plane-origin guess is meaningless; report float sanity instead.
-                    var sane = (byte[] a) => { var n = 0; for (var r = 0; r < Records; r++) { var x = BitConverter.ToSingle(a, r * 92); var y = BitConverter.ToSingle(a, r * 92 + 4); var z = BitConverter.ToSingle(a, r * 92 + 8); if (x == 0 && y == 0 && z == 0) continue; if (float.IsFinite(x) && float.IsFinite(y) && float.IsFinite(z) && Math.Abs(x) < 1e6f && Math.Abs(y) < 1e6f && Math.Abs(z) < 1e6f) n++; } return n; };
-                    if (frame % 40 == 0)
-                    {
-                        foreach (var (name, data) in new[] { ("even", even), ("odd", odd) })
-                        {
-                            var shown = 0;
-                            for (var r = 0; r < Records && shown < 6; r += 97)
-                            {
-                                var o = r * 92;
-                                if (BitConverter.ToUInt32(data, o) == 0 && BitConverter.ToUInt32(data, o + 4) == 0) continue;
-                                Console.Error.WriteLine($"[DBG][PROBE] frame={frame} {name} rec{r}: {string.Join(" ", Enumerable.Range(0, 23).Select(w => BitConverter.ToUInt32(data, o + w * 4).ToString("X8")))}");
-                                shown++;
-                            }
-                        }
-                    }
-
-                    Console.Error.WriteLine($"[DBG][PROBE] frame={frame} posSets even={evenN}/{evenSet.Count} odd={oddN}/{oddSet.Count} overlap={overlap} saneEven={sane(even)} saneOdd={sane(odd)}");
-                }
-
-                Console.Error.WriteLine($"[DBG][PROBE] frame={frame} instCmp both={both} same={same} onlyEven={onlyEven} onlyOdd={onlyOdd} diffWords={string.Join(",", diffWords)} {sample}");
-            }
-        }
-
-        Console.Error.WriteLine($"[DBG][PROBE] frame={frame} bitmaskGpu={gpuBits} flagsEven={DbgProbeNonZero(0x50C2C80000UL + 0x40000, 262144, 1)} flagsOdd={DbgProbeNonZero(0x50C5E80000UL + 0x40000, 262144, 1)} " +
-            $"dwEven={DbgProbeNonZero(0x50C2B80000UL + 0x100000, 0x100000, 4)} dwOdd={DbgProbeNonZero(0x50C5D80000UL + 0x100000, 0x100000, 4)} " +
-            $"tabB58={DbgProbeNonZero(0x5037B58000UL, 0xA0000, 32)} tabBF8={DbgProbeNonZero(0x5037BF8000UL, 0xA0000, 32)} tabC98={DbgProbeNonZero(0x5037C98000UL, 0xA0000, 32)} " +
-            $"instEven={DbgProbeNonZero(0x50C1480000UL, 0x1700000 / 92 * 92, 92)} instOdd={DbgProbeNonZero(0x50C4680000UL, 0x1700000 / 92 * 92, 92)} " +
-            $"inst2Even={DbgProbeNonZero(0x50C1480000UL + 0x1700000, 0x400000, 92)} inst2Odd={DbgProbeNonZero(0x50C4680000UL + 0x1700000, 0x400000, 92)}");
-    }
-
-    private static readonly (ulong Hash, int Slot, int Words, ulong Offset)[] DbgPeek = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_PEEK") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
-        .Select(item => item.Split(':')).Where(parts => parts.Length >= 3).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToInt32(parts[1], 16), Convert.ToInt32(parts[2]), parts.Length > 3 ? Convert.ToUInt64(parts[3].Replace("0x", ""), 16) : 0UL)).ToArray(); // TEMP
-    private static readonly int DbgBootFrames = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_BOOT_FRAMES"), out var dbgBoot) ? dbgBoot : 0; // TEMP
-    private static int _dbgBootCount; // TEMP
-    private static readonly HashSet<ulong> DbgRunOnly = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_RUN_CS") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).Select(h => Convert.ToUInt64(h.Replace("0x", ""), 16)).ToHashSet(); // TEMP
-    private static readonly HashSet<ulong> DbgSkipHashes = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_CS") ?? "")
-        .Split(',', StringSplitOptions.RemoveEmptyEntries).Select(h => Convert.ToUInt64(h.Replace("0x", ""), 16)).ToHashSet();
-
-    private static readonly Dictionary<ulong, (int Count, long Groups, int Indirect)> _dbgDispatches = new(); // TEMP
-    private static long _dbgDispatchLast = Environment.TickCount64;
-    private static readonly bool _dbgDispatchStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPATCHES") == "1";
-    private static void DbgCountDispatch(ulong hash, long groups, bool indirect)
-    {
-        if (!_dbgDispatchStats) return;
-        _dbgDispatches.TryGetValue(hash, out var e);
-        _dbgDispatches[hash] = (e.Count + 1, e.Groups + groups, e.Indirect + (indirect ? 1 : 0));
-        if (Environment.TickCount64 - _dbgDispatchLast < 10000) return;
-        _dbgDispatchLast = Environment.TickCount64;
-        Console.Error.WriteLine($"[DBG][DISPATCHES] total={_dbgDispatches.Values.Sum(v => v.Count)} distinct={_dbgDispatches.Count}");
-        foreach (var (h, v) in _dbgDispatches.OrderByDescending(x => x.Value.Count).Take(25))
-            Console.Error.WriteLine($"[DBG][DISPATCHES] n={v.Count} avg_groups={v.Groups / (double)v.Count:F1} indirect={v.Indirect} hash=0x{h:X16}");
-        _dbgDispatches.Clear();
-    }
-
     public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
     {
         if (!_host.IsRecording)
@@ -250,44 +33,6 @@ public sealed partial class RenderExecutor
 
         _host.RunPendingOperations();
         var compute = banks.Shader.Compute;
-        if (Diagnostics.ReferenceCheck.Enabled) // TEMP: CPU reference check, at a point where nothing of this dispatch is recorded
-        {
-            if (Diagnostics.ReferenceCheck.Pending is { } pending)
-            {
-                Diagnostics.ReferenceCheck.Pending = null;
-                if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_REF_SCALAR_COHERENCE") == "1") // TEMP: are the constants the interpreter read still the GPU's?
-                {
-                    var seen = new HashSet<ulong>();
-                    var reported = 0;
-                    var gpuWord = new byte[4];
-                    Span<byte> guestWord = stackalloc byte[4];
-                    foreach (var (pc, loadAddress, value) in pending.Interpreter.ScalarLoads)
-                    {
-                        if (!seen.Add(loadAddress) || reported >= 24) continue;
-                        var guest = _host.TryReadGuest(loadAddress, guestWord) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(guestWord) : (uint?)null;
-                        var gpu = _host.DebugReadGpuCopy(loadAddress, gpuWord) ? BitConverter.ToUInt32(gpuWord) : (uint?)null;
-                        if (guest != value || (gpu is { } g && g != value))
-                        {
-                            reported++;
-                            Console.Error.WriteLine($"[DBG][REF] scalar pc=0x{pc:X} addr=0x{loadAddress:X} interp=0x{value:X8} guestNow=0x{guest:X8} gpuCopy={(gpu is { } x ? $"0x{x:X8}" : "none")}");
-                        }
-                    }
-                    Console.Error.WriteLine($"[DBG][REF] scalar coherence checked={seen.Count} differing={reported}");
-                }
-                Diagnostics.ReferenceCheck.Compare(pending.Hash, pending.Interpreter, address =>
-                {
-                    Span<byte> word = stackalloc byte[4];
-                    return _host.TryReadGuest(address, word) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(word) : null;
-                });
-            }
-
-            if (indirectArgumentsAddress == 0 &&
-                Diagnostics.ReferenceCheck.Begin(compute.Address, (address, destination) => _host.TryReadGuest(address, destination),
-                    compute.UserScalars.Values[..(int)Math.Min(compute.UserScalarCount, 32u)], compute.ThreadsX, compute.ThreadsY, compute.ThreadsZ,
-                    groupsX, groupsY, groupsZ, Pipelines.ShaderPipelineCache.DecodeComputeSystemRegisters(compute), compute.ThreadIdComponentCount + 1,
-                    compute.WaveSize) is { } reference && Diagnostics.ReferenceCheck.Programs.TryGetValue(compute.Address, out var referenced))
-                Diagnostics.ReferenceCheck.Pending = (referenced.Hash, reference);
-        }
         _host.SetDebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
         if (compute.Address == 0)
         {
@@ -317,9 +62,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        var dbgT0 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         var computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
-        var dbgT1 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         if (computeProgram.Consumed)
         {
             return;
@@ -343,218 +86,6 @@ public sealed partial class RenderExecutor
             Diagnostics.DccWriterTrace.CurrentKind = "compute";
         }
 
-        if (Diagnostics.DbgSequence.Active) // TEMP
-        {
-            var dbgWrites = new System.Text.StringBuilder();
-            for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
-            {
-                if (!program.Buffers[index].Written || input.Stage.Resources.Buffers[index].Length < 4)
-                    continue;
-                var dbgDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[index]);
-                dbgWrites.Append($" w{index}=0x{dbgDescriptor.Address:X}+0x{dbgDescriptor.Footprint() ?? 0:X}/stride{dbgDescriptor.Stride}/rec{dbgDescriptor.RecordCount}");
-                if ((dbgDescriptor.Footprint() ?? 0) == 0)
-                    dbgWrites.Append($"[raw={string.Join(",", input.Stage.Resources.Buffers[index].ToArray().Select(word => word.ToString("X8")))}]");
-            }
-            var dbgCb = banks.Context;
-            Diagnostics.DbgSequence.Note($"  cbstate cb0[base=0x{dbgCb.ColorTargets[0].BaseAddress:X} info=0x{dbgCb.ColorTargets[0].Info:X8} dcc=0x{dbgCb.ColorTargets[0].DccAddress:X} clr0=0x{dbgCb.ColorTargets[0].ClearWord0:X8} clr1=0x{dbgCb.ColorClearWord1[0]:X8}] cb1[base=0x{dbgCb.ColorTargets[1].BaseAddress:X} info=0x{dbgCb.ColorTargets[1].Info:X8} dcc=0x{dbgCb.ColorTargets[1].DccAddress:X} clr0=0x{dbgCb.ColorTargets[1].ClearWord0:X8} clr1=0x{dbgCb.ColorClearWord1[1]:X8}]");
-            var dbgUser = input.Stage.Resources.UserData;
-            Diagnostics.DbgSequence.Note($"dispatch cs=0x{program.Hash:X16} groups={groupsX}x{groupsY}x{groupsZ} local={input.ThreadsX}{dbgWrites} ud4-7={(dbgUser.Length >= 8 && program.Hash == 0x2BD3CD129405F9A9UL ? $"{dbgUser[4]:X8},{dbgUser[5]:X8},{dbgUser[6]:X8},{dbgUser[7]:X8}" : "-")}");
-        }
-        if (DbgPeek.Length != 0) // TEMP: SHARPEMU_DBG_PEEK=hash:slot:dwords,... logs guest dwords of a bound buffer per dispatch
-        {
-            foreach (var (peekHash, peekSlot, peekWords, peekOffset) in DbgPeek)
-            {
-                if (peekHash != program.Hash)
-                    continue;
-                ulong peekAddress;
-                if (peekSlot == 0xFE) // V# at ud pointer + offset: dump the first dwords of every record
-                {
-                    var peekUser2 = input.Stage.Resources.UserData;
-                    var vsharp = new byte[16];
-                    if (peekUser2.Length < 2 || !_host.TryReadGuest((peekUser2[0] | ((ulong)peekUser2[1] << 32)) + peekOffset, vsharp))
-                        continue;
-                    var baseAddress = BitConverter.ToUInt32(vsharp, 0) | ((ulong)(BitConverter.ToUInt32(vsharp, 4) & 0xFFFF) << 32);
-                    var recordStride = (BitConverter.ToUInt32(vsharp, 4) >> 16) & 0x3FFF;
-                    var recordCount = BitConverter.ToUInt32(vsharp, 8);
-                    Console.Error.WriteLine($"[DBG][PEEK] V# base=0x{baseAddress:X} stride=0x{recordStride:X} records={recordCount} groups={groupsX}");
-                    for (var record = 0u; record < Math.Min(recordCount, 64u); record++)
-                    {
-                        var recordBytes = new byte[peekWords * 4];
-                        var recordRead = _host.TryReadGuest(baseAddress + record * recordStride, recordBytes);
-                        Console.Error.WriteLine($"[DBG][PEEK]   rec {record}: " + (recordRead ? string.Join(" ", Enumerable.Range(0, peekWords).Select(index => BitConverter.ToUInt32(recordBytes, index * 4).ToString("X8"))) : "unreadable"));
-                    }
-
-                    continue;
-                }
-
-                if (peekSlot == 0xFF)
-                {
-                    var peekUser = input.Stage.Resources.UserData;
-                    if (peekUser.Length < 2)
-                        continue;
-                    peekAddress = (peekUser[0] | ((ulong)peekUser[1] << 32)) + peekOffset;
-                }
-                else
-                {
-                    if (peekSlot >= input.Stage.Resources.Buffers.Length || input.Stage.Resources.Buffers[peekSlot].Length < 4)
-                        continue;
-                    peekAddress = BufferDescriptorWords.From(input.Stage.Resources.Buffers[peekSlot]).Address + peekOffset;
-                }
-
-                var peekBytes = new byte[peekWords * 4];
-                var peekRead = _host.TryReadGuest(peekAddress, peekBytes);
-                Console.Error.WriteLine($"[DBG][PEEK] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F2} cs=0x{program.Hash:X} slot={peekSlot:X} addr=0x{peekAddress:X} groups={groupsX} " +
-                    (peekRead ? string.Join(" ", Enumerable.Range(0, peekWords).Select(index => BitConverter.ToUInt32(peekBytes, index * 4).ToString("X8"))) : "unreadable"));
-            }
-        }
-
-        if (DbgSkipHashes.Contains(program.Hash) || Environment.GetEnvironmentVariable("SHARPEMU_DBG_SKIP_ALL_CS") == "1" || (DbgRunOnly.Count != 0 && !DbgRunOnly.Contains(program.Hash))) return; // TEMP
-        Diagnostics.DbgSequence.Tally("CS", program.Hash); // TEMP
-        if (Diagnostics.DbgSequence.SkipByMarker) // TEMP
-        {
-            _host.ResetBindings();
-            return;
-        }
-
-
-        if (program.Hash == HizPolicy.BuilderProgramHash && HizPolicy.TryGetBuilderImage(input.Stage.Resources.Images, out var hizImage) && HizPolicy.Current == HizPolicy.Mode.Far)
-        {
-            // Nothing is occluded: the pyramid reads empty instead of being built from this frame's depth.
-            _host.DebugFillBuffer(hizImage, HizPolicy.ImageBytes, HizPolicy.FarBits);
-            _host.ResetBindings();
-            return;
-        }
-
-        DbgVcullWatch(program, input); // TEMP
-        if (DbgProbeOn && program.Hash == 0x25FCDA2A90D50DD4UL) { DbgProbeTick(); DbgProbeBuffers(); } // TEMP
-        if (DbgProbeOn) DbgProbeDraw("CS", 0, 1); // TEMP
-        if (DbgProbeOn && program.Hash is 0x9DCF7A3711A288C0UL or 0xF00717DE7B897C69UL or 0xB9B4F92557380EDDUL or 0x32839016CE94F7A2UL or 0xE584166F64BA03E2UL or 0xA7661FF4EA282325UL or 0x8457901D80B91921UL) // TEMP
-        {
-            var allImages = input.Stage.Resources.Images;
-            var key2 = (program.Hash, 1UL, false, Diagnostics.DbgSequence.Frames);
-            bool first;
-            lock (_dbgImageUses) first = _dbgImageUses.Add(key2);
-            if (first)
-                for (var index = 0; index < allImages.Length && index < program.Images.Length; index++)
-                {
-                    if (allImages[index].Length < 8) continue;
-                    var tsharp = new SharpEmu.Libs.Gpu.Images.TextureDescriptorWords(allImages[index]);
-                    Console.Error.WriteLine($"[DBG][PROBE] frame={Diagnostics.DbgSequence.Frames} chain cs={program.Hash:X16} groups={groupsX}x{groupsY} img{index} base=0x{tsharp.BaseAddress:X} written={program.Images[index].Written} words={string.Join(",", allImages[index].Take(8).Select(w => w.ToString("X8")))}");
-                }
-        }
-
-        if (DbgProbeOn && Diagnostics.DbgSequence.Frames >= 0) // TEMP: who reads/writes the two culling depth images
-        {
-            var imagesAll = input.Stage.Resources.Images;
-            for (var index = 0; index < imagesAll.Length && index < program.Images.Length; index++)
-            {
-                if (imagesAll[index].Length < 8) continue;
-                var baseAddress = new SharpEmu.Libs.Gpu.Images.TextureDescriptorWords(imagesAll[index]).BaseAddress;
-                if (baseAddress is not (0x504C270000UL or 0x504C51FC00UL)) continue;
-                var key = (program.Hash, baseAddress, program.Images[index].Written, Diagnostics.DbgSequence.Frames);
-                lock (_dbgImageUses)
-                {
-                    if (!_dbgImageUses.Add(key)) continue;
-                }
-
-                Console.Error.WriteLine($"[DBG][PROBE] frame={Diagnostics.DbgSequence.Frames} image 0x{baseAddress:X} used by cs=0x{program.Hash:X16} written={program.Images[index].Written} marker={Diagnostics.DbgSequence.Marker} groups={groupsX}x{groupsY}x{groupsZ}");
-            }
-        }
-
-        if (DbgProbeOn && program.Hash == 0xA7661FF4EA282325UL && _dbgTileFrame != Diagnostics.DbgSequence.Frames) // TEMP
-        {
-            _dbgTileFrame = Diagnostics.DbgSequence.Frames;
-            var images = input.Stage.Resources.Images;
-            for (var index = 0; index < images.Length; index++)
-            {
-                var words = images[index];
-                if (words.Length < 8) continue;
-                Console.Error.WriteLine($"[DBG][PROBE] frame={_dbgTileFrame} tile-cull image{index} base=0x{new SharpEmu.Libs.Gpu.Images.TextureDescriptorWords(words).BaseAddress:X} words={string.Join(",", words.Select(w => w.ToString("X8")))}");
-            }
-        }
-
-        if (program.Hash == 0x25FCDA2A90D50DD4UL && Environment.GetEnvironmentVariable("SHARPEMU_DBG_TABLESTAT") == "1" && input.Stage.Resources.Buffers.Length > 1 && input.Stage.Resources.Buffers[1].Length >= 4) // TEMP
-        {
-            var tableDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[1]);
-            var tableBytes = new byte[Math.Min(tableDescriptor.Footprint() ?? 0, 4UL << 20)];
-            if (tableBytes.Length >= 32 && _host.TryReadGuest(tableDescriptor.Address, tableBytes))
-            {
-                var used = 0; ulong triSum = 0;
-                for (var rec = 0; rec + 32 <= tableBytes.Length; rec += 32)
-                {
-                    var instances = BitConverter.ToUInt32(tableBytes, rec + 4);
-                    var tris = BitConverter.ToUInt32(tableBytes, rec + 8);
-                    if (instances != 0 && tris != 0) { used++; triSum += (ulong)instances * tris; }
-                }
-
-                Console.Error.WriteLine($"[DBG][TABLE] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F1} addr=0x{tableDescriptor.Address:X} bytes=0x{tableBytes.Length:X} usedRecords={used} triSum={triSum} groups={groupsX}");
-            }
-        }
-
-        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_STRUCTS") == "1" && program.Hash is 0x25FCDA2A90D50DD4UL or 0x525A55D3242304C9UL or 0xB7DF200E29FEE750UL && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds > 70 && DbgStructQuota(program.Hash)) // TEMP
-        {
-            var dbgUd = input.Stage.Resources.UserData;
-            var dbgStruct = new byte[256];
-            var dbgOk = dbgUd.Length >= 2 && _host.TryReadGuest(dbgUd[0] | ((ulong)dbgUd[1] << 32), dbgStruct);
-            var dbgDw = Enumerable.Range(0, 64).Select(i => BitConverter.ToUInt32(dbgStruct, i * 4)).ToArray();
-            var dbgBufs = string.Join(" ", Enumerable.Range(0, input.Stage.Resources.Buffers.Length).Select(index =>
-            {
-                var words = input.Stage.Resources.Buffers[index];
-                if (words.Length < 4) return "-";
-                var descriptor = BufferDescriptorWords.From(words);
-                return $"{descriptor.Address:X}+{descriptor.Footprint() ?? 0:X}{(program.Buffers[index].Written ? "w" : "")}";
-            }));
-            Console.Error.WriteLine($"[DBG][STRUCT] cs={program.Hash:X16} g={groupsX} read={dbgOk} struct={string.Join(",", dbgDw.Select(w => w.ToString("X")))} bufs={dbgBufs}");
-        }
-
-        if (program.Hash == 0x17444E6ABBF4F82CUL && Environment.GetEnvironmentVariable("SHARPEMU_DBG_VCULL_TABLES") == "1" && Interlocked.Increment(ref _dbgVcullTableLogs) <= 3) // TEMP
-        {
-            for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
-            {
-                var words = input.Stage.Resources.Buffers[index];
-                if (words.Length < 4) continue;
-                var descriptor = BufferDescriptorWords.From(words);
-                var footprint = descriptor.Footprint() ?? 0;
-                var bytes = new byte[Math.Min(footprint, 4096UL * 4)];
-                var ok = descriptor.Address != 0 && _host.TryReadGuest(descriptor.Address, bytes);
-                var dwords = Enumerable.Range(0, bytes.Length / 4).Select(i => BitConverter.ToUInt32(bytes, i * 4)).ToArray();
-                Console.Error.WriteLine($"[DBG][VTAB] buf[{index}] addr=0x{descriptor.Address:X} bytes=0x{footprint:X} written={program.Buffers[index].Written} read={ok} nonzero={dwords.Count(x => x != 0)} first={string.Join(",", dwords.Take(48).Select(x => x.ToString("X")))}");
-            }
-
-            var ud = input.Stage.Resources.UserData;
-            Console.Error.WriteLine($"[DBG][VTAB] groups={groupsX}x{groupsY}x{groupsZ} ud={string.Join(",", ud.Take(16).Select(x => x.ToString("X")))}");
-            var rect = new byte[16];
-            if (ud.Length >= 2 && _host.TryReadGuest(ud[0] | ((ulong)ud[1] << 32), rect))
-                Console.Error.WriteLine($"[DBG][VTAB] ud-struct rect={string.Join(",", Enumerable.Range(0, 4).Select(i => BitConverter.ToUInt32(rect, i * 4).ToString("X")))}");
-        }
-        if ((DbgFillWrittenHashes.Contains(program.Hash) || (program.Hash == 0x17444E6ABBF4F82CUL && DbgInForceWindow())) && DbgInBootWindow() && !DbgInRealVcullWindow()) // TEMP: replace the dispatch by all-ones fills of its written buffers
-        {
-            for (var index = 0; index < program.Buffers.Length && index < input.Stage.Resources.Buffers.Length; index++)
-            {
-                if (!program.Buffers[index].Written || input.Stage.Resources.Buffers[index].Length < 4)
-                    continue;
-                var descriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[index]);
-                if (descriptor.Footprint() is { } footprint && descriptor.Address != 0 && footprint != 0)
-                    _host.DebugFillBuffer(descriptor.Address & ~3UL, (footprint + 3) & ~3UL, 0xFFFFFFFF);
-            }
-
-            _host.ResetBindings();
-            return;
-        }
-        DbgCountDispatch(program.Hash, groupsX * groupsY * groupsZ, indirectArgumentsAddress != 0); // TEMP
-        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG") == "2" && System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds is var dbgNow && dbgNow >= double.Parse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG_FROM") ?? "0") && dbgNow < double.Parse(Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG_FROM") ?? "0") + 8) // TEMP: per-dispatch inputs
-        {
-            var dbgUser = input.Stage.Resources.UserData;
-            var dbgBuffers = string.Join(" ", Enumerable.Range(0, input.Stage.Resources.Buffers.Length).Select(index =>
-            {
-                var words = input.Stage.Resources.Buffers[index];
-                if (words.Length < 4) return "-";
-                var descriptor = BufferDescriptorWords.From(words);
-                return $"{descriptor.Address:X}+{descriptor.Footprint() ?? 0:X}{(program.Buffers[index].Written ? "w" : "")}";
-            }));
-            Console.Error.WriteLine($"[DBG][DISPIN] t={System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds:F3} cs={program.Hash:X16} g={groupsX}x{groupsY}x{groupsZ} ind={(indirectArgumentsAddress != 0 ? 1 : 0)} ud=" + string.Join(",", dbgUser.Take(16).Select(word => word.ToString("X"))) + " buf=" + dbgBuffers);
-        }
-        if (Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISPLOG") == "1") Console.Error.WriteLine($"[DBG][DISPLOG] cs=0x{program.Hash:X16} groups={groupsX}x{groupsY}x{groupsZ} indirect={indirectArgumentsAddress != 0} local={input.ThreadsX}x{input.ThreadsY}x{input.ThreadsZ} wave={input.WaveSize} buffers={program.Buffers.Length} images={program.Images.Length}"); // TEMP
         if (RenderTrace.Enabled)
         {
             RenderTrace.Write(
@@ -564,18 +95,10 @@ public sealed partial class RenderExecutor
                 $"buffers={program.Buffers.Length} images={program.Images.Length} samplers={program.SamplerCount}");
         }
 
-        if (indirectArgumentsAddress == 0)
+        if (indirectArgumentsAddress == 0 && TryConsumeMetadataClear(input))
         {
-            // A dispatch that reads and rewrites HTile in place runs as written; the depth
-            // target's clear state is then read from the words it wrote. Titles clear each
-            // shadow map's HTile this way, and a target never seen cleared fails every
-            // caster's reverse-Z test.
-            RecordHtileRewrite(input);
-            if (TryConsumeMetadataClear(input))
-            {
-                _host.ResetBindings();
-                return;
-            }
+            _host.ResetBindings();
+            return;
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeConstantFill(input, groupsX, groupsY, groupsZ))
@@ -584,13 +107,13 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (indirectArgumentsAddress == 0 && !SharpEmu.ShaderCompiler.DbgFlags.Disabled("boundedfill") && TryConsumeBoundedFill(input, groupsX, groupsY, groupsZ, dispatchInitiator))
+        if (indirectArgumentsAddress == 0 && TryConsumeBoundedFill(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
             _host.ResetBindings();
             return;
         }
 
-        if (indirectArgumentsAddress == 0 && !SharpEmu.ShaderCompiler.DbgFlags.Disabled("boundedfill") && TryConsumeBoundedCopy(input, groupsX, groupsY, groupsZ, dispatchInitiator))
+        if (indirectArgumentsAddress == 0 && TryConsumeBoundedCopy(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
             _host.ResetBindings();
             return;
@@ -621,13 +144,15 @@ public sealed partial class RenderExecutor
             }
         }
 
+        if (SkipWhileLinkedModuleCompiles(input, computeProgram.Program, program))
+        {
+            _host.ResetBindings();
+            return;
+        }
+
         _host.EndRendering();
-        var dbgT2 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
-        long dbgT3 = 0, dbgT4 = 0, dbgT5 = 0;
-        var dbgTb0 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
         using (_host.BeginPreparation())
         {
-            DbgBeginPrep += System.Diagnostics.Stopwatch.GetTimestamp() - dbgTb0; // TEMP
             // The host may compile this program off the command-stream thread and report that
             // the pipeline is not ready yet. The dispatch waits for it rather than being
             // dropped: a guest that does not replay a one-shot dispatch deadlocks, because
@@ -649,22 +174,25 @@ public sealed partial class RenderExecutor
                 }
             }
 
-            dbgT3 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             var bindings = PrepareBindings(input.Stage);
-            dbgT4 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             if (program.UsesDeviceAddresses)
             {
                 _host.PrepareDeviceAddresses();
             }
 
             _host.BindResources(bindings);
-            dbgT5 = System.Diagnostics.Stopwatch.GetTimestamp(); // TEMP
             Span<IPreparedBindings> stages = [bindings];
             _host.CommitBindings(PipelineBindPoint.Compute, in pipeline, stages);
             var hasStorageWrites = HasBufferWrites(input.Stage);
             foreach (var image in program.Images)
             {
                 hasStorageWrites |= image.Written && image.Class == ImageResourceClass.Storage;
+            }
+
+            if (hasStorageWrites)
+            {
+                // Every earlier read of the written resources completes before this dispatch writes.
+                _host.ShaderWriteHazardBarrier();
             }
 
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
@@ -688,109 +216,29 @@ public sealed partial class RenderExecutor
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
-
-            }
-            foreach (var (fillHash, fillSlot, fillValue) in DbgFillAfter) // TEMP: SHARPEMU_DBG_FILL_AFTER=hash:slot:value,... overwrites a bound buffer after the dispatch
-            {
-                if (fillHash != program.Hash || fillSlot >= input.Stage.Resources.Buffers.Length || input.Stage.Resources.Buffers[fillSlot].Length < 4)
-                    continue;
-                var fillDescriptor = BufferDescriptorWords.From(input.Stage.Resources.Buffers[fillSlot]);
-                if (fillDescriptor.Footprint() is { } fillFootprint && fillDescriptor.Address != 0 && fillFootprint != 0)
-                    _host.DebugFillBuffer(fillDescriptor.Address & ~3UL, (fillFootprint + 3) & ~3UL, fillValue);
             }
             _host.EndComputeImageSnapshot(imageSnapshot, bindings);
             _host.ShaderAccessBarrier();
         }
 
-        DbgDispStat(program.Hash, dbgT0, dbgT1, dbgT2, dbgT3, dbgT4, dbgT5, System.Diagnostics.Stopwatch.GetTimestamp(), program.Buffers.Length, program.Images.Length); // TEMP
         _host.ResetBindings();
     }
 
-    // TEMP: SHARPEMU_DBG_DISP_STATS=1 prints per-program dispatch phase costs every 10 s.
-    private static readonly bool _dbgDispStats = Environment.GetEnvironmentVariable("SHARPEMU_DBG_DISP_STATS") == "1";
-    // TEMP: SHARPEMU_DBG_REAL_VCULL=from:len runs the real visibility-feedback pass in that window of process time
-    // and logs which draws and dispatches touch its two visibility images (T# base addresses learned at the pass).
-    private static readonly (double From, double Length)? DbgRealVcull = Environment.GetEnvironmentVariable("SHARPEMU_DBG_REAL_VCULL") is { Length: > 0 } dbgRv && dbgRv.Split(':') is { Length: 2 } dbgRvParts
-        ? (double.Parse(dbgRvParts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(dbgRvParts[1], System.Globalization.CultureInfo.InvariantCulture)) : null;
-    private static bool DbgInRealVcullWindow()
-    {
-        if (DbgRealVcull is not { } window) return false;
-        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds;
-        return elapsed >= window.From && elapsed < window.From + window.Length;
-    }
+    // A program linked with the callees of its hit-group tables can take the driver minutes to compile, and the game
+    // adds callees as it streams. Such programs are ray-traced passes that run every frame, so their dispatches are left
+    // out while the module compiles instead of holding every queue behind it: the pass's output is stale for those
+    // frames.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, long> LinkedCompileSkips = new();
 
-    // TEMP: SHARPEMU_DBG_FORCE_WINDOW=from:len forces every triangle visible (all-ones bitmask) in that window of process time.
-    private static readonly (double From, double Length)? DbgForceWindow = Environment.GetEnvironmentVariable("SHARPEMU_DBG_FORCE_WINDOW") is { Length: > 0 } dbgFw && dbgFw.Split(':') is { Length: 2 } dbgFwParts
-        ? (double.Parse(dbgFwParts[0], System.Globalization.CultureInfo.InvariantCulture), double.Parse(dbgFwParts[1], System.Globalization.CultureInfo.InvariantCulture)) : null;
-    private static bool DbgInForceWindow()
+    private bool SkipWhileLinkedModuleCompiles(ComputeInputInfo input, ShaderProgram handle, ShaderProgramInfo program)
     {
-        if (DbgForceWindow is not { } window) return false;
-        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(DbgProcessStart).TotalSeconds;
-        return elapsed >= window.From && elapsed < window.From + window.Length;
+        if (program.Bindings is not { CallTargetCount: not 0 } ||
+            _pipelines.TryCreateComputePipeline(input, handle, out _)) return false;
+        var skipped = LinkedCompileSkips.AddOrUpdate(program.Hash, 1, static (_, count) => count + 1);
+        if ((skipped & (skipped - 1)) == 0)
+            Console.Error.WriteLine($"[GPU][WARN][LINKED_COMPILE] Dispatches of a linked program are skipped while its module compiles: hash=0x{program.Hash:X16} skipped={skipped}.");
+        return true;
     }
-
-    private static readonly HashSet<ulong> DbgVcullAddresses = new();
-    private static int _dbgVcullLogs;
-    private static void DbgVcullWatch(ShaderProgramInfo program, ComputeInputInfo input)
-    {
-        if (DbgRealVcull is null || !DbgInRealVcullWindow() || input.Stage.Program is not { } stageProgram) return;
-        var images = input.Stage.Resources.Images;
-        if (program.Hash == 0x17444E6ABBF4F82CUL || stageProgram.Hash == 0x17444E6ABBF4F82CUL)
-        {
-            for (var index = 0; index < images.Length; index++)
-            {
-                if (images[index].Length < 8) continue;
-                var address = ((ulong)images[index][0] | ((ulong)(images[index][1] & 0xFFu) << 32)) << 8;
-                if (DbgVcullAddresses.Add(address))
-                {
-                    Diagnostics.DbgTargetWatch.Addresses.Add(address);
-                    Console.Error.WriteLine($"[DBG][VCULL] image[{index}] addr=0x{address:X} t#={string.Join(",", images[index].Take(8).Select(word => word.ToString("X8")))}");
-                }
-            }
-
-            return;
-        }
-
-        for (var index = 0; index < images.Length; index++)
-        {
-            if (images[index].Length < 8) continue;
-            var address = ((ulong)images[index][0] | ((ulong)(images[index][1] & 0xFFu) << 32)) << 8;
-            if (DbgVcullAddresses.Contains(address) && Interlocked.Increment(ref _dbgVcullLogs) <= 400)
-                Console.Error.WriteLine($"[DBG][VCULL] dispatch cs=0x{stageProgram.Hash:X16} binds watched image[{index}] addr=0x{address:X} t#={string.Join(",", images[index].Take(8).Select(word => word.ToString("X8")))}");
-        }
-    }
-    private static int _dbgVcullTableLogs, _dbgStructLogs;
-    private static readonly Dictionary<ulong, int> _dbgStructQuota = new();
-    private static bool DbgStructQuota(ulong hash)
-    {
-        lock (_dbgStructQuota)
-        {
-            var count = _dbgStructQuota.GetValueOrDefault(hash);
-            _dbgStructQuota[hash] = count + 1;
-            return count < 14;
-        }
-    }
-    private static long DbgBeginPrep; // TEMP: ticks spent in BeginPreparation (flush + capacity wait)
-    private static long DbgEndRendering; // TEMP
-    private static readonly Dictionary<ulong, long[]> _dbgDispPhases = new();
-    private static long _dbgDispPhasesLast = Environment.TickCount64;
-    private static void DbgDispStat(ulong hash, long t0, long t1, long t2, long t3, long t4, long t5, long t6, int buffers, int images)
-    {
-        if (!_dbgDispStats) return;
-        if (!_dbgDispPhases.TryGetValue(hash, out var a)) _dbgDispPhases[hash] = a = new long[8];
-        a[0]++; a[1] += t1 - t0; a[2] += t3 - t2; a[3] += t4 - t3; a[4] += t5 - t4; a[5] += t6 - t5; a[6] = buffers; a[7] = images;
-        if (Environment.TickCount64 - _dbgDispPhasesLast < 10000) return;
-        _dbgDispPhasesLast = Environment.TickCount64;
-        var f = System.Diagnostics.Stopwatch.Frequency / 1e6;
-        Console.Error.WriteLine($"[DBG][DISPPH] beginprep_ms={DbgBeginPrep / (System.Diagnostics.Stopwatch.Frequency / 1000.0):F0}"); DbgBeginPrep = 0;
-        Console.Error.WriteLine($"[DBG][DISPPH] programs={_dbgDispPhases.Count} total_ms={_dbgDispPhases.Values.Sum(v => v[1] + v[2] + v[3] + v[4] + v[5]) / f / 1000:F0}");
-        foreach (var (h, v) in _dbgDispPhases.OrderByDescending(x => x.Value[1] + x.Value[2] + x.Value[3] + x.Value[4] + x.Value[5]).Take(14))
-            Console.Error.WriteLine($"[DBG][DISPPH]   0x{h:X16} n={v[0]} us/op: program={v[1] / f / v[0]:F0} pipeline={v[2] / f / v[0]:F0} prepare={v[3] / f / v[0]:F0} bind={v[4] / f / v[0]:F0} record={v[5] / f / v[0]:F0} bufs={v[6]} imgs={v[7]}");
-        _dbgDispPhases.Clear();
-    }
-
-    private static readonly (ulong Hash, int Slot, uint Value)[] DbgFillAfter = (Environment.GetEnvironmentVariable("SHARPEMU_DBG_FILL_AFTER") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)
-        .Select(item => item.Split(':')).Where(parts => parts.Length == 3).Select(parts => (Convert.ToUInt64(parts[0].Replace("0x", ""), 16), Convert.ToInt32(parts[1], 16), Convert.ToUInt32(parts[2].Replace("0x", ""), 16))).ToArray(); // TEMP
 
     // The dispatch counts threads; the host counts groups of the shader's thread size.
     public static uint GroupsFromThreads(uint threads, uint groupSize)
@@ -813,64 +261,6 @@ public sealed partial class RenderExecutor
         }
 
         return BufferDescriptorWords.From(words);
-    }
-
-    // The program's packed stride against the descriptor's. With runtime strides the
-    // program carries only the flags and indexes with the descriptor's stride.
-    private static bool StrideMatches(uint programStride, uint descriptorStride) =>
-        (programStride & ~BufferSpecialization.StrideMask) == (descriptorStride & ~BufferSpecialization.StrideMask) &&
-        ((programStride & BufferSpecialization.StrideMask) == 0 ||
-         (programStride & BufferSpecialization.StrideMask) == (descriptorStride & BufferSpecialization.StrideMask));
-
-    // The command processor starts a dispatch as soon as the previous one has launched its waves:
-    // dispatches overlap unless the command stream orders them with a partial flush, a cache
-    // flush, ACQUIRE_MEM or RELEASE_MEM, each of which records a global barrier here. Ordering
-    // every dispatch on its own serialized the compute queue the guest meant to overlap.
-
-    // A dispatch that reads and rewrites one HTile surface in place (a shadow-map HTile clear
-    // written by reading every word and storing it back) marks that HTile rewritten. Whether
-    // it cleared the target is decided from the words it wrote, as the hardware decides from
-    // ZMask, not from the shape of the program. Several metadata surfaces or a write-only
-    // clear leave the decision to the consumption paths.
-    private void RecordHtileRewrite(ComputeInputInfo input)
-    {
-        var program = input.Stage.Program!;
-        var resources = input.Stage.Resources;
-        if (program.HasBitwiseExclusiveOr || resources.Buffers.Length != program.Buffers.Length)
-        {
-            return;
-        }
-
-        ulong metadataAddress = 0;
-        for (var i = 0; i < program.Buffers.Length; i++)
-        {
-            if (!program.Buffers[i].Written)
-            {
-                continue;
-            }
-
-            var descriptor = DecodeBufferDescriptor(resources, i);
-            if (!_host.IsMetadata(descriptor.Address))
-            {
-                continue;
-            }
-
-            if (metadataAddress != 0 || !program.Buffers[i].Read)
-            {
-                return;
-            }
-
-            metadataAddress = descriptor.Address;
-        }
-
-        if (metadataAddress != 0 && _host.IsHtile(metadataAddress) && _host.MarkHtileRewritten(metadataAddress))
-        {
-            if (RenderTrace.Enabled && RenderTrace.MetadataClear())
-            {
-                RenderTrace.Write(
-                    $"Marked an HTile rewritten in place: shader=0x{program.Hash:X16} address=0x{metadataAddress:X16}");
-            }
-        }
     }
 
     // A full overwrite of registered metadata by a compute shader becomes a tracked clear.
@@ -907,54 +297,8 @@ public sealed partial class RenderExecutor
             }
 
             var descriptor = DecodeBufferDescriptor(resources, i);
-            // A uniform fill over HTile memory is a clear only when the HTile words say
-            // "cleared" (ZMask, bits 0-3, zero). A fill whose words mean expanded proves the
-            // depth lives in memory: recording a clear would wipe that target's depth at
-            // every next bind. The fill is left to the image-clear paths below.
-            if (_host.IsHtile(descriptor.Address) &&
-                TryResolveFillValue(input, out var fillValue) &&
-                (fillValue & 0xFu) != 0)
-            {
-                _host.ExpandMetadata(descriptor.Address);
-                if (RenderTrace.Enabled && RenderTrace.MetadataClear())
-                {
-                    RenderTrace.Write(
-                        $"Dropped an expanded HTile fill as a clear: shader=0x{program.Hash:X16} address=0x{descriptor.Address:X16} value=0x{fillValue:X8}");
-                }
-
-                return false;
-            }
-
             if (_host.ClearMetadata(descriptor.Address))
             {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    // The uniform value a metadata fill writes, when the program proves one at dispatch time.
-    private bool TryResolveFillValue(ComputeInputInfo input, out uint value)
-    {
-        value = 0;
-        var program = input.Stage.Program!;
-        var resources = input.Stage.Resources;
-        if (program.ConstantStoreValue is { } constant)
-        {
-            value = constant;
-            return true;
-        }
-
-        if (program.ConstantFill is { } fill &&
-            fill.DestinationScalarResource + 4 <= resources.UserData.Length &&
-            fill.SourceScalarResource + 4 <= resources.UserData.Length)
-        {
-            var source = BufferDescriptorWords.From(resources.UserData.AsSpan((int)fill.SourceScalarResource, 4).ToArray());
-            Span<byte> bytes = stackalloc byte[sizeof(uint)];
-            if (source.Address != 0 && _host.TryReadGuest(source.Address, bytes))
-            {
-                value = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
                 return true;
             }
         }
@@ -974,9 +318,7 @@ public sealed partial class RenderExecutor
     {
         var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
         var resources = input.Stage.Resources;
-        if (program.ConstantStoreValue is not { } value || program.ImmediateConstantFill is not { } fill ||
-            program.UserDataBase != 0 || fill.GroupScalarRegister != (uint)input.WorkgroupRegister ||
-            fill.DestinationScalarResource + 4 > resources.UserData.Length ||
+        if (program.ConstantStoreValue is not { } value ||
             program.Buffers.Length != 1 || resources.Buffers.Length != 1 || resources.Buffers[0].Length != 4 ||
             program.Images.Length != 0 || program.SamplerCount != 0 || program.UsesDeviceAddresses)
         {
@@ -985,8 +327,6 @@ public sealed partial class RenderExecutor
 
         var info = program.Buffers[0];
         var descriptor = BufferDescriptorWords.From(resources.Buffers[0]);
-        if (!resources.UserData.AsSpan((int)fill.DestinationScalarResource, 4).SequenceEqual(resources.Buffers[0]))
-            return null;
         var threads = (ulong)groupsX * input.ThreadsX;
         if (!info.Formatted || !info.Written || info.Read || info.Atomic || info.Scalar || info.MaxByteExtent != sizeof(uint) ||
             descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
@@ -1009,10 +349,7 @@ public sealed partial class RenderExecutor
     {
         var program = input.Stage.Program ?? throw _host.Fatal("The compute stage has no program.");
         var resources = input.Stage.Resources;
-        if (program.ConstantFill is not { } fill || program.UserDataBase != 0 ||
-            fill.GroupScalarRegister != (uint)input.WorkgroupRegister ||
-            fill.DestinationScalarResource + 4 > resources.UserData.Length || fill.SourceScalarResource + 4 > resources.UserData.Length ||
-            program.Buffers.Length != 2 || resources.Buffers.Length != 2 || program.Images.Length != 0 || program.SamplerCount != 0 ||
+        if (program.Buffers.Length != 2 || resources.Buffers.Length != 2 || program.Images.Length != 0 || program.SamplerCount != 0 ||
             program.UsesDeviceAddresses || resources.Images.Length != 0 || resources.Samplers.Length != 0 ||
             resources.Buffers[0].Length != 4 || resources.Buffers[1].Length != 4)
         {
@@ -1040,9 +377,6 @@ public sealed partial class RenderExecutor
 
         var descriptor = BufferDescriptorWords.From(resources.Buffers[target]);
         var valueDescriptor = BufferDescriptorWords.From(resources.Buffers[source]);
-        if (!resources.UserData.AsSpan((int)fill.DestinationScalarResource, 4).SequenceEqual(resources.Buffers[target]) ||
-            !resources.UserData.AsSpan((int)fill.SourceScalarResource, 4).SequenceEqual(resources.Buffers[source]))
-            return null;
         var threads = (ulong)groupsX * input.ThreadsX;
         if (descriptor.Stride != sizeof(uint) || descriptor.Format != BufferDescriptorWords.Format32UInt || descriptor.SwizzleEnabled ||
             descriptor.IndexStride != 0 || descriptor.AddThreadId || descriptor.RecordCount == 0 ||
@@ -1085,7 +419,7 @@ public sealed partial class RenderExecutor
         var descriptor = BufferDescriptorWords.From(words);
         if (!resource.Formatted || !resource.Written || resource.Read || resource.Atomic || resource.Scalar || resource.MaxByteExtent != ImageClearStride ||
             descriptor.Stride != ImageClearStride || descriptor.Format != BufferDescriptorWords.Format32x4UInt || descriptor.SwizzleEnabled ||
-            descriptor.IndexStride != 0 || descriptor.AddThreadId || !StrideMatches(resource.PackedStride, descriptor.PackedStride) ||
+            descriptor.IndexStride != 0 || descriptor.AddThreadId || resource.PackedStride != descriptor.PackedStride ||
             program.UserDataBase != 0 || resources.UserData.Length != ImageClearUserDataCount)
         {
             return null;
@@ -1404,31 +738,11 @@ public sealed partial class RenderExecutor
         value = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
         return true;
     }
-    // TEMP: SHARPEMU_DBG_CLEARS=1 reports how clear/fill dispatches were handled.
-    private static readonly bool _dbgClears = Environment.GetEnvironmentVariable("SHARPEMU_DBG_CLEARS") == "1";
-    private static readonly Dictionary<string, int> _dbgClearCounts = new();
-    private static long _dbgClearLast = Environment.TickCount64;
-    private static void DbgClear(string outcome, ulong hash, ulong address, ulong size, uint value)
-    {
-        if (!_dbgClears || outcome == "nodecode") return;
-        var key = $"{outcome} hash=0x{hash:X} addr=0x{address:X} size=0x{size:X} value=0x{value:X8}";
-        _dbgClearCounts.TryGetValue(key, out var count);
-        _dbgClearCounts[key] = count + 1;
-        if (Environment.TickCount64 - _dbgClearLast < 10000) return;
-        _dbgClearLast = Environment.TickCount64;
-        foreach (var (k, v) in _dbgClearCounts.OrderByDescending(x => x.Value).Take(14))
-            Console.Error.WriteLine($"[DBG][CLEARS] {v} {k}");
-        _dbgClearCounts.Clear();
-    }
-
-    private static bool IsDccFillPattern(uint value) =>
-        value == (value & 0xFFu) * 0x01010101u && value is 0x00000000u or 0x20202020u or 0x40404040u or 0x80808080u or 0xC0C0C0C0u;
 
     private bool TryConsumeImageClear(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator)
     {
         if (TryDecodeImageClear(input, groupsX, groupsY, groupsZ, dispatchInitiator) is not { } clear)
         {
-            DbgClear("nodecode", input.Stage.Program!.Hash, 0, 0, 0); // TEMP
             return false;
         }
 
@@ -1441,16 +755,7 @@ public sealed partial class RenderExecutor
             // leaves the metadata GPU-written, and every later bind of the surface waits for the GPU to
             // read it back (Astro Bot fills several surfaces this way each frame).
             var registered = _host.TryAbsorbDccFill(address, clear.Size, clear.PackedClear);
-            // A DCC-code fill of metadata that is still pending its target is applied on the CPU: the
-            // dispatch would leave the bytes GPU-dirty and the target's discovery would wait for them.
-            if (!registered && IsDccFillPattern(clear.PackedClear) && _host.TryFillGuestMemoryOnCpu(address, clear.Size, clear.PackedClear))
-            {
-                DbgClear("cpu-fill", hash, address, clear.Size, clear.PackedClear); // TEMP
-                return true;
-            }
-
             var filledOnHost = !registered && _host.TryFillDccMetadata(address, clear.Size, clear.PackedClear);
-            DbgClear(registered ? "absorbed" : filledOnHost ? "host-fill" : "pending-run", hash, address, clear.Size, clear.PackedClear); // TEMP
             if (RenderTrace.Enabled && RenderTrace.MetadataClear())
             {
                 RenderTrace.Write(
@@ -1460,7 +765,6 @@ public sealed partial class RenderExecutor
             return registered || filledOnHost;
         }
 
-        DbgClear("cleared", hash, address, clear.Size, clear.PackedClear); // TEMP
         if (RenderTrace.Enabled && RenderTrace.ImageClear())
         {
             RenderTrace.Write($"Consumed a compute image clear: shader=0x{hash:X16} address=0x{address:X16} size=0x{clear.Size:X16} value=0x{clear.PackedClear:X8}");

@@ -236,7 +236,9 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         uint[]? tessellationData = null,
         DescriptorSet globalSet = default,
         ulong[]? bufferRanges = null,
-        uint[]? memoryOffsets = null)
+        uint[]? memoryOffsets = null,
+        ulong[]? callArguments = null,
+        ulong[]? callTargets = null)
     {
         var vk = _harness.Vk;
         var device = _harness.Device.Device;
@@ -285,6 +287,24 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             if (meshDrawParameters is not { Length: 6 }) throw new InvalidOperationException("The mesh draw requires six parameters.");
             meshDrawParameters.CopyTo(shaderData, (int)layout.MeshDrawParametersDword);
         }
+        if (layout.CallArgumentCount != 0)
+        {
+            if (callArguments?.Length != layout.CallArgumentCount) throw new InvalidOperationException("The dispatch requires its call arguments.");
+            for (var index = 0; index < callArguments.Length; index++)
+            {
+                shaderData[layout.CallArgumentsDword + index * 2] = (uint)callArguments[index];
+                shaderData[layout.CallArgumentsDword + index * 2 + 1] = (uint)(callArguments[index] >> 32);
+            }
+        }
+        if (layout.CallTargetCount != 0)
+        {
+            if (callTargets?.Length != layout.CallTargetCount) throw new InvalidOperationException("The dispatch requires its call targets.");
+            for (var index = 0; index < callTargets.Length; index++)
+            {
+                shaderData[layout.CallTargetsDword + index * 2] = (uint)callTargets[index];
+                shaderData[layout.CallTargetsDword + index * 2 + 1] = (uint)(callTargets[index] >> 32);
+            }
+        }
 
         var setLayout = _setLayout;
         var allocateInfo = new DescriptorSetAllocateInfo { SType = StructureType.DescriptorSetAllocateInfo, DescriptorPool = _pool, DescriptorSetCount = 1, PSetLayouts = &setLayout };
@@ -318,6 +338,12 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
             else if (descriptor.Kind == DescriptorBindingKind.ShaderData && !boundBuffers.ContainsKey(descriptor.Kind))
             {
                 buffers = [CreateBuffer(MemoryMarshal.AsBytes<uint>(shaderData))];
+            }
+            else if (descriptor.Kind == DescriptorBindingKind.DeviceAddressFallback && !boundBuffers.ContainsKey(descriptor.Kind))
+            {
+                // As the buffer cache does: the address of a readable buffer.
+                ulong[] fallback = [CreateBuffer(256).DeviceAddress, 0];
+                buffers = [CreateBuffer(MemoryMarshal.AsBytes<ulong>(fallback))];
             }
             else if (!boundBuffers.TryGetValue(descriptor.Kind, out buffers!))
             {

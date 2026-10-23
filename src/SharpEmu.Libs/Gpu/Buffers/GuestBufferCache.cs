@@ -49,6 +49,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
     private readonly GpuBuffer _bdaPageTable;
+    private GpuBuffer? _bdaFallback;
+    private GpuBuffer? _bdaFallbackAddress;
     private readonly GuestBufferRegistry<GpuBuffer> _registry = new(CachingPageSize, PageOwnerTable.AddressSpaceSize);
     private readonly AvlSpanSet _gpuModifiedRanges = new();
     private long _gpuModifiedVersion;
@@ -135,6 +137,26 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     public GpuBuffer GdsBuffer => _gds;
 
     public GpuBuffer BdaPageTableBuffer => _bdaPageTable;
+
+    // The address of a readable buffer, for programs with shader calls: their branchless device-address loads read there for
+    // an access they do not make and drop the value (DescriptorBindingKind.DeviceAddressFallback). Made at their first use.
+    public GpuBuffer DeviceAddressFallbackBuffer
+    {
+        get
+        {
+            if (_bdaFallbackAddress is null)
+            {
+                _bdaFallback = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
+                    GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, 256);
+                _bdaFallbackAddress = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, 16);
+                var address = _bdaFallback.DeviceAddress;
+                _bdaFallbackAddress.Fill(0, sizeof(uint), (uint)address);
+                _bdaFallbackAddress.Fill(sizeof(uint), sizeof(uint), (uint)(address >> 32));
+            }
+
+            return _bdaFallbackAddress;
+        }
+    }
 
     public GpuBuffer FaultBuffer => _faults.FaultBuffer;
 
@@ -2178,6 +2200,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         _staging.Dispose();
         _sweepCopy.Dispose();
         _bdaPageTable.Dispose();
+        _bdaFallback?.Dispose();
+        _bdaFallbackAddress?.Dispose();
         _gds.Dispose();
         _faults.Dispose();
     }

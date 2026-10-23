@@ -35,6 +35,8 @@ internal static unsafe partial class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
             DestroyFeedbackSnapshotPool();
             DestroyRenderPipelines();
+            DestroyBindlessHeap();
+            DestroyCallMarks();
             _descriptorHeap.Dispose();
             if (_imageCache is not null)
             {

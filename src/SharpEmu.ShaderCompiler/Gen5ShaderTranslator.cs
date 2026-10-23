@@ -472,8 +472,6 @@ public static partial class Gen5ShaderTranslator
                 return true;
             }
 
-            // S_SWAPPC_B64 with NULL as its link destination discards the return
-            // address and is a tail transfer, as used by merged LS/HS programs.
             if (stopAtSetProgramCounter &&
                 (string.Equals(name, "SSetpcB64", StringComparison.Ordinal) ||
                  IsSwapProgramCounterWithoutReturnAddress(instruction)) &&
@@ -882,7 +880,6 @@ public static partial class Gen5ShaderTranslator
             0x09 => "SCbranchExecnz",
             0x0A => "SBarrier",
             0x0C => "SWaitcnt",
-            0x0E => "SSleep",
             0x0F => "SSetprio",
             0x10 => "SSendmsg",
             0x12 => "STrap",
@@ -1743,7 +1740,6 @@ public static partial class Gen5ShaderTranslator
             0x23 => "BufferLoadSbyteD16Hi",
             0x24 => "BufferLoadShortD16",
             0x25 => "BufferLoadShortD16Hi",
-            0x27 => "BufferStoreFormatD16HiX",
             0x30 => "BufferAtomicSwap",
             0x31 => "BufferAtomicCmpswap",
             0x32 => "BufferAtomicAdd",
@@ -1974,7 +1970,6 @@ public static partial class Gen5ShaderTranslator
             0x44 => "ImageGather4L",
             0x47 => "ImageGather4Lz",
             0x48 => "ImageGather4C",
-            0x4C => "ImageGather4CL",
             0x4E => "ImageGather4CBCl",
             0x4F => "ImageGather4CLz",
             0x57 => "ImageGather4LzO",
@@ -2029,10 +2024,6 @@ public static partial class Gen5ShaderTranslator
 
         return FinishDecode(name, $"unknown-vintrp op=0x{opcode:X1}", out error);
     }
-
-    private static bool HasDoubleVectorResult(string opcode) => opcode is
-        "VCvtF64I32" or "VCvtF64U32" or "VRcpF64" or "VRsqF64" or
-        "VSqrtF64" or "VMulF64" or "VFmaF64";
 
     private static bool FinishDecode(string name, string decodeError, out string error)
     {
@@ -2467,12 +2458,9 @@ public static partial class Gen5ShaderTranslator
                 // ordinary vector destination leaves every invocation with a
                 // different value and corrupts scalar addresses derived from
                 // lane data.
-                var vop1Destination = (word >> 17) & 0xFF;
                 destinations = opcode == "VReadfirstlaneB32"
                     ? [Gen5Operand.Scalar((word >> 17) & 0x7F)]
-                    : HasDoubleVectorResult(opcode)
-                        ? [Gen5Operand.Vector(vop1Destination), Gen5Operand.Vector(vop1Destination + 1)]
-                        : [Gen5Operand.Vector(vop1Destination)];
+                    : [Gen5Operand.Vector((word >> 17) & 0xFF)];
                 break;
             case Gen5ShaderEncoding.Vop2:
                 if (isDpp8)
@@ -2601,10 +2589,7 @@ public static partial class Gen5ShaderTranslator
                     Gen5Operand.Source((extra >> 9) & 0x1FF, literal),
                     Gen5Operand.Source((extra >> 18) & 0x1FF, literal),
                 ];
-                var vop3Destination = word & 0xFF;
-                destinations = HasDoubleVectorResult(opcode)
-                    ? [Gen5Operand.Vector(vop3Destination), Gen5Operand.Vector(vop3Destination + 1)]
-                    : [Gen5Operand.Vector(vop3Destination)];
+                destinations = [Gen5Operand.Vector(word & 0xFF)];
                 if (opcode == "VReadlaneB32")
                 {
                     // V_READLANE uses the VOP3A vdst byte even though the
@@ -2894,6 +2879,7 @@ public static partial class Gen5ShaderTranslator
                     "BufferStoreFormatXy" => 2u,
                     "BufferStoreFormatXyz" => 3u,
                     "BufferStoreFormatXyzw" => 4u,
+                    // The D16 forms hold two components in each register.
                     "BufferLoadFormatD16X" or "BufferLoadFormatD16Xy" or
                     "BufferStoreFormatD16X" or "BufferStoreFormatD16Xy" => 1u,
                     "BufferLoadFormatD16Xyz" or "BufferLoadFormatD16Xyzw" or
@@ -2943,13 +2929,7 @@ public static partial class Gen5ShaderTranslator
                     ((word >> 13) & 1) != 0,
                     ((word >> 12) & 1) != 0,
                     ((word >> 14) & 1) != 0,
-                    ((extra >> 22) & 1) != 0,
-                    PackedD16: opcode.Contains("FormatD16", StringComparison.Ordinal) && !opcode.Contains("Hi", StringComparison.Ordinal),
-                    FormatComponentCount: opcode.Contains("FormatD16", StringComparison.Ordinal) && !opcode.Contains("Hi", StringComparison.Ordinal)
-                        ? opcode.EndsWith("Xyzw", StringComparison.Ordinal) ? 4u
-                            : opcode.EndsWith("Xyz", StringComparison.Ordinal) ? 3u
-                            : opcode.EndsWith("Xy", StringComparison.Ordinal) ? 2u : 1u
-                        : 0u);
+                    ((extra >> 22) & 1) != 0);
                 break;
             }
             case Gen5ShaderEncoding.Mtbuf:
@@ -2992,13 +2972,7 @@ public static partial class Gen5ShaderTranslator
                     ((word >> 14) & 1) != 0,
                     ((extra >> 22) & 1) != 0,
                     Typed: true,
-                    TypedFormat: (word >> 19) & 0x7F,
-                    PackedD16: opcode.Contains("D16", StringComparison.Ordinal),
-                    FormatComponentCount: opcode.Contains("D16", StringComparison.Ordinal)
-                        ? opcode.EndsWith("Xyzw", StringComparison.Ordinal) ? 4u
-                            : opcode.EndsWith("Xyz", StringComparison.Ordinal) ? 3u
-                            : opcode.EndsWith("Xy", StringComparison.Ordinal) ? 2u : 1u
-                        : 0u);
+                    TypedFormat: (word >> 19) & 0x7F);
                 break;
             }
             case Gen5ShaderEncoding.Mimg:

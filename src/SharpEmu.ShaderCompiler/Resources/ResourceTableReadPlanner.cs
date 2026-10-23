@@ -15,6 +15,8 @@ public sealed class ResourceTableReadPlanner
     private readonly ulong _hash;
     private readonly List<ResourceTableRead> _reads = [];
     private readonly List<ScalarValue> _dynamicReads = [];
+    private readonly HashSet<ScalarValue> _dynamicReadSet = [];
+    private readonly Dictionary<int, List<int>> _slotsByHash = [];
     private readonly List<(ScalarValue Read, uint Slot)> _patches = [];
     private readonly Dictionary<int, uint> _flattenedSlotByMemoryIndex = [];
     private readonly List<ScalarValue> _visiting = [];
@@ -133,7 +135,7 @@ public sealed class ResourceTableReadPlanner
         var offset = value.Operands[1];
         if (!offset.IsConstant)
         {
-            if (!_dynamicReads.Contains(value))
+            if (_dynamicReadSet.Add(value))
             {
                 _dynamicReads.Add(value);
             }
@@ -148,15 +150,14 @@ public sealed class ResourceTableReadPlanner
             return;
         }
 
-        // An address carried by a loop phi that changes per iteration is the loop's current
-        // pointer: the host sees one value per draw, the shader one per iteration, so the
-        // shader performs the read. A phi that only merges one value with itself is that value.
-        if (DependsOnVaryingPhi(value.Operands[0]))
+        var hash = _graph.StructuralHash(value);
+        if (!_slotsByHash.TryGetValue(hash, out var slots))
         {
-            return;
+            slots = [];
+            _slotsByHash.Add(hash, slots);
         }
 
-        for (var slot = 0; slot < _reads.Count; slot++)
+        foreach (var slot in slots)
         {
             if (_graph.Equivalent(value, _reads[slot].Value))
             {
@@ -166,32 +167,9 @@ public sealed class ResourceTableReadPlanner
         }
 
         var newSlot = (uint)_reads.Count;
+        slots.Add((int)newSlot);
         _reads.Add(new ResourceTableRead(value, newSlot));
         _patches.Add((value, newSlot));
-    }
-
-    private bool DependsOnVaryingPhi(ScalarValue value)
-    {
-        var pending = new Stack<ScalarValue>();
-        var visited = new HashSet<ScalarValue>();
-        pending.Push(value);
-        while (pending.TryPop(out var current))
-        {
-            if (!visited.Add(current))
-                continue;
-            if (current.Kind == ScalarValueKind.Phi)
-            {
-                if (_graph.ResolveInvariantPhi(current) is not { } invariant || invariant.Kind == ScalarValueKind.Phi)
-                    return true;
-                pending.Push(invariant);
-                continue;
-            }
-
-            foreach (var operand in current.Operands)
-                pending.Push(operand);
-        }
-
-        return false;
     }
 
     // Equivalent reads share one host read, but each instruction must load its destination

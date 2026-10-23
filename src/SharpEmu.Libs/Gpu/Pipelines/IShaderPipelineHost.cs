@@ -11,7 +11,6 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 // Everything a host pipeline creation reads for one graphics pipeline.
 public sealed class GraphicsPipelineDescription
 {
-    public TessellationPipelineStages? Tessellation { get; init; }
     public required PipelineRenderingState Rendering { get; init; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required VertexInputInfo VertexInfo { get; init; }
@@ -22,8 +21,6 @@ public sealed class GraphicsPipelineDescription
     public ShaderProgramInfo? PixelStage { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
 }
-
-public sealed record TessellationPipelineStages(ShaderProgram Control, ShaderProgram Evaluation, uint InputControlPoints);
 
 public sealed class ComputePipelineDescription
 {
@@ -61,22 +58,20 @@ internal interface IShaderPipelineHost
 
     bool MipStatisticsSubgroupReduction => false;
 
+    // Whether the host reads a linked program's call records at run time, through descriptor set 1.
+    bool RuntimeCallRecordsSupported => false;
+
+    // The call marks of programs linked with run-time call records (CallMarks): whether the host binds and reads them, how
+    // many mark snapshots it has read, and the snapshot that last held a bit (0 when none did).
+    bool CallMarksSupported => false;
+    long CallMarkSnapshots => 0;
+    long CallMarkedAt(uint bit) => 0;
+
     bool GraphicsSubgroupOperationsEnabled { get; }
 
     // The device supports shaderSharedInt64Atomics, so LDS 64-bit atomics can be
     // emitted as real 64-bit atomics instead of a non-atomic 32-bit pair.
     bool SharedInt64AtomicsEnabled { get; }
-
-    // The device converts f16<->f32 natively with the hardware's rounding and denormals
-    // (see VulkanFloat16Support).
-    bool ExactFloat16ConversionsEnabled => false;
-
-    bool NonUniformImageIndexingEnabled => false;
-
-    // The host writes buffer strides into shader data (BindingLayout.UsesRuntimeBufferStrides),
-    // so the stride leaves the permutation key.
-    bool RuntimeBufferStridesEnabled => false;
-    bool UsesBindlessImages => false;
 
     // The device supports shaderImageInt64Atomics, so an atomic on a 64-bit image texel
     // (a 32_32 UINT image) can be compiled; without it such a program is rejected.
@@ -86,21 +81,6 @@ internal interface IShaderPipelineHost
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;
     bool ClipDistanceEnabled => false;
-    bool PostDepthCoverageSupported => false;
-    // The device can require 64-lane compute subgroups (see ComputeWaveModel).
-    bool ComputeSubgroup64Required => false;
-    uint MaxComputeWorkgroupSubgroups => 0;
-    // fragmentShaderPixelInterlock: primitive-ordered pixel shaders run under an ordered interlock.
-    bool FragmentShaderInterlockSupported => false;
-    bool NativeTwoSampleMixedSupported => false;
-
-    // True when this device's GLSL UnpackHalf2x16 / PackHalf2x16 were measured bit-exact
-    // against the translator's own f16 conversion. False for every host that did not measure it.
-    bool NativeHalfConversionExact => false;
-
-    // True only when the host measured that a storage-buffer read past its descriptor range
-    // returns zero on this device; the translator then stops bounds-checking every guest word.
-    bool ZeroOutOfBoundsBufferReads => false;
 
     bool MeshShadersSupported => false;
 
@@ -123,19 +103,8 @@ internal interface IShaderPipelineHost
     // Reads one guest dword only when no GPU work may still own the range.
     bool TryReadCleanGuestWord(ulong address, out uint word);
 
-    // Whether recorded GPU work still owns the dword, so the host can copy it on the device
-    // when it binds the flattened table instead of downloading it now.
-    bool IsGpuPendingGuestWord(ulong address) => false;
-
-    // Whether the guest address is mapped. A host that cannot tell without a read probes with one.
-    bool IsGuestMapped(ulong address) => TryReadGuestWord(address, out _);
-
-    bool TryReadCleanGuestWords(ulong address, Span<uint> words)
-    {
-        using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
-        return BitConverter.IsLittleEndian && TryReadResidentGuestBytes(address,
-            System.Runtime.InteropServices.MemoryMarshal.AsBytes(words), clean: true);
-    }
+    // For an error report: why a clean read of the dword can fail (mapping and GPU ownership).
+    string DescribeCleanRead(ulong address) => "";
 
     // Copies guest bytes the CPU already holds, without synchronizing. False when the GPU
     // may own the range (or, for a clean read, when a clean word read would be refused);

@@ -166,8 +166,6 @@ public enum SpirvOp : ushort
     BranchConditional = 250,
     Switch = 251,
     Kill = 252,
-    BeginInvocationInterlockEXT = 5364,
-    EndInvocationInterlockEXT = 5365,
     Return = 253,
     ReturnValue = 254,
     Unreachable = 255,
@@ -190,7 +188,6 @@ public enum SpirvOp : ushort
 public enum SpirvCapability : uint
 {
     Shader = 1,
-    Tessellation = 3,
     ShaderLayer = 69,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
@@ -199,14 +196,9 @@ public enum SpirvCapability : uint
     SampledImageArrayDynamicIndexing = 29,
     StorageImageArrayDynamicIndexing = 31,
     SampleRateShading = 35,
-    SampleMaskPostDepthCoverage = 4447,
     Sampled1D = 43,
     Image1D = 44,
     Float16 = 9,
-    DenormPreserve = 4464,
-    SignedZeroInfNanPreserve = 4466,
-    RoundingModeRTE = 4467,
-    FragmentShaderPixelInterlockEXT = 5378,
     Float64 = 10,
     Int64 = 11,
     Int64Atomics = 12,
@@ -227,19 +219,9 @@ public enum SpirvCapability : uint
     ShaderNonUniform = 5301,
     RuntimeDescriptorArray = 5302,
     SampledImageArrayNonUniformIndexing = 5307,
-    StorageImageArrayNonUniformIndexing = 5309,
     PhysicalStorageBufferAddresses = 5347,
+    SignedZeroInfNanPreserve = 4466,
     MeshShadingExt = 5283,
-}
-
-[Flags]
-public enum SpirvFunctionControl : uint
-{
-    None = 0,
-    Inline = 0x1,
-    DontInline = 0x2,
-    Pure = 0x4,
-    Const = 0x8,
 }
 
 public enum SpirvStorageClass : uint
@@ -260,8 +242,6 @@ public enum SpirvStorageClass : uint
 public enum SpirvExecutionModel : uint
 {
     Vertex = 0,
-    TessellationControl = 1,
-    TessellationEvaluation = 2,
     Fragment = 4,
     GLCompute = 5,
     MeshExt = 5365,
@@ -269,48 +249,34 @@ public enum SpirvExecutionModel : uint
 
 public enum SpirvExecutionMode : uint
 {
-    SpacingEqual = 1,
-    SpacingFractionalEven = 2,
-    SpacingFractionalOdd = 3,
-    VertexOrderCw = 4,
-    VertexOrderCcw = 5,
-    PointMode = 10,
-    Triangles = 22,
-    Quads = 24,
-    Isolines = 25,
-    OutputVertices = 26,
     OriginUpperLeft = 7,
-    EarlyFragmentTests = 9,
-    PostDepthCoverage = 4446,
     DepthReplacing = 12,
     LocalSize = 17,
-    DenormPreserve = 4459,
     SignedZeroInfNanPreserve = 4461,
-    RoundingModeRTE = 4462,
+    OutputVertices = 26,
     OutputPrimitivesExt = 5270,
     OutputTrianglesExt = 5298,
 }
 
 public enum SpirvDecoration : uint
 {
-    NonUniform = 5300,
     Block = 2,
     ArrayStride = 6,
     BuiltIn = 11,
     NoPerspective = 13,
     Flat = 14,
-    Sample = 17,
     PerVertexKhr = 5285,
-    Patch = 15,
     Location = 30,
     Index = 32,
     Binding = 33,
     DescriptorSet = 34,
     Offset = 35,
     NoContraction = 42,
+    Aliased = 20,
     Coherent = 23,
     NonWritable = 24,
     PerPrimitiveExt = 5271,
+    NonUniform = 5300,
 }
 
 public enum SpirvBuiltIn : uint
@@ -323,12 +289,6 @@ public enum SpirvBuiltIn : uint
     ViewportIndex = 10,
     VertexIndex = 42,
     InstanceIndex = 43,
-    PrimitiveId = 7,
-    InvocationId = 8,
-    TessLevelOuter = 11,
-    TessLevelInner = 12,
-    TessCoord = 13,
-    PatchVertices = 14,
     FragCoord = 15,
     BaryCoordKhr = 5286,
     BaryCoordNoPerspKhr = 5287,
@@ -418,7 +378,6 @@ public sealed class SpirvModuleBuilder
     private readonly List<uint> _annotations = [];
     private readonly List<uint> _typesConstantsGlobals = [];
     private readonly List<uint> _functions = [];
-
     private readonly Dictionary<(uint Width, bool Signed), uint> _integerTypes = [];
     private readonly Dictionary<uint, uint> _floatTypes = [];
     private readonly Dictionary<(uint Component, uint Count), uint> _vectorTypes = [];
@@ -435,7 +394,7 @@ public sealed class SpirvModuleBuilder
         uint> _imageTypes = [];
     private readonly Dictionary<uint, uint> _sampledImageTypes = [];
     private readonly Dictionary<(SpirvStorageClass Storage, uint Type), uint> _pointerTypes = [];
-    private readonly Dictionary<(uint Element, uint Count, uint? Stride), uint> _arrayTypes = [];
+    private readonly Dictionary<(uint Element, uint Count), uint> _arrayTypes = [];
     private readonly Dictionary<uint, uint> _runtimeArrayTypes = [];
     private readonly Dictionary<string, uint> _functionTypes = [];
     private readonly Dictionary<(uint Type, ulong Value), uint> _constants = [];
@@ -664,12 +623,9 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
-    public uint TypeArray(uint elementType, uint count, uint? arrayStride = null)
+    public uint TypeArray(uint elementType, uint count)
     {
-        // Explicit block layout belongs to the type. Sharing it with an array
-        // in Workgroup storage would also share ArrayStride, which is invalid
-        // without the explicit workgroup layout extension.
-        var key = (elementType, count, arrayStride);
+        var key = (elementType, count);
         if (_arrayTypes.TryGetValue(key, out var existing))
         {
             return existing;
@@ -678,10 +634,6 @@ public sealed class SpirvModuleBuilder
         var length = Constant(TypeInt(32, false), count);
         var id = AllocateId();
         Emit(_typesConstantsGlobals, SpirvOp.TypeArray, id, elementType, length);
-        if (arrayStride is { } stride)
-        {
-            AddDecoration(id, SpirvDecoration.ArrayStride, stride);
-        }
         _arrayTypes.Add(key, id);
         return id;
     }
@@ -860,24 +812,16 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
-    private readonly List<uint> _functionVariables = [];
-    private int _functionVariableOffset = -1;
-
     public uint BeginFunction(uint returnType, uint functionType)
         => BeginFunction(returnType, functionType, 0);
 
     public uint BeginFunction(uint returnType, uint functionType, uint functionControl)
-    {
-        var id = AllocateId();
-        Emit(_functions, SpirvOp.Function, returnType, id, functionControl, functionType);
-        return id;
-    }
+        => BeginFunction(returnType, functionType, functionControl, AllocateId());
 
-    // Begins a function whose id was allocated earlier, so it can be called before it is emitted.
-    public uint BeginFunction(uint returnType, uint functionType, uint id, SpirvFunctionControl functionControl = SpirvFunctionControl.None)
+    // A function whose id was allocated before its callers were emitted.
+    public uint BeginFunction(uint returnType, uint functionType, uint functionControl, uint id)
     {
-        _functionVariableOffset = -1;
-        Emit(_functions, SpirvOp.Function, returnType, id, (uint)functionControl, functionType);
+        Emit(_functions, SpirvOp.Function, returnType, id, functionControl, functionType);
         return id;
     }
 
@@ -888,7 +832,6 @@ public sealed class SpirvModuleBuilder
     {
         var result = id ?? AllocateId();
         Emit(_functions, SpirvOp.Label, result);
-        if (_functionVariableOffset < 0) _functionVariableOffset = _functions.Count;
         return result;
     }
 
@@ -898,7 +841,7 @@ public sealed class SpirvModuleBuilder
         if (initializer.HasValue)
         {
             Emit(
-                _functionVariables,
+                _functions,
                 SpirvOp.Variable,
                 pointerType,
                 id,
@@ -908,7 +851,7 @@ public sealed class SpirvModuleBuilder
         else
         {
             Emit(
-                _functionVariables,
+                _functions,
                 SpirvOp.Variable,
                 pointerType,
                 id,
@@ -1063,20 +1006,7 @@ public sealed class SpirvModuleBuilder
     public void AddStatement(SpirvOp opcode, params uint[] operands) =>
         Emit(_functions, opcode, operands);
 
-    public void EndFunction()
-    {
-        // Registers are discovered while emitting the body. SPIR-V requires every
-        // Function variable to precede the entry block's executable instructions.
-        if (_functionVariables.Count != 0)
-        {
-            if (_functionVariableOffset < 0)
-                throw new InvalidOperationException("Function variables require an entry block.");
-            _functions.InsertRange(_functionVariableOffset, _functionVariables);
-            _functionVariables.Clear();
-        }
-        _functionVariableOffset = -1;
-        Emit(_functions, SpirvOp.FunctionEnd);
-    }
+    public void EndFunction() => Emit(_functions, SpirvOp.FunctionEnd);
 
     public byte[] Build()
     {

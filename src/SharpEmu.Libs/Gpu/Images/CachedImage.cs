@@ -87,6 +87,9 @@ public sealed unsafe partial class CachedImage : IDisposable
     private readonly Dictionary<(uint Width, uint Height), CachedImage> _stencilStorageImages = new();
     public ImageUses Uses;
     public ImageBindingState Binding;
+
+    // Set while descriptor set 1 holds a view of this image: told when its layout, contents or registration change.
+    public Action<CachedImage>? HeapChanged;
     public bool Registered;
     public uint QueryEpoch;
     public ulong WatchBegin;
@@ -413,6 +416,12 @@ public sealed unsafe partial class CachedImage : IDisposable
         {
             _maybeCpuDirty = true;
         }
+        else
+        {
+            return;
+        }
+
+        HeapChanged?.Invoke(this);
     }
 
     public bool IsCpuDirty => _cpuDirty || _maybeCpuDirty;
@@ -427,6 +436,8 @@ public sealed unsafe partial class CachedImage : IDisposable
         {
             _maybeCpuDirty = true;
         }
+
+        HeapChanged?.Invoke(this);
     }
 
     public bool NeedsMaybeCpuHash => _maybeCpuDirty && !_maybeHashValid;
@@ -506,6 +517,7 @@ public sealed unsafe partial class CachedImage : IDisposable
         GpuWriteSequence = Interlocked.Increment(ref _gpuWriteCounter);
         ContentSequence = GpuWriteSequence;
         _guestPieceHashes = null;
+        HeapChanged?.Invoke(this);
     }
 
     // The GPU write the image contents reflect. A copy from a same-layout alias takes the

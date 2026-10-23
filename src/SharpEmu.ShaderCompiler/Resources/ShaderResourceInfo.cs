@@ -13,7 +13,6 @@ public enum ShaderStage : byte
     Pixel,
     Compute,
     Mesh,
-    TessellationEvaluation,
 }
 
 public enum ImageNumericClass : byte
@@ -39,9 +38,6 @@ public static class DescriptorConstants
     public const uint IdentityImageSwizzle = 0xFAC;
     public const uint InvalidFormat = 0;
     public const uint NoIndex = uint.MaxValue;
-    // GFX10 S# dword 3 bits 12-29 are reserved. The adjusted sample forms carry their
-    // adjustment there; the sampler itself ignores them.
-    public const uint SamplerDword3ReservedMask = 0x3FFF_F000u;
 }
 
 // One buffer resource of a program and how the program uses it.
@@ -59,11 +55,6 @@ public sealed class BufferResource
     public bool Atomic { get; set; }
     public bool Formatted { get; set; }
     public bool Scalar { get; set; }
-
-    // Set when some access addresses whole dwords (raw dword, atomic or scalar), which the
-    // host resolves with the byte address divided by four. Formatted and sub-dword accesses
-    // assemble their bytes, so a buffer used only that way may start at any byte.
-    public bool DwordAddressed { get; set; }
 
     public BufferResource Clone() => (BufferResource)MemberwiseClone();
 }
@@ -173,9 +164,6 @@ public sealed class BufferCandidateTableInfo
 public sealed class ShaderResourceInfo
 {
     public const int MaxBuffers = 32;
-    // Bindless material tables select among many descriptors; the host binds each
-    // candidate, and the device's per-stage limits are checked when the layout is made.
-    public const int MaxImages = 65536;
     public const int MaxIndirectImageCandidates = 64;
     public const int NoScalarRegister = -1;
 
@@ -196,12 +184,17 @@ public sealed class ShaderResourceInfo
     public bool HasBitwiseExclusiveOr { get; set; }
     public bool UsesDeviceAddresses { get; set; }
 
-    // Some sampled access reads its descriptors through the runtime descriptor table.
-    public bool UsesRuntimeDescriptors { get; set; }
+    // Some image access reads its image or sampler from a bindless heap through descriptor set 1.
+    public bool UsesBindlessHeap { get; set; }
 
-    // Descriptor accesses with no plan-time source that read the null descriptor instead
-    // (their texels read as zero); the host reports them so the loss is visible.
-    public List<(uint Pc, string Kind)> NullDescriptorFallbacks { get; set; } = [];
+    // Some image access reads its image or sampler through a linked callee's record argument (see CallRecordSelector).
+    public bool UsesCallRecords { get; set; }
+
+    // A call that reaches a callee the program does not hold marks it (CallMarks).
+    public bool UsesCallMarks { get; set; }
+
+    // The program has shader calls and reads device addresses: it binds DescriptorBindingKind.DeviceAddressFallback.
+    public bool UsesDeviceAddressFallback { get; set; }
 
     public ShaderResourceInfo Clone() => new()
     {
@@ -219,8 +212,10 @@ public sealed class ShaderResourceInfo
         InstanceOffsetScalarRegister = InstanceOffsetScalarRegister,
         HasBitwiseExclusiveOr = HasBitwiseExclusiveOr,
         UsesDeviceAddresses = UsesDeviceAddresses,
-        UsesRuntimeDescriptors = UsesRuntimeDescriptors,
-        NullDescriptorFallbacks = [.. NullDescriptorFallbacks],
+        UsesBindlessHeap = UsesBindlessHeap,
+        UsesCallRecords = UsesCallRecords,
+        UsesCallMarks = UsesCallMarks,
+        UsesDeviceAddressFallback = UsesDeviceAddressFallback,
     };
 }
 
@@ -233,9 +228,6 @@ public sealed record IndirectImageSelector(
     uint KeyArgument)
 {
     public IndirectSelectorValues? SelectorValues { get; init; }
-
-    // An inclusive upper bound the shader's own clamps prove for the selector, when one exists.
-    public uint? SelectorBound { get; init; }
     public IReadOnlyList<DirectImageCandidate>? DirectCandidates { get; init; }
     public bool Dense { get; init; }
     public uint TableOffset { get; init; }
@@ -243,25 +235,13 @@ public sealed record IndirectImageSelector(
     public uint KeyBound { get; init; }
     public WaveIndexedImageSelector? WaveIndexed { get; init; }
 
-    // Non-zero when the descriptors live in a buffer table of records this many bytes apart:
-    // the shader's scalar buffer offset selects the record, and the table's V# bounds it.
-    public uint BufferTableStride { get; init; }
-
     // The key is selected by a value the whole wave shares (a loop counter), not by a lane's value. Such an image
     // used to read as a null image, so a table the host cannot read stays null instead of failing the program.
     public bool SharedSelector { get; init; }
 
     // The key read's immediate offset. The hardware adds it after the 32-bit selector offset, without wrapping.
     public uint MaterialImmediate { get; init; }
-
-    // Set when each buffer-table record holds a 64-bit pointer (at TableOffset) and the
-    // descriptor lives at this byte offset from it, rather than inside the record.
-    public uint? PointerTargetOffset { get; init; }
 }
-
-// A descriptor reached through a V# table of records that each hold a 64-bit pointer: the
-// record's pointer sits at TableOffset, the descriptor at TargetOffset from that pointer.
-public sealed record PointerTableSelector(uint TableOffset, uint Stride, uint TargetOffset);
 
 public sealed record DirectImageCandidate(uint Offset, uint Source);
 
@@ -277,12 +257,7 @@ public sealed class DescriptorSource
     public ScalarValue[] Dwords { get; init; } = [];
     public uint DwordCount => (uint)Dwords.Length;
     public IndirectImageSelector? IndirectImage { get; init; }
-
-    // For a sampler: Dwords are the table V#, and every record's sampler must be the same.
-    public PointerTableSelector? PointerTable { get; init; }
-    // Scalar loads from an empty buffer return zero regardless of the offset.
-    // Materialization must recheck the source extent before using these words.
-    public uint? ZeroExtentBufferSource { get; init; }
+    public CallRecordSelector? CallRecord { get; init; }
 }
 
 // One immediate-offset scalar read the host evaluates into the flattened table.
@@ -296,20 +271,4 @@ public readonly record struct DescriptorWords(uint[] Dwords)
     public static DescriptorWords Empty(uint dwordCount) => new(new uint[dwordCount]);
 
     public bool SameAs(DescriptorWords other) => Dwords.AsSpan().SequenceEqual(other.Dwords);
-}
-
-// Equality of descriptor dwords by content.
-public sealed class DescriptorContentComparer : IEqualityComparer<uint[]>
-{
-    public static readonly DescriptorContentComparer Instance = new();
-
-    public bool Equals(uint[]? left, uint[]? right) =>
-        ReferenceEquals(left, right) || (left is not null && right is not null && left.AsSpan().SequenceEqual(right));
-
-    public int GetHashCode(uint[] dwords)
-    {
-        var hash = new HashCode();
-        hash.AddBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(dwords.AsSpan()));
-        return hash.ToHashCode();
-    }
 }
