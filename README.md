@@ -1,30 +1,4 @@
-# DISCLAIMER
-
-> [!WARNING] 
-> This branch is a <ins>**really dirty**</ins> LLM-only development (opus5.5 and sonnet 5.5), the produced code is <ins>**ugly**</ins>, probably not optimized and <ins>**should never be included upstream**</ins>!
-> The goal is to see how far it can go and if it can make Ghost of Yotei playable.
-> It'll probably break other games.
-
-> [!NOTE]
-> Based on the **great work** by:
-> 
-> **foufouadi**: https://github.com/foufouadi/sharpemu/tree/yotei-rendering
-> 
-> **fxpw**: https://github.com/fxpw/KytyPS5/tree/yotei-windows-bringup
-> 
-> **Celegans12**: https://github.com/boykopovar/AnyPS5/discussions/675
-
-Current status:
-<img width="1597" height="931" alt="image" src="https://github.com/user-attachments/assets/9f894437-3f33-42ad-9991-c192cf29683a" />
-<img width="1273" height="744" alt="image" src="https://github.com/user-attachments/assets/fb05870b-428f-4f4e-9bef-d8fc0170ebbe" />
-<img width="1276" height="744" alt="image" src="https://github.com/user-attachments/assets/e92073ab-0fba-4126-a0c8-25a1f4727995" />
-<img width="1273" height="739" alt="image" src="https://github.com/user-attachments/assets/6c20832b-a0c9-4ffb-977b-f37cbfeda2ef" />
-
-
-
-
-
- <!--
+﻿<!--
 Copyright (C) 2026 SharpEmu Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
@@ -36,7 +10,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 </p>
 
 <p align="center">
-  An experimental PlayStation 5 emulator for Windows, Linux and macOS.  
+  An experimental PlayStation 5 emulator for Windows and Linux.  
 </p>
 
 ---
@@ -65,10 +39,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
 > **Official channels:** Only **sharpemu.app** and the links listed in this GitHub repository are affiliated with SharpEmu. Any other websites, accounts, or donation pages are unofficial and unauthorized.
 
 > [!NOTE]  
-> SharpEmu supports Windows x64, Linux x64, and macOS x64. Apple Silicon Macs
-> can run the macOS x64 build through Rosetta 2, and Windows on ARM devices
+> SharpEmu supports Windows x64 and Linux x64. Windows on ARM devices
 > (e.g. Snapdragon) can run the Windows x64 build through Windows' built-in
-> x64 emulation.
+> x64 emulation. macOS support is maintained separately in
+> [sharpemu/sharpemu-mac](https://github.com/sharpemu/sharpemu-mac).
 
 > [!WARNING]  
 > SharpEmu is an experimental PS5 emulator developed from scratch in C#. The current focus is on accuracy and infrastructure setup rather than game-specific compatibility.
@@ -106,9 +80,10 @@ A selection of games tested with SharpEmu. This is not an exhaustive list of sup
 
 The emulator can currently load the `eboot.bin` of real games, execute native CPU instructions, and partially handle gpu-related functionality. Included 3D games.
 
-SharpEmu supports Windows, Linux, and macOS hosts. Video output uses Vulkan on
-Windows and Linux, and MoltenVK on macOS. Platform support is still experimental,
-so compatibility and performance vary by game, operating system, and GPU driver.
+SharpEmu supports Windows and Linux hosts, with video output through Vulkan.
+Platform support is still experimental, so compatibility and performance vary by
+game, operating system, and GPU driver. For macOS, see
+[sharpemu/sharpemu-mac](https://github.com/sharpemu/sharpemu-mac).
 
 ## Using
 
@@ -123,7 +98,7 @@ Windows PowerShell:
 .\SharpEmu.exe "C:\path\to\game\eboot.bin" --log-to-file
 ```
 
-Linux and macOS:
+Linux:
 
 ```bash
 chmod +x ./SharpEmu
@@ -135,8 +110,7 @@ SharpEmu supports environment variables that can be configured from the GUI. Und
 
 You can set them per game or globally in the GUI, or pass them directly through the CLI.
 
-A Vulkan-capable GPU and current graphics driver are required. The macOS
-release includes the MoltenVK Vulkan implementation.
+A Vulkan-capable GPU and current graphics driver are required.
 
 See [Game patches](docs/patches.md) for downloading, enabling and writing game patches.
 

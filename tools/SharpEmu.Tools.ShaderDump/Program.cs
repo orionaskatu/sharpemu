@@ -9,7 +9,6 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using SharpEmu.HLE;
 using SharpEmu.ShaderCompiler;
-using SharpEmu.ShaderCompiler.Metal;
 using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 
@@ -383,7 +382,6 @@ var outputDirectory = args.Length > 0
 Directory.CreateDirectory(outputDirectory);
 
 var failures = 0;
-var mslLimitations = 0;
 foreach (var (name, expectTranslate, words) in testPrograms)
 {
     var memory = new FakeMemory();
@@ -473,23 +471,6 @@ foreach (var (name, expectTranslate, words) in testPrograms)
             failures++;
             Console.WriteLine($"[{name}] {suffix} emit: FAILED ({shaderError})");
         }
-
-        if (Gen5MslTranslator.TryCompileProgram(request, out var metalShader, out var metalError))
-        {
-            var path = Path.Combine(outputDirectory, $"{name}-layout-{suffix}.msl");
-            File.WriteAllText(path, metalShader.Source);
-            Console.WriteLine($"[{name}] {suffix} msl: success, {metalShader.Source.Length} chars -> {path}");
-        }
-        else if (IsExpectedMetalLimitation(name, metalError))
-        {
-            mslLimitations++;
-            Console.WriteLine($"[{name}] {suffix} msl: limitation ({metalError})");
-        }
-        else
-        {
-            failures++;
-            Console.WriteLine($"[{name}] {suffix} msl: FAILED ({metalError})");
-        }
     }
 
     if (name == "mrt")
@@ -540,7 +521,6 @@ foreach (var (moduleName, spirv) in fixedModules)
     Console.WriteLine($"[{moduleName}] emit: {spirv.Length} bytes -> {modulePath}");
 }
 
-Console.WriteLine($"MSL limitations: {mslLimitations}");
 Console.WriteLine(failures == 0
     ? "RESULT: all programs behaved as expected"
     : $"RESULT: {failures} unexpected outcome(s)");
@@ -564,11 +544,6 @@ static ShaderCompileRequest CreateCompileRequest(
         ThreadCountZ = 1,
     };
 }
-
-// Only these measured fixture limitations are accepted; other emission failures fail the run.
-static bool IsExpectedMetalLimitation(string programName, string error) =>
-    (programName is "pk-f16" or "exec" && error.Contains("unsupported vector opcode VPkFmaF16", StringComparison.Ordinal)) ||
-    (programName == "sopp-hints" && error.Contains("SWaitcntDepctr: missing scalar destination", StringComparison.Ordinal));
 
 internal sealed class FakeMemory : ICpuMemory
 {

@@ -2740,7 +2740,7 @@ public partial class MainWindow : Window
             {
                 Process.Start(new ProcessStartInfo
                 {
-                    FileName = OperatingSystem.IsMacOS() ? "open" : "xdg-open",
+                    FileName = "xdg-open",
                     Arguments = $"\"{directory}\"",
                     UseShellExecute = false,
                 });
