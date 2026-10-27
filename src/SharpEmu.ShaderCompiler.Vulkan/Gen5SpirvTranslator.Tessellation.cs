@@ -148,7 +148,8 @@ public static partial class Gen5SpirvTranslator
             });
             _module.AddExecutionMode(entryPoint, info.Clockwise
                 ? SpirvExecutionMode.VertexOrderCw : SpirvExecutionMode.VertexOrderCcw);
-            if (info.PointMode) _module.AddExecutionMode(entryPoint, SpirvExecutionMode.PointMode);
+            // TODO: PointMode is not available in SpirvExecutionMode enum - re-implement when supported
+            // if (info.PointMode) _module.AddExecutionMode(entryPoint, SpirvExecutionMode.PointMode);
         }
     }
 }

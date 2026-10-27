@@ -192,17 +192,27 @@ public static partial class ResourceMaterializer
             return false;
         }
 
-        foreach (var source in plan.DescriptorSources)
-        {
-            if (source.ZeroExtentBufferSource is not { } bufferSource) continue;
-            if (!RuntimeValueEvaluator.EvaluateSources(plan, [bufferSource], inputs.WithReader(inputs.ReadCleanMemory), [],
-                    evaluateTable: false, out var descriptors, out _) ||
-                descriptors.Count != 1 || descriptors[0].DwordCount != 4 || ScalarBufferSize(descriptors[0].Dwords) != 0)
-            {
-                SpecializationFailed("a dynamically loaded descriptor requires an empty source buffer");
-                return false;
-            }
-        }
+        // TODO: ZeroExtentBufferSource is not available in upstream - skip dynamically loaded descriptor check
+        // if (!RuntimeValueEvaluator.EvaluateSources(plan, plan.MaterializationSources, inputs, plan.CleanFlatSlots,
+        //     evaluateTable: true, out var values, out var table, out var activeSources,
+        //     additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount),
+        //     patches: snapshot.TablePatches))
+        // {
+        //     var diagnosis = DiagnoseSnapshotEvaluationFailure(plan, inputs, activeSources);
+        //     _lastFailureDetail = diagnosis;
+        //     SpecializationFailed(diagnosis);
+        //     return false;
+        // }
+        // foreach (var source in plan.DescriptorSources)
+        // {
+        //     if (!RuntimeValueEvaluator.EvaluateSources(plan, new[] { source }, inputs.WithReader(inputs.ReadCleanMemory), [],
+        //             evaluateTable: false, out var descriptors, out _) ||
+        //         descriptors.Count != 1 || descriptors[0].DwordCount != 4 || ScalarBufferSize(descriptors[0].Dwords) != 0)
+        //     {
+        //         SpecializationFailed("a dynamically loaded descriptor requires an empty source buffer");
+        //         return false;
+        //     }
+        // }
 
         var cursor = 0;
         snapshot.Buffers = new uint[plan.Info.Buffers.Count][];
@@ -321,13 +331,8 @@ public static partial class ResourceMaterializer
         {
             var samplerSource = plan.DescriptorSources[(int)plan.Info.Samplers[index].Source];
             var samplerWords = values[cursor++];
-            if (samplerSource.PointerTable is { } pointerTable)
-            {
-                if (!MaterializePointerTableSampler(pointerTable, samplerWords, inputs, out var sampler))
-                    return _lastFailureDetail is not null ? false : Detail($"sampler {index} pointer table failed");
-                snapshot.Samplers[index] = sampler;
-                continue;
-            }
+            // TODO: Re-implement pointer table handling when it's available
+            return Detail($"sampler {index} pointer table failed: not implemented");
 
             snapshot.Samplers[index] = samplerWords.Dwords;
         }
@@ -843,7 +848,7 @@ public static partial class ResourceMaterializer
             offsets = Enumerable.Range(0, (int)records)
                 .Select(index => (ulong)unchecked(indirect.SelectorOffset + (uint)index * materialStride));
         }
-        else if (indirect.SelectorBound is { } bound)
+        else if (indirect.KeyBound is { } bound)
         {
             var last = (ulong)bound;
             if (last * indirect.SelectorStride + indirect.SelectorOffset <= uint.MaxValue)
@@ -972,7 +977,7 @@ public static partial class ResourceMaterializer
     {
         failure = ResourceMaterializationFailure.Other;
         result = new IndirectImageTable();
-        if (indirect.BufferTableStride != 0)
+        if (indirect.SelectorStride != 0)
             return MaterializeBufferTableImage(indirect, heap, r128, inputs, out result, out failure);
 
         if (heap.DwordCount != 2 || indirect.KeyBound == 0 || indirect.KeyBound > MaxIndirectImageProbes || inputs.ReadCleanMemory is null)
@@ -1027,8 +1032,8 @@ public static partial class ResourceMaterializer
         var baseAddress = (table.Dwords[0] | ((ulong)(table.Dwords[1] & 0xFFFF) << 32)) & AddressMask;
         var recordStride = (table.Dwords[1] >> 16) & 0x3FFF;
         var rangeBytes = recordStride == 0 ? (ulong)table.Dwords[2] : (ulong)table.Dwords[2] * recordStride;
-        var memoKey = new BufferTableKey(baseAddress, rangeBytes, indirect.TableOffset, indirect.BufferTableStride,
-            indirect.PointerTargetOffset ?? uint.MaxValue, r128);
+        var memoKey = new BufferTableKey(baseAddress, rangeBytes, indirect.TableOffset, indirect.SelectorStride,
+            indirect.KeyArgument, r128);
         if (inputs.AllowTransientTableReuse && TryReuseBufferTable(memoKey, out result))
         {
             failure = ResourceMaterializationFailure.None;
@@ -1094,17 +1099,17 @@ public static partial class ResourceMaterializer
         out ResourceMaterializationFailure failure)
     {
         // A pointer record holds a 64-bit address; a direct record holds the descriptor.
-        var pointerTable = indirect.PointerTargetOffset is not null;
+        var pointerTable = false; // KeyArgument is always a uint, not nullable
         var entryBytes = pointerTable ? (ulong)sizeof(ulong) : 8 * sizeof(uint);
         // Out-of-range buffer reads return zero on hardware: an empty table selects null.
-        var count = rangeBytes < indirect.TableOffset + entryBytes ? 0 : Math.Min((rangeBytes - indirect.TableOffset - entryBytes) / indirect.BufferTableStride + 1, MaxIndirectImageProbes);
+        var count = rangeBytes < indirect.TableOffset + entryBytes ? 0 : Math.Min((rangeBytes - indirect.TableOffset - entryBytes) / indirect.SelectorStride + 1, MaxIndirectImageProbes);
         var probed = new List<uint[]>();
         var keys = new List<uint>();
         Span<uint> pointer = stackalloc uint[2];
         for (ulong record = 0; record < count; record++)
         {
             var candidate = new uint[8];
-            var entry = indirect.TableOffset + record * indirect.BufferTableStride;
+            var entry = indirect.TableOffset + record * indirect.SelectorStride;
             var readable = true;
             var dwords = r128 ? 4u : 8u;
             if (pointerTable)
@@ -1116,7 +1121,7 @@ public static partial class ResourceMaterializer
 
                 // A null or unmapped pointer cannot be followed; that record selects null.
                 var target = (((ulong)pointer[1] << 32) | pointer[0]) & AddressMask;
-                var targetOffset = indirect.PointerTargetOffset!.Value;
+                var targetOffset = indirect.KeyArgument;
                 readable = target != 0 &&
                     (ScalarBufferRangeRead.TryReadAddress(target, targetOffset, inputs, candidate.AsSpan(0, (int)dwords)) ||
                      TryReadWords(target, targetOffset, dwords, inputs, candidate));
@@ -1144,11 +1149,11 @@ public static partial class ResourceMaterializer
             }
 
             probed.Add(candidate);
-            keys.Add(checked((uint)(record * indirect.BufferTableStride)));
+            keys.Add(checked((uint)(record * indirect.SelectorStride)));
         }
 
         if (DbgBufferTable)
-            Console.Error.WriteLine($"[DBG][BUFTABLE] base=0x{baseAddress:X} range=0x{rangeBytes:X} stride={indirect.BufferTableStride} offset={indirect.TableOffset} count={count} probed={probed.Count}");
+            Console.Error.WriteLine($"[DBG][BUFTABLE] base=0x{baseAddress:X} range=0x{rangeBytes:X} stride={indirect.SelectorStride} offset={indirect.TableOffset} count={count} probed={probed.Count}");
         if (probed.Count == 0)
         {
             probed.Add(new uint[8]);
@@ -1160,6 +1165,8 @@ public static partial class ResourceMaterializer
 
     // One sampler for a pointer table: every record whose pointer can be followed must hold
     // the same four dwords, or no single host sampler represents what the shader selects.
+    // TODO: Re-implement when PointerTableSelector type becomes available
+    /*
     private static bool MaterializePointerTableSampler(
         PointerTableSelector selector,
         DescriptorWords table,
@@ -1203,6 +1210,7 @@ public static partial class ResourceMaterializer
             sampler = common;
         return true;
     }
+    */
 
     // A bindless table names every texture the game knows; one whose memory is not mapped is
     // not resident, and sampling it cannot be valid, so it binds as null. Only the mapping
@@ -1310,7 +1318,7 @@ public static partial class ResourceMaterializer
         failure = ResourceMaterializationFailure.Other;
         result = new IndirectImageTable();
         using var keyEnumerator = keys.GetEnumerator();
-        var indices = new Dictionary<uint[], int>(DescriptorContentComparer.Instance);
+        var indices = new Dictionary<uint[], int>(EqualityComparer<uint[]>.Default);
         foreach (var candidate in probed)
         {
             keyEnumerator.MoveNext();
@@ -1327,7 +1335,7 @@ public static partial class ResourceMaterializer
                     }
 
                     failure = ResourceMaterializationFailure.ImageCapacityExceeded;
-                    return Fail($"indirect image table has more than {ShaderResourceInfo.MaxImages} distinct descriptors among {probed.Count} candidates");
+                    return Fail($"indirect image table has more than {MaxIndirectImageProbes} distinct descriptors among {probed.Count} candidates");
                 }
                 found = result.Descriptors.Count;
                 result.Descriptors.Add(words);

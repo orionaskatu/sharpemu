@@ -2074,6 +2074,8 @@ public static partial class Gen5SpirvTranslator
 
         private bool FastHalf => _request.SupportsExactFloat16Conversions && _request.FastFloat16Arithmetic;
 
+        private bool _nativeHalfConversionExact => _request.SupportsExactFloat16Conversions && !_request.FastFloat16Arithmetic;
+
         // Both lanes of a packed f16 op as one f16vec2 operation.
         private uint EmitNativePackedF16(Gen5ShaderInstruction instruction, Gen5Vop3pControl control)
         {
@@ -4649,7 +4651,7 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(
                     SpirvOp.LogicalOr,
                     _boolType,
-                    LogicalNot(sourcePresent),
+                    LogicalNot(sourcePresent ? 1u : 0u),
                     sourceActive),
                 shuffled,
                 UInt(0));
@@ -4707,8 +4709,8 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(
                     SpirvOp.LogicalOr,
                     _boolType,
-                    LogicalNot(sourcePresent),
-                    IsNotZero(shuffledActive)));
+                    LogicalNot(sourcePresent ? 1u : 0u),
+                    IsNotZero(shuffledActive != 0 ? (uint)1 : 0)));
         }
 
         private uint ApplySdwaDestination(

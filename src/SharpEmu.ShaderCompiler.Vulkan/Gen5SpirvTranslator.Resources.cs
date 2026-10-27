@@ -227,6 +227,7 @@ public static partial class Gen5SpirvTranslator
             {
                 _waveLowering = new EmulatedWave64Lowering(this);
             }
+            _emulateWave64 = _waveLowering is EmulatedWave64Lowering;
             _requiredVertexOutputCount = request.RequiredVertexOutputCount;
             _pixelInputEnable = request.PixelInputEnable;
             _pixelInputAddress = request.PixelInputAddress;

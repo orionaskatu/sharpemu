@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.ShaderCompiler;
+using SharpEmu.ShaderCompiler.Vulkan;
 
 namespace SharpEmu.ShaderCompiler.Vulkan;
 
@@ -39,7 +40,7 @@ public static partial class Gen5SpirvTranslator
                 _module.AddCapability(SpirvCapability.InterpolationFunction);
                 _fixedSampleInterpolants.Add(variable);
             }
-            else _module.AddDecoration(variable, SpirvDecoration.Sample);
+            else _module.AddDecoration(variable, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Sample);
         }
 
         private void DeclareInterpolationParameters()

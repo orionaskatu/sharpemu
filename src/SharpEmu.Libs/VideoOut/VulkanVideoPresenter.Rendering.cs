@@ -1515,6 +1515,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words) =>
             _bufferCache.TryCopyWordsOnHost(destination, source, sourceWords, words);
 
-        public bool TryFillGuestMemoryOnCpu(ulong address, ulong size, uint value) => _bufferCache.TryFillHostMemory(address, size, value);
+        public bool TryReadCleanGuestBytes(ulong address, Span<byte> destination) =>
+            _bufferCache.TryReadCleanGuestBytes(address, destination);
     }
 }

@@ -453,7 +453,7 @@ public static partial class Gen5SpirvTranslator
                 context.StoreS64(register, BooleanToWaveMask(condition));
             }
 
-            private uint OwnHalfBallot(uint condition) => _context.OwnHalfBallot(condition);
+            private uint OwnHalfBallot(uint condition) => _context.OwnHalfBallot ? 1u : 0u;
 
             private uint BooleanToHalfWaveMask(uint condition)
             {

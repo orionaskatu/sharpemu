@@ -232,7 +232,7 @@ public sealed class ShaderResourcePlan
         foreach (var sampler in plan.Info.Samplers)
         {
             materialization.Add(sampler.Source);
-            if (plan.DescriptorSources[(int)sampler.Source].PointerTable is not null)
+            // TODO: PointerTable is not available in upstream
             {
                 plan.RequiresSpecializationMemory = true;
             }

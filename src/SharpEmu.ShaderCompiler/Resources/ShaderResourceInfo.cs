@@ -13,6 +13,8 @@ public enum ShaderStage : byte
     Pixel,
     Compute,
     Mesh,
+    TessellationControl,
+    TessellationEvaluation,
 }
 
 public enum ImageNumericClass : byte

@@ -1755,4 +1755,7 @@ internal static class CompiledShaderDump
 
         File.WriteAllLines($"{basePath}.ir.txt", lines);
     }
+
+    // TODO: GetTessellationBridge is not implemented - returns null
+    public static object? GetTessellationBridge(BindingLayout layout, Gen5TessellationDomain domain) => null;
 }

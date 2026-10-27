@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.ShaderCompiler.Resources;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Pipelines;
@@ -243,7 +244,8 @@ public sealed class GraphicsPipelineKey : IEquatable<GraphicsPipelineKey>
     // Settable for the lookup key reused across draws; a key in the cache is never changed.
     public ulong VertexProgramId { get; set; }
     public ulong PixelProgramId { get; set; }
-    public TessellationPipelineStages? Tessellation { get; set; }
+    // TODO: TessellationPipelineStages doesn't exist in upstream - use ShaderStage.TessellationEvaluation instead
+    public ShaderStage? Tessellation { get; set; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
 

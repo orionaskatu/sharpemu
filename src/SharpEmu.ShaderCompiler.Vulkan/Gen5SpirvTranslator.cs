@@ -79,6 +79,7 @@ public static partial class Gen5SpirvTranslator
         private readonly Dictionary<uint, Dictionary<uint, uint>> _savedLaneValues = new();
         private readonly bool _usesBufferAtomics;
         private readonly bool _usesCoherentBufferPairs;
+        private readonly bool _emulateWave64;
 
         // Safety valve for the PC-dispatcher loop. Each iteration executes one
         // GCN basic block; a correctly-translated shader always reaches its
@@ -185,6 +186,8 @@ public static partial class Gen5SpirvTranslator
         private uint _storageUvec2Pointer;
         private uint _lds;
         private bool _ldsPrivate;
+        private bool _ldsIsWorkgroup;
+        private uint _ldsZeroDword;
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
         private uint _ldsDwordMask;
@@ -192,6 +195,8 @@ public static partial class Gen5SpirvTranslator
         private uint _scratchElementPointer;
         private uint _scratchDwordCount;
         private uint _ldsDwordCount;
+        private Dictionary<uint, uint> _packedHalfRegisterVariables = new();
+        private bool OwnHalfBallot;
         private uint _positionOutput;
         private uint _pointSizeOutput;
         private uint _clipDistanceOutput;
@@ -203,6 +208,8 @@ public static partial class Gen5SpirvTranslator
         private uint _cullDistanceCount;
         private uint _vertexIndexInput;
         private uint _instanceIndexInput;
+        private uint _halfType;
+        private uint _half2Type;
         private uint _fragCoordInput;
         private uint _localInvocationIdInput;
         private uint _localInvocationIndexInput;
@@ -590,6 +597,8 @@ public static partial class Gen5SpirvTranslator
             _longType = _module.TypeInt(64, signed: true);
             _ulongType = _module.TypeInt(64, signed: false);
             _floatType = _module.TypeFloat(32);
+            _halfType = _module.TypeFloat(16);
+            _half2Type = _module.TypeVector(_halfType, 2);
             _vec2Type = _module.TypeVector(_floatType, 2);
             _vec3Type = _module.TypeVector(_floatType, 3);
             _vec4Type = _module.TypeVector(_floatType, 4);
@@ -742,6 +751,8 @@ public static partial class Gen5SpirvTranslator
                 ? SpirvStorageClass.Workgroup
                 : SpirvStorageClass.Private;
             _ldsPrivate = storageClass == SpirvStorageClass.Private;
+            _ldsIsWorkgroup = storageClass == SpirvStorageClass.Workgroup;
+            _ldsZeroDword = 0; // Workgroup LDS starts at offset 0
             var dwordCount = _stage == Gen5SpirvStage.Mesh
                 ? _request.Mesh?.LocalDataShareDwords ?? 0
                 : _stage == Gen5SpirvStage.Compute ? ComputeLdsGuestDwordCount() : PrivateLdsDwordCount;
@@ -9190,6 +9201,37 @@ public static partial class Gen5SpirvTranslator
                     _pairedLanes || _waveLowering is HalfWave64Lowering
                         ? BitwiseAnd(lane, UInt(PairedHalfLaneCount - 1))
                         : lane);
+
+        private uint ShuffleGuestLaneOrSelf(uint value, uint targetLane, out bool sourcePresent)
+        {
+            sourcePresent = true;
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return value;
+            }
+
+            var shuffled = _module.AddInstruction(
+                SpirvOp.GroupNonUniformShuffle,
+                _uintType,
+                UInt(3),
+                value,
+                _pairedLanes || _waveLowering is HalfWave64Lowering
+                    ? BitwiseAnd(targetLane, UInt(PairedHalfLaneCount - 1))
+                    : targetLane);
+
+            // Check if the source lane is present in the execution mask
+            var sourceActive = _module.AddInstruction(
+                SpirvOp.GroupNonUniformShuffle,
+                _boolType,
+                UInt(3),
+                Load(_boolType, _exec),
+                _pairedLanes || _waveLowering is HalfWave64Lowering
+                    ? BitwiseAnd(targetLane, UInt(PairedHalfLaneCount - 1))
+                    : targetLane);
+
+            sourcePresent = _module.AddInstruction(SpirvOp.INotEqual, _boolType, sourceActive, UInt(0)) != 0;
+            return shuffled;
+        }
 
         private uint CurrentLaneBit() =>
             _waveLowering.CurrentLaneBit();

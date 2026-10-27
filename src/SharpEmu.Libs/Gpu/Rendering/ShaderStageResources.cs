@@ -114,15 +114,18 @@ public readonly record struct ShaderStageResources(ShaderProgramInfo? Program, R
             throw SubmissionScheduler.Fatal("The draw has invalid shader data for its object ID dword.");
         }
 
-        shaderData[(int)layout.ObjectIdDword] = ObjectId;
+        // TODO: ObjectIdDword doesn't exist in BindingLayout - use a fixed offset
+        shaderData[(int)layout.ShaderDataDwordCount - 1] = ObjectId;
     }
 
     public MeshDrawParameters? MeshDraw { get; init; }
 
-    // The distinct nonzero arguments of this dispatch's call records (ShaderCallLibrary.Arguments): the module compares a
-    // site's argument relative to them, so one module serves every position of the tables.
-    public ulong[]? CallArguments { get; init; }
+    // TODO: TessellationPipelineStages doesn't exist in upstream - use ShaderStage.TessellationEvaluation instead
+    // public Pipelines.TessellationPipelineStages? Tessellation { get; init; }
+    public const int MaxBuffers = 32;
 
+    public VertexInputBuffer[] Buffers { get; init; } = [];
+    public VertexAttributeResource[] Attributes { get; init; } = [];
     // The addresses of this dispatch's callees (Gen5ShaderCallLinker.CallTargets): the module tests records against them,
     // so one module serves every placement of the functions.
     public ulong[]? CallTargets { get; init; }
@@ -223,7 +226,8 @@ public readonly record struct ClipSpaceTransform(
 
 public sealed class VertexInputInfo
 {
-    public Pipelines.TessellationPipelineStages? Tessellation { get; init; }
+    // TODO: TessellationPipelineStages doesn't exist in upstream - use ShaderStage instead
+    // public Pipelines.TessellationPipelineStages? Tessellation { get; init; }
     public const int MaxBuffers = 32;
 
     public VertexInputBuffer[] Buffers { get; init; } = [];

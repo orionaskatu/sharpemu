@@ -368,6 +368,22 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint CallTargetCount { get; init; }
     // The program reads call records through descriptor set 1 (see BindlessHeap).
     public bool UsesBindlessHeap { get; init; }
+    // The program uses bindless images
+    public bool UsesBindlessImages { get; init; }
+    // The program uses object ID output
+    public bool UsesObjectId { get; init; }
+    // The dword offset of object ID in the shader data buffer
+    public uint ObjectIdDword { get; init; }
+    // The program uses tessellation data (tessellation control/evaluation bridges)
+    public bool UsesTessellationData { get; init; }
+    // The dword offset of tessellation data in the shader data buffer
+    public uint TessellationDataDword { get; init; }
+    // The program uses render scale
+    public bool UsesRenderScale { get; init; }
+    // The dword offset of render scale data in the shader data buffer
+    public uint RenderScaleDword { get; init; }
+    // The program uses runtime buffer strides
+    public bool UsesRuntimeBufferStrides { get; init; }
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
 

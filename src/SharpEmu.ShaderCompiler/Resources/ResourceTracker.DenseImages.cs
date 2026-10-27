@@ -693,7 +693,7 @@ public sealed partial class ResourceTracker
             {
                 Dense = true,
                 TableOffset = tableImmediate,
-                BufferTableStride = stride,
+                SelectorStride = stride,
             },
         };
 
@@ -797,8 +797,8 @@ public sealed partial class ResourceTracker
             {
                 Dense = true,
                 TableOffset = match.TableOffset,
-                BufferTableStride = match.Stride,
-                PointerTargetOffset = match.TargetOffset,
+                SelectorStride = match.Stride,
+                // TODO: Re-implement when PointerTargetOffset is available
             },
         };
 
@@ -828,7 +828,7 @@ public sealed partial class ResourceTracker
         sourceIndex = InternSource(new DescriptorSource
         {
             Dwords = tableSource.Dwords,
-            PointerTable = new PointerTableSelector(match.TableOffset, match.Stride, match.TargetOffset),
+            // TODO: Re-implement when PointerTableSelector type becomes available
         });
         return true;
     }

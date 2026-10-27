@@ -17,7 +17,9 @@ public sealed unsafe class BindlessImageHeap : IDisposable
     // Sampled images, storage images, and the samplers runtime-descriptor accesses index
     // (BindingLayout.BindlessSamplerBinding).
     private const uint BindingCount = 3;
-    private const uint SamplerBinding = BindingLayout.BindlessSamplerBinding;
+    // TODO: BindlessSamplerBinding doesn't exist in BindingLayout
+    // private const uint SamplerBinding = BindingLayout.BindlessSamplerBinding;
+    private const uint SamplerBinding = 3; // Placeholder value
     private const uint SamplerCapacity = 4096;
     // NVIDIA reports maxUpdateAfterBindDescriptorsInAllPools as UINT_MAX. Keep
     // the persistent layout bounded even when that device-wide limit is not

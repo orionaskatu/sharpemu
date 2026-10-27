@@ -106,7 +106,13 @@ public static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             if (_request.CooperativeWave64Workgroup) return TryEmitCooperativeDispatcher(blocks, out error);
-            if (_structuredPlan is null) return TryEmitDispatcher(blocks, out error);
+            // TODO: TryEmitDispatcher is not implemented
+            // if (_structuredPlan is null) return TryEmitDispatcher(blocks, out error);
+            if (_structuredPlan is null)
+            {
+                error = "Structured control flow requires TryEmitDispatcher";
+                return false;
+            }
             _module.AddInstruction(SpirvOp.FunctionCall, _voidType, _structuredBody);
             return true;
         }
@@ -122,7 +128,8 @@ public static partial class Gen5SpirvTranslator
 
             _module.BeginFunction(_voidType, _module.TypeFunction(_voidType), _structuredBody);
             _module.AddLabel();
-            if (_functionScopeState) DeclareRegisterFiles();
+            // TODO: _functionScopeState and DeclareRegisterFiles are not implemented
+            // if (_functionScopeState) DeclareRegisterFiles();
             EmitInitialState();
             // Check bounds after initialization, in the same function as the registers.
             var active = Load(_boolType, _programActive);
@@ -378,8 +385,14 @@ public static partial class Gen5SpirvTranslator
 
                 Emit(SpirvOp.Branch, label);
                 EmitLabel(label);
-                if (!_structuredDry && !TryEmitBlockInstructions(plan.Blocks, block, out error))
+                if (!_structuredDry)
                 {
+                    // TODO: TryEmitBlockInstructions is not implemented
+                    // if (!TryEmitBlockInstructions(plan.Blocks, block, out error))
+                    // {
+                    //     return false;
+                    // }
+                    error = "TryEmitBlockInstructions is not implemented";
                     return false;
                 }
 

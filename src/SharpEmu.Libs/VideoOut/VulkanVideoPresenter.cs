@@ -293,6 +293,20 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Dictionary<ulong, long> _presentedGuestImageTraceCounts = new();
         private readonly Dictionary<long, GuestImageResource> _guestImageVersions = new();
 
+        // Max descriptor counts per stage
+        private const uint _maxPerStageSampledImages = 128;
+        private const uint _maxPerStageStorageImages = 8;
+        private const uint _maxPerStageStorageBuffers = 8;
+        private const uint _maxPerStageUpdateAfterBindSampledImages = 128;
+        private const uint _maxPerStageUpdateAfterBindStorageImages = 8;
+        private const uint _maxUpdateAfterBindSampledImages = 128;
+        private const uint _maxUpdateAfterBindStorageImages = 8;
+        private const uint _maxUpdateAfterBindDescriptors = 128;
+        private const uint _maxPerStageSamplers = 64;
+        private const uint _maxPerStageUpdateAfterBindSamplers = 64;
+        private const uint _maxUpdateAfterBindSamplers = 64;
+        private bool _postDepthCoverageEnabled;
+
         // The host-owned resources of one recorded draw or dispatch, retired when its submission completes.
         private sealed class SubmissionUploadResources
         {
